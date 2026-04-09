@@ -9,9 +9,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /build
 
-COPY pyproject.toml requirements.txt ./
+COPY pyproject.toml README.md ./
+COPY src/ src/
 
-RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
+RUN pip install --no-cache-dir --prefix=/install .
 
 # ---- Runtime ----
 FROM python:3.11-slim
