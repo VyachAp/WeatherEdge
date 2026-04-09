@@ -16,7 +16,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 from sqlalchemy import select
 
 from src.config import settings
-from src.db.engine import async_session
+from src.db.engine import async_session, engine
 from src.db.models import Market, Signal, Trade, TradeStatus
 from src.execution.alerter import get_alerter
 from src.ingestion.ecmwf import ingest_latest_ecmwf
@@ -447,6 +447,11 @@ async def run_scheduler() -> None:
         logger.warning("Signal handlers not supported; will run until cancelled")
 
     health_server = await start_health_server()
+
+    # Ensure all tables exist (first deploy / fresh database)
+    from src.db.models import Base
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
 
     _scheduler = setup_scheduler()
     _scheduler.start()
