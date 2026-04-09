@@ -31,6 +31,7 @@ psycopg2-binary = ">=2.9"
 plotly = ">=5.0"
 pandas = ">=2.0"
 py-clob-client = ">=0.34"
+web3 = ">=7.0"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.0"
