@@ -51,6 +51,13 @@ def _confidence_label(confidence: float) -> str:
     return "LOW"
 
 
+def _aviation_model_part(aviation_str: str | None, e: Callable[[object], str]) -> str:
+    """Return the aviation model segment for the models line."""
+    if aviation_str:
+        return "  \\| Aviation " + e(aviation_str)
+    return ""
+
+
 def _auto_exec_line() -> str:
     """Return the AUTO-EXECUTED indicator line if auto-execution is enabled."""
     if settings.AUTO_EXECUTE and settings.POLYMARKET_PRIVATE_KEY:
@@ -232,7 +239,7 @@ class Alerter:
             f"\U0001f3af Confidence: {e(f'{conf_label} ({signal.confidence:.2f})')}\n"
             f"\n"
             f"Models: GFS {e(gfs_str)} \\| ECMWF {e(ecmwf_str)}"
-            f"{'  \\| Aviation ' + e(aviation_str) if aviation_str else ''}\n"
+            f"{_aviation_model_part(aviation_str, e)}\n"
             f"{_short_range_line(signal, e)}"
             f"\U0001f4c5 Resolves: {e(resolve_date)} \\| Liquidity: {e(liquidity_str)}\n"
             f"\n"
