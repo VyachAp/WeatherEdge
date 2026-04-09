@@ -199,7 +199,12 @@ def approve() -> None:
     from eth_account import Account
     from web3 import Web3
 
-    RPC_URL = "https://polygon-rpc.com"
+    RPC_URLS = [
+        "https://polygon-bor-rpc.publicnode.com",
+        "https://rpc.ankr.com/polygon",
+        "https://polygon.drpc.org",
+        "https://polygon-rpc.com",
+    ]
     CHAIN_ID = 137
 
     # Token contracts
@@ -259,12 +264,27 @@ def approve() -> None:
         },
     ]
 
-    w3 = Web3(Web3.HTTPProvider(RPC_URL))
     account = Account.from_key(settings.POLYMARKET_PRIVATE_KEY)
     address = account.address
     max_uint = 2**256 - 1
 
     click.echo(f"Wallet: {address}")
+
+    # Try RPC endpoints until one works
+    w3 = None
+    for rpc_url in RPC_URLS:
+        try:
+            _w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": 10}))
+            _w3.eth.get_balance(address)  # test connection
+            w3 = _w3
+            click.echo(f"Connected to {rpc_url}")
+            break
+        except Exception:
+            click.echo(f"  RPC {rpc_url} failed, trying next...")
+
+    if w3 is None:
+        click.echo("Error: all Polygon RPC endpoints failed")
+        raise SystemExit(1)
 
     bal = w3.eth.get_balance(address)
     click.echo(f"POL balance: {w3.from_wei(bal, 'ether'):.4f} (for gas)")

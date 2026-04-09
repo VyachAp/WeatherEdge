@@ -39,19 +39,32 @@ def _get_client():
     if not settings.POLYMARKET_PRIVATE_KEY:
         return None
 
+    from eth_account import Account
     from py_clob_client.client import ClobClient
 
-    _client = ClobClient(
+    # Derive wallet address from private key for funder parameter
+    account = Account.from_key(settings.POLYMARKET_PRIVATE_KEY)
+    funder_address = account.address
+
+    # Step 1: temporary client to derive API creds
+    temp_client = ClobClient(
         settings.POLYMARKET_HOST,
         key=settings.POLYMARKET_PRIVATE_KEY,
         chain_id=settings.POLYMARKET_CHAIN_ID,
     )
+    creds = temp_client.create_or_derive_api_creds()
 
-    if not _api_creds_set:
-        creds = _client.create_or_derive_api_creds()
-        _client.set_api_creds(creds)
-        _api_creds_set = True
-        logger.info("Polymarket CLOB client initialised (API creds derived)")
+    # Step 2: full client with creds, signature_type, and funder
+    _client = ClobClient(
+        settings.POLYMARKET_HOST,
+        key=settings.POLYMARKET_PRIVATE_KEY,
+        chain_id=settings.POLYMARKET_CHAIN_ID,
+        creds=creds,
+        signature_type=0,  # EOA wallet
+        funder=funder_address,
+    )
+    _api_creds_set = True
+    logger.info("Polymarket CLOB client initialised (wallet: %s)", funder_address)
 
     return _client
 
