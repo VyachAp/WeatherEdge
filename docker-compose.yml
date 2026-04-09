@@ -1,0 +1,47 @@
+services:
+  db:
+    image: timescale/timescaledb:latest-pg16
+    environment:
+      POSTGRES_USER: weather
+      POSTGRES_PASSWORD: weather
+      POSTGRES_DB: weatheredge
+    ports:
+      - "5432:5432"
+    volumes:
+      - tsdb_data:/home/postgres/pgdata/data
+      - ./init-db.sql:/docker-entrypoint-initdb.d/init-db.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U weather -d weatheredge"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  app:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://weather:weather@db:5432/weatheredge
+    volumes:
+      - grib_cache:/data/grib_cache
+    restart: unless-stopped
+
+  dashboard:
+    build: .
+    command: ["streamlit", "run", "src/monitoring/dashboard.py", "--server.address=0.0.0.0"]
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://weather:weather@db:5432/weatheredge
+    ports:
+      - "8501:8501"
+    restart: unless-stopped
+
+volumes:
+  tsdb_data:
+  grib_cache:

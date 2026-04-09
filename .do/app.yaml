@@ -1,0 +1,43 @@
+spec:
+  name: weather-edge
+  region: nyc
+
+  services:
+    - name: scheduler
+      dockerfile_path: Dockerfile
+      instance_count: 1
+      instance_size_slug: basic-xxs
+      health_check:
+        http_path: /
+        port: 8080
+        initial_delay_seconds: 15
+        period_seconds: 30
+      envs:
+        - key: DATABASE_URL
+          scope: RUN_TIME
+          value: ${db.DATABASE_URL}
+        - key: TELEGRAM_BOT_TOKEN
+          scope: RUN_TIME
+          type: SECRET
+        - key: TELEGRAM_CHAT_ID
+          scope: RUN_TIME
+          type: SECRET
+        - key: MIN_EDGE
+          scope: RUN_TIME
+          value: "0.10"
+        - key: KELLY_FRACTION
+          scope: RUN_TIME
+          value: "0.25"
+        - key: MAX_POSITION_PCT
+          scope: RUN_TIME
+          value: "0.05"
+        - key: INITIAL_BANKROLL
+          scope: RUN_TIME
+          value: "750"
+
+  databases:
+    - name: db
+      engine: PG
+      version: "16"
+      size: db-s-1vcpu-1gb
+      num_nodes: 1

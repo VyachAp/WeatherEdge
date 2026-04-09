@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(mkdir -p src/db src/ingestion src/signals src/risk src/execution src/monitoring alembic/versions tests)",
+      "Bash(touch src/__init__.py src/db/__init__.py src/ingestion/__init__.py src/signals/__init__.py src/risk/__init__.py src/execution/__init__.py src/monitoring/__init__.py tests/__init__.py)"
+    ]
+  }
+}
