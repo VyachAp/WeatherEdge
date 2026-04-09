@@ -51,6 +51,13 @@ def _confidence_label(confidence: float) -> str:
     return "LOW"
 
 
+def _auto_exec_line() -> str:
+    """Return the AUTO-EXECUTED indicator line if auto-execution is enabled."""
+    if settings.AUTO_EXECUTE and settings.POLYMARKET_PRIVATE_KEY:
+        return "\\u2705 *AUTO\\-EXECUTED*\n"
+    return ""
+
+
 def _short_range_line(signal: object, e: Callable[[object], str]) -> str:
     """Build an optional short-range indicator line for aviation-enhanced signals."""
     aviation_prob = getattr(signal, "aviation_prob", None)
@@ -234,7 +241,7 @@ class Alerter:
             f"Bankroll: {e(f'${drawdown.current:,.0f}')} \\| "
             f"Drawdown: {e(f'{drawdown.drawdown_pct * 100:.1f}%')}\n"
             f"\n"
-            f"{'\\u2705 *AUTO\\-EXECUTED*\n' if settings.AUTO_EXECUTE and settings.POLYMARKET_PRIVATE_KEY else ''}"
+            f"{_auto_exec_line()}"
             f"[Open on Polymarket]({e(url)})"
         )
 

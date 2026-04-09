@@ -183,5 +183,254 @@ def paper_trade(days: int) -> None:
     asyncio.run(_paper_trade())
 
 
+@main.command()
+def approve() -> None:
+    """Approve USDC + Conditional Token contracts for Polymarket trading.
+
+    Sends 6 on-chain transactions (2 tokens x 3 spender contracts).
+    Requires POLYMARKET_PRIVATE_KEY in .env and POL for gas.
+    """
+    from src.config import settings
+
+    if not settings.POLYMARKET_PRIVATE_KEY:
+        click.echo("Error: POLYMARKET_PRIVATE_KEY not set in .env")
+        raise SystemExit(1)
+
+    from eth_account import Account
+    from web3 import Web3
+
+    RPC_URL = "https://polygon-rpc.com"
+    CHAIN_ID = 137
+
+    # Token contracts
+    USDC = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+    CTF = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
+
+    # Spender contracts that need approval
+    SPENDERS = {
+        "CTF Exchange": "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E",
+        "Neg Risk CTF Exchange": "0xC5d563A36AE78145C45a50134d48A1215220f80a",
+        "Neg Risk Adapter": "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296",
+    }
+
+    ERC20_ABI = [
+        {
+            "inputs": [
+                {"name": "spender", "type": "address"},
+                {"name": "amount", "type": "uint256"},
+            ],
+            "name": "approve",
+            "outputs": [{"name": "", "type": "bool"}],
+            "stateMutability": "nonpayable",
+            "type": "function",
+        },
+        {
+            "inputs": [
+                {"name": "owner", "type": "address"},
+                {"name": "spender", "type": "address"},
+            ],
+            "name": "allowance",
+            "outputs": [{"name": "", "type": "uint256"}],
+            "stateMutability": "view",
+            "type": "function",
+        },
+    ]
+
+    ERC1155_ABI = [
+        {
+            "inputs": [
+                {"name": "operator", "type": "address"},
+                {"name": "approved", "type": "bool"},
+            ],
+            "name": "setApprovalForAll",
+            "outputs": [],
+            "stateMutability": "nonpayable",
+            "type": "function",
+        },
+        {
+            "inputs": [
+                {"name": "account", "type": "address"},
+                {"name": "operator", "type": "address"},
+            ],
+            "name": "isApprovedForAll",
+            "outputs": [{"name": "", "type": "bool"}],
+            "stateMutability": "view",
+            "type": "function",
+        },
+    ]
+
+    w3 = Web3(Web3.HTTPProvider(RPC_URL))
+    account = Account.from_key(settings.POLYMARKET_PRIVATE_KEY)
+    address = account.address
+    max_uint = 2**256 - 1
+
+    click.echo(f"Wallet: {address}")
+
+    bal = w3.eth.get_balance(address)
+    click.echo(f"POL balance: {w3.from_wei(bal, 'ether'):.4f} (for gas)")
+    if bal == 0:
+        click.echo("Error: wallet has no POL for gas fees")
+        raise SystemExit(1)
+
+    usdc = w3.eth.contract(address=Web3.to_checksum_address(USDC), abi=ERC20_ABI)
+    ctf = w3.eth.contract(address=Web3.to_checksum_address(CTF), abi=ERC1155_ABI)
+
+    def send_tx(tx_data):
+        nonce = w3.eth.get_transaction_count(address)
+        tx_data["nonce"] = nonce
+        tx_data["chainId"] = CHAIN_ID
+        tx_data["from"] = address
+        if "gas" not in tx_data:
+            tx_data["gas"] = w3.eth.estimate_gas(tx_data)
+        signed = w3.eth.account.sign_transaction(tx_data, private_key=settings.POLYMARKET_PRIVATE_KEY)
+        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+        return w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+
+    # --- Check existing approvals first ---
+    click.echo("\n=== Checking existing approvals ===")
+    needs_usdc = []
+    needs_ctf = []
+    for name, spender in SPENDERS.items():
+        spender_cs = Web3.to_checksum_address(spender)
+        usdc_ok = usdc.functions.allowance(address, spender_cs).call() > 0
+        ctf_ok = ctf.functions.isApprovedForAll(address, spender_cs).call()
+        status_u = "OK" if usdc_ok else "NEEDED"
+        status_c = "OK" if ctf_ok else "NEEDED"
+        click.echo(f"  {name}: USDC={status_u}, CTF={status_c}")
+        if not usdc_ok:
+            needs_usdc.append((name, spender_cs))
+        if not ctf_ok:
+            needs_ctf.append((name, spender_cs))
+
+    if not needs_usdc and not needs_ctf:
+        click.echo("\nAll approvals already in place!")
+        return
+
+    total_txs = len(needs_usdc) + len(needs_ctf)
+    click.echo(f"\nNeed {total_txs} approval transaction(s). Proceeding...")
+
+    # --- USDC approvals ---
+    for name, spender in needs_usdc:
+        click.echo(f"  Approving USDC for {name}...", nl=False)
+        tx = usdc.functions.approve(spender, max_uint).build_transaction({"from": address})
+        receipt = send_tx(tx)
+        ok = "OK" if receipt["status"] == 1 else "FAILED"
+        click.echo(f" {ok} (tx: {receipt['transactionHash'].hex()[:16]}...)")
+
+    # --- CTF approvals ---
+    for name, spender in needs_ctf:
+        click.echo(f"  Approving CTF for {name}...", nl=False)
+        tx = ctf.functions.setApprovalForAll(spender, True).build_transaction({"from": address})
+        receipt = send_tx(tx)
+        ok = "OK" if receipt["status"] == 1 else "FAILED"
+        click.echo(f" {ok} (tx: {receipt['transactionHash'].hex()[:16]}...)")
+
+    # --- Notify CLOB server ---
+    click.echo("\nNotifying Polymarket CLOB server...")
+    from py_clob_client.client import ClobClient
+    from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
+
+    client = ClobClient(
+        settings.POLYMARKET_HOST,
+        key=settings.POLYMARKET_PRIVATE_KEY,
+        chain_id=settings.POLYMARKET_CHAIN_ID,
+    )
+    creds = client.create_or_derive_api_creds()
+    client.set_api_creds(creds)
+    client.update_balance_allowance(BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
+    click.echo("Done! You can now trade on Polymarket.")
+
+
+@main.command("test-trade")
+@click.option("--amount", default=1.0, show_default=True, help="USDC amount to spend.")
+def test_trade(amount: float) -> None:
+    """Place a tiny test trade on the most liquid weather market.
+
+    Uses a FOK market order. Verifies the full execution pipeline works.
+    """
+
+    async def _test_trade() -> None:
+        from src.config import settings
+
+        if not settings.POLYMARKET_PRIVATE_KEY:
+            click.echo("Error: POLYMARKET_PRIVATE_KEY not set in .env")
+            raise SystemExit(1)
+
+        from py_clob_client.client import ClobClient
+        from py_clob_client.clob_types import MarketOrderArgs, OrderType
+
+        client = ClobClient(
+            settings.POLYMARKET_HOST,
+            key=settings.POLYMARKET_PRIVATE_KEY,
+            chain_id=settings.POLYMARKET_CHAIN_ID,
+        )
+        creds = client.create_or_derive_api_creds()
+        client.set_api_creds(creds)
+
+        # Find a weather market with good liquidity
+        import httpx
+
+        click.echo("Finding a liquid weather market...")
+        async with httpx.AsyncClient() as http:
+            resp = await http.get(
+                "https://gamma-api.polymarket.com/markets",
+                params={"tag": "weather", "limit": 10, "active": True, "order": "liquidity", "ascending": False},
+                timeout=15,
+            )
+            resp.raise_for_status()
+            markets = resp.json()
+
+        if not markets:
+            click.echo("No active weather markets found. Trying any market...")
+            async with httpx.AsyncClient() as http:
+                resp = await http.get(
+                    "https://gamma-api.polymarket.com/markets",
+                    params={"limit": 5, "active": True, "order": "liquidity", "ascending": False},
+                    timeout=15,
+                )
+                resp.raise_for_status()
+                markets = resp.json()
+
+        if not markets:
+            click.echo("No markets found.")
+            return
+
+        market = markets[0]
+        token_ids = market.get("clobTokenIds", [])
+        if len(token_ids) < 2:
+            click.echo(f"Market has no token IDs: {market.get('question', 'unknown')}")
+            return
+
+        yes_token = token_ids[0]
+        click.echo(f"Market: {market.get('question', 'unknown')[:80]}")
+        click.echo(f"YES token: {yes_token[:20]}...")
+        click.echo(f"Amount: ${amount:.2f}")
+
+        tick_size = client.get_tick_size(yes_token)
+        neg_risk = client.get_neg_risk(yes_token)
+
+        # Place a small FOK market buy on YES
+        click.echo("Placing FOK market order...")
+        market_order = MarketOrderArgs(token_id=yes_token, amount=amount)
+        signed = client.create_market_order(market_order)
+        resp = client.post_order(
+            signed,
+            OrderType.FOK,
+            options={"tick_size": tick_size, "neg_risk": neg_risk},
+        )
+
+        click.echo(f"Response: {resp}")
+
+        if resp.get("orderID"):
+            click.echo(f"\nOrder ID: {resp['orderID']}")
+            click.echo(f"Status: {resp.get('status', 'unknown')}")
+            click.echo("\nTest trade successful! The execution pipeline works.")
+        else:
+            click.echo(f"\nOrder failed: {resp.get('errorMsg', 'unknown error')}")
+            click.echo("This may be normal for FOK on a thin book. The API connection works.")
+
+    asyncio.run(_test_trade())
+
+
 if __name__ == "__main__":
     main()
