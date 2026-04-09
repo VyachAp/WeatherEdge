@@ -25,6 +25,22 @@ class Settings(BaseSettings):
     GEFS_CACHE_TTL_HOURS: int = 24
     ECMWF_CACHE_DIR: str = "/tmp/weather-edge/ecmwf/"
     ECMWF_CACHE_TTL_HOURS: int = 24
+    AWC_USER_AGENT: str = "WeatherEdge/1.0 (weather-trading-bot; contact@example.com)"
+    AWC_RATE_LIMIT_RPS: float = 1.0
+
+    # Short-range trading tunables
+    SR_MIN_LIQUIDITY: float = 100.0
+    SR_MIN_VOLUME: float = 50.0
+    SR_MIN_EDGE_DISCOUNT: float = 0.65
+    SR_PIPELINE_INTERVAL_MINUTES: int = 60
+
+    # Polymarket execution
+    POLYMARKET_PRIVATE_KEY: str = ""  # Polygon wallet private key; empty = dry-run
+    POLYMARKET_HOST: str = "https://clob.polymarket.com"
+    POLYMARKET_CHAIN_ID: int = 137  # Polygon mainnet
+    AUTO_EXECUTE: bool = False  # Set True to place orders automatically
+    DAILY_SPEND_CAP_USD: float = 200.0  # Max total spend per 24h
+    MIN_STAKE_USD: float = 5.0  # Skip orders below this amount
 
 
 settings = Settings()

@@ -15,7 +15,8 @@ from typing import TYPE_CHECKING
 
 from dateutil import parser as dateutil_parser
 
-from src.ingestion import ecmwf, gfs
+from src.ingestion import aviation, ecmwf, gfs
+from src.ingestion.aviation import get_realtime_probability
 from src.ingestion.polymarket import get_active_weather_markets
 
 if TYPE_CHECKING:
@@ -185,6 +186,182 @@ CITIES: dict[str, tuple[float, float]] = {
 }
 
 
+# ---------------------------------------------------------------------------
+# ICAO station lookup – maps city names to nearest airport ICAO codes
+# ---------------------------------------------------------------------------
+
+CITY_ICAO: dict[str, str] = {
+    "new york city": "KJFK",
+    "new york": "KJFK",
+    "los angeles": "KLAX",
+    "chicago": "KORD",
+    "houston": "KIAH",
+    "phoenix": "KPHX",
+    "philadelphia": "KPHL",
+    "san antonio": "KSAT",
+    "san diego": "KSAN",
+    "dallas": "KDFW",
+    "san jose": "KSJC",
+    "austin": "KAUS",
+    "jacksonville": "KJAX",
+    "fort worth": "KDFW",
+    "columbus": "KCMH",
+    "charlotte": "KCLT",
+    "san francisco": "KSFO",
+    "indianapolis": "KIND",
+    "seattle": "KSEA",
+    "denver": "KDEN",
+    "washington": "KDCA",
+    "washington dc": "KDCA",
+    "nashville": "KBNA",
+    "oklahoma city": "KOKC",
+    "el paso": "KELP",
+    "boston": "KBOS",
+    "portland": "KPDX",
+    "las vegas": "KLAS",
+    "memphis": "KMEM",
+    "louisville": "KSDF",
+    "baltimore": "KBWI",
+    "milwaukee": "KMKE",
+    "albuquerque": "KABQ",
+    "tucson": "KTUS",
+    "fresno": "KFAT",
+    "mesa": "KPHX",
+    "sacramento": "KSMF",
+    "atlanta": "KATL",
+    "kansas city": "KMCI",
+    "colorado springs": "KCOS",
+    "omaha": "KOMA",
+    "raleigh": "KRDU",
+    "long beach": "KLGB",
+    "virginia beach": "KORF",
+    "miami": "KMIA",
+    "oakland": "KOAK",
+    "minneapolis": "KMSP",
+    "tulsa": "KTUL",
+    "tampa": "KTPA",
+    "arlington": "KDFW",
+    "new orleans": "KMSY",
+    "wichita": "KICT",
+    "cleveland": "KCLE",
+    "bakersfield": "KBFL",
+    "aurora": "KDEN",
+    "anaheim": "KSNA",
+    "honolulu": "PHNL",
+    "santa ana": "KSNA",
+    "riverside": "KRAL",
+    "corpus christi": "KCRP",
+    "lexington": "KLEX",
+    "pittsburgh": "KPIT",
+    "anchorage": "PANC",
+    "stockton": "KSCK",
+    "cincinnati": "KCVG",
+    "saint paul": "KMSP",
+    "st. paul": "KMSP",
+    "toledo": "KTOL",
+    "greensboro": "KGSO",
+    "newark": "KEWR",
+    "plano": "KDFW",
+    "henderson": "KLAS",
+    "lincoln": "KLNK",
+    "buffalo": "KBUF",
+    "jersey city": "KEWR",
+    "chula vista": "KSAN",
+    "norfolk": "KORF",
+    "detroit": "KDTW",
+    "chandler": "KPHX",
+    "laredo": "KLRD",
+    "madison": "KMSN",
+    "lubbock": "KLBB",
+    "scottsdale": "KPHX",
+    "reno": "KRNO",
+    "glendale": "KPHX",
+    "gilbert": "KPHX",
+    "winston-salem": "KINT",
+    "north las vegas": "KLAS",
+    "irving": "KDFW",
+    "chesapeake": "KORF",
+    "boise": "KBOI",
+    "richmond": "KRIC",
+    "spokane": "KGEG",
+    "baton rouge": "KBTR",
+    "des moines": "KDSM",
+    "tacoma": "KSEA",
+    "birmingham": "KBHM",
+    "salt lake city": "KSLC",
+    "rochester": "KROC",
+    "modesto": "KMOD",
+    "st. louis": "KSTL",
+    "saint louis": "KSTL",
+    # State names → major airport in capital / largest city
+    "alabama": "KBHM",
+    "alaska": "PANC",
+    "arizona": "KPHX",
+    "arkansas": "KLIT",
+    "california": "KLAX",
+    "colorado": "KDEN",
+    "connecticut": "KBDL",
+    "delaware": "KILG",
+    "florida": "KMIA",
+    "georgia": "KATL",
+    "hawaii": "PHNL",
+    "idaho": "KBOI",
+    "illinois": "KORD",
+    "indiana": "KIND",
+    "iowa": "KDSM",
+    "kansas": "KICT",
+    "kentucky": "KSDF",
+    "louisiana": "KMSY",
+    "maine": "KPWM",
+    "maryland": "KBWI",
+    "massachusetts": "KBOS",
+    "michigan": "KDTW",
+    "minnesota": "KMSP",
+    "mississippi": "KJAN",
+    "missouri": "KSTL",
+    "montana": "KBZN",
+    "nebraska": "KOMA",
+    "nevada": "KLAS",
+    "new hampshire": "KMHT",
+    "new jersey": "KEWR",
+    "new mexico": "KABQ",
+    "north carolina": "KCLT",
+    "north dakota": "KFAR",
+    "ohio": "KCMH",
+    "oklahoma": "KOKC",
+    "oregon": "KPDX",
+    "pennsylvania": "KPHL",
+    "rhode island": "KPVD",
+    "south carolina": "KCHS",
+    "south dakota": "KFSD",
+    "tennessee": "KBNA",
+    "texas": "KDFW",
+    "utah": "KSLC",
+    "vermont": "KBTV",
+    "virginia": "KRIC",
+    "west virginia": "KCRW",
+    "wisconsin": "KMKE",
+    "wyoming": "KCPR",
+}
+
+
+def icao_for_location(location: str) -> str | None:
+    """Resolve a location name to its nearest ICAO station code.
+
+    Tries exact match first, then substring containment.
+    """
+    key = location.strip().lower()
+    if key in CITY_ICAO:
+        return CITY_ICAO[key]
+
+    for city, icao in CITY_ICAO.items():
+        if key in city or city in key:
+            return icao
+
+    logger.warning("icao_for_location: unknown location %r", location)
+    return None
+
+
 def geocode(location: str) -> tuple[float, float] | None:
     """Resolve a location name to (lat, lon) via static lookup.
 
@@ -212,9 +389,45 @@ OPERATOR_MAP: dict[str, str] = {
     "below": "below",
     "at_least": "above",
     "at_most": "below",
+    "occurs": "below",  # freeze/frost events → temperature below threshold
 }
 
 SUPPORTED_VARIABLES: set[str] = {"temperature", "precipitation", "wind_speed"}
+
+# Aliases map unsupported market variables to NWP-compatible ones.
+VARIABLE_ALIASES: dict[str, dict] = {
+    "snowfall": {
+        "nwp_variable": "precipitation",
+    },
+    "freeze": {
+        "nwp_variable": "temperature",
+        "threshold_override": 32.0,  # always 32°F
+        "operator_override": "below",
+    },
+    "heat_wave": {
+        "nwp_variable": "temperature",
+        "operator_override": "above",
+    },
+}
+
+
+def resolve_variable(
+    variable: str,
+    threshold: float | None,
+    operator: str | None,
+) -> tuple[str, float | None, str | None]:
+    """Resolve market variable to NWP-compatible variable via aliases.
+
+    Returns (resolved_variable, resolved_threshold, resolved_operator).
+    """
+    alias = VARIABLE_ALIASES.get(variable)
+    if alias is None:
+        return variable, threshold, operator
+    return (
+        alias["nwp_variable"],
+        alias.get("threshold_override", threshold),
+        alias.get("operator_override", operator),
+    )
 
 
 def normalize_operator(op: str) -> str | None:
@@ -272,6 +485,17 @@ _FETCH_SEMAPHORE = asyncio.Semaphore(8)
 
 
 @dataclass
+class AviationContext:
+    """Contextual intelligence from aviation weather sources."""
+
+    taf_amendment_count: int = 0
+    speci_events_2h: int = 0
+    has_severe_pireps: bool = False
+    active_sigmet_count: int = 0
+    active_airmet_count: int = 0
+
+
+@dataclass
 class MarketSignal:
     """Intermediate representation linking a market to model probabilities."""
 
@@ -280,8 +504,11 @@ class MarketSignal:
     market_prob: float
     gfs_prob: float | None
     ecmwf_prob: float | None
+    aviation_prob: float | None
     days_to_resolution: int
+    hours_to_resolution: float
     market: Market
+    aviation_context: AviationContext | None = None
 
 
 async def map_market(
@@ -303,10 +530,17 @@ async def map_market(
     ]):
         return None
 
-    if market.parsed_variable not in SUPPORTED_VARIABLES:
+    # Resolve variable aliases (snowfall→precipitation, freeze→temperature, etc.)
+    variable, threshold, operator_raw = resolve_variable(
+        market.parsed_variable,
+        market.parsed_threshold,
+        market.parsed_operator,
+    )
+
+    if variable not in SUPPORTED_VARIABLES:
         return None
 
-    operator = normalize_operator(market.parsed_operator)
+    operator = normalize_operator(operator_raw)
     if operator is None:
         return None
 
@@ -320,22 +554,25 @@ async def map_market(
         return None
 
     now = datetime.now(tz=timezone.utc)
+    hours_to_resolution = (target_dt - now).total_seconds() / 3600.0
     days_to_resolution = (target_dt - now).days
-    if days_to_resolution < 0:
+    if days_to_resolution < 0 and hours_to_resolution < 0:
         return None
 
-    threshold_si = convert_threshold(market.parsed_threshold, market.parsed_variable)
+    threshold_si = convert_threshold(threshold, variable)
 
     # --- fetch probabilities concurrently ---------------------------------
     async with _FETCH_SEMAPHORE:
         results = await asyncio.gather(
-            gfs.get_probability(lat, lon, target_dt, market.parsed_variable, threshold_si, operator, session),
-            ecmwf.get_probability(lat, lon, target_dt, market.parsed_variable, threshold_si, operator, session),
+            gfs.get_probability(lat, lon, target_dt, variable, threshold_si, operator, session),
+            ecmwf.get_probability(lat, lon, target_dt, variable, threshold_si, operator, session),
+            get_realtime_probability(market),
             return_exceptions=True,
         )
 
     gfs_prob = results[0] if not isinstance(results[0], BaseException) else None
     ecmwf_prob = results[1] if not isinstance(results[1], BaseException) else None
+    aviation_prob = results[2] if not isinstance(results[2], BaseException) else None
 
     if gfs_prob is not None and isinstance(gfs_prob, BaseException):
         logger.warning("GFS fetch failed for market %s: %s", market.id, gfs_prob)
@@ -343,10 +580,37 @@ async def map_market(
     if ecmwf_prob is not None and isinstance(ecmwf_prob, BaseException):
         logger.warning("ECMWF fetch failed for market %s: %s", market.id, ecmwf_prob)
         ecmwf_prob = None
+    if aviation_prob is not None and isinstance(aviation_prob, BaseException):
+        logger.warning("Aviation fetch failed for market %s: %s", market.id, aviation_prob)
+        aviation_prob = None
 
-    if gfs_prob is None and ecmwf_prob is None:
+    if gfs_prob is None and ecmwf_prob is None and aviation_prob is None:
         logger.info("No forecast data for market %s", market.id)
         return None
+
+    # --- gather aviation context (cheap queries when data is cached) -------
+    aviation_ctx = None
+    if aviation_prob is not None:
+        icao = icao_for_location(market.parsed_location)
+        if icao is not None:
+            ctx_results = await asyncio.gather(
+                aviation.taf_amendment_count(icao, hours=24),
+                aviation.detect_speci_events(icao, hours=2),
+                aviation.has_severe_weather_reports(lat, lon),
+                aviation.alerts_affecting_location(lat, lon),
+                return_exceptions=True,
+            )
+            amend = ctx_results[0] if not isinstance(ctx_results[0], BaseException) else 0
+            speci = ctx_results[1] if not isinstance(ctx_results[1], BaseException) else []
+            severe = ctx_results[2] if not isinstance(ctx_results[2], BaseException) else False
+            alerts = ctx_results[3] if not isinstance(ctx_results[3], BaseException) else []
+            aviation_ctx = AviationContext(
+                taf_amendment_count=amend,
+                speci_events_2h=len(speci) if isinstance(speci, list) else 0,
+                has_severe_pireps=bool(severe),
+                active_sigmet_count=sum(1 for a in alerts if getattr(a, "alert_type", None) == "SIGMET"),
+                active_airmet_count=sum(1 for a in alerts if getattr(a, "alert_type", None) == "AIRMET"),
+            )
 
     market_prob = market.current_yes_price or 0.5
 
@@ -356,8 +620,11 @@ async def map_market(
         market_prob=market_prob,
         gfs_prob=gfs_prob,
         ecmwf_prob=ecmwf_prob,
+        aviation_prob=aviation_prob,
         days_to_resolution=days_to_resolution,
+        hours_to_resolution=hours_to_resolution,
         market=market,
+        aviation_context=aviation_ctx,
     )
 
 
@@ -379,4 +646,39 @@ async def map_all_markets(
             signals.append(r)
 
     logger.info("Mapped %d / %d markets successfully", len(signals), len(markets))
+    return signals
+
+
+async def map_short_range_markets(
+    session: AsyncSession | None = None,
+) -> list[MarketSignal]:
+    """Fetch active weather markets and map only those within 30h to resolution."""
+    markets = await get_active_weather_markets(session)
+    now = datetime.now(tz=timezone.utc)
+
+    short_range = []
+    for m in markets:
+        if not m.parsed_target_date:
+            continue
+        target_dt = parse_target_date(m.parsed_target_date)
+        if target_dt is None:
+            continue
+        hours_out = (target_dt - now).total_seconds() / 3600.0
+        if 0 <= hours_out <= 30:
+            short_range.append(m)
+
+    logger.info(
+        "Short-range pipeline: %d / %d markets within 30h", len(short_range), len(markets),
+    )
+
+    tasks = [map_market(m, session) for m in short_range]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    signals: list[MarketSignal] = []
+    for r in results:
+        if isinstance(r, BaseException):
+            logger.error("map_market error: %s", r)
+        elif r is not None:
+            signals.append(r)
+
     return signals

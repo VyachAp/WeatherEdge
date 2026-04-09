@@ -9,13 +9,16 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
+
+from sqlalchemy import select
 
 from src.config import settings
 from src.db.engine import async_session as session_factory
 from src.db.models import Signal, TradeDirection
 from src.signals.consensus import compute_calibrated_consensus
-from src.signals.mapper import map_all_markets
+from src.signals.mapper import map_all_markets, map_short_range_markets
 
 if TYPE_CHECKING:
     from src.db.models import Market
@@ -39,6 +42,9 @@ MAX_DAYS: int = 7
 # ---------------------------------------------------------------------------
 
 
+SHORT_RANGE_MIN_EDGE_DISCOUNT: float = 0.75  # 25% reduction when aviation confirms
+
+
 @dataclass
 class ActionableSignal:
     """A signal that has passed all quality filters."""
@@ -52,7 +58,9 @@ class ActionableSignal:
     market_prob: float
     gfs_prob: float | None
     ecmwf_prob: float | None
+    aviation_prob: float | None
     days_to_resolution: int
+    hours_to_resolution: float
     ev_score: float
 
 
@@ -88,17 +96,46 @@ def passes_filters(
     confidence: float,
     days_to_resolution: int,
     market: Market,
+    aviation_prob: float | None = None,
+    hours_to_resolution: float | None = None,
 ) -> bool:
-    """Apply all signal quality filters."""
-    if abs(edge) < settings.MIN_EDGE:
+    """Apply tiered signal quality filters.
+
+    Three tiers based on aviation confirmation and forecast horizon:
+    - Ultra-short (aviation + ≤12h): most relaxed thresholds
+    - Short-range (aviation + ≤30h): moderate relaxation
+    - Standard (no aviation): original thresholds
+    """
+    has_aviation = aviation_prob is not None and hours_to_resolution is not None and hours_to_resolution <= 30
+
+    if has_aviation and hours_to_resolution <= 12:
+        # Ultra-short: aviation data is near-observation quality
+        min_edge = settings.MIN_EDGE * settings.SR_MIN_EDGE_DISCOUNT
+        min_liq = settings.SR_MIN_LIQUIDITY
+        min_vol = settings.SR_MIN_VOLUME
+        min_days = 0
+    elif has_aviation:
+        # Short-range (12-30h): moderate relaxation
+        min_edge = settings.MIN_EDGE * SHORT_RANGE_MIN_EDGE_DISCOUNT
+        min_liq = 200.0
+        min_vol = 75.0
+        min_days = 0
+    else:
+        # Standard: original thresholds
+        min_edge = settings.MIN_EDGE
+        min_liq = MIN_LIQUIDITY
+        min_vol = MIN_VOLUME
+        min_days = MIN_DAYS
+
+    if abs(edge) < min_edge:
         return False
-    if (market.liquidity or 0) < MIN_LIQUIDITY:
+    if (market.liquidity or 0) < min_liq:
         return False
     if confidence < MIN_CONFIDENCE:
         return False
-    if not (MIN_DAYS <= days_to_resolution <= MAX_DAYS):
+    if not (min_days <= days_to_resolution <= MAX_DAYS):
         return False
-    if (market.volume or 0) < MIN_VOLUME:
+    if (market.volume or 0) < min_vol:
         return False
     return True
 
@@ -122,6 +159,7 @@ async def persist_signal(
         confidence=signal.confidence,
         gfs_prob=signal.gfs_prob,
         ecmwf_prob=signal.ecmwf_prob,
+        aviation_prob=signal.aviation_prob,
     )
     session.add(row)
     return row
@@ -145,24 +183,71 @@ async def detect_signals(
     own_session = session is None
     if own_session:
         async with session_factory() as session:
-            return await _detect(session)
-    return await _detect(session)  # type: ignore[arg-type]
+            ms = await map_all_markets(session)
+            return await _detect(session, ms)
+    ms = await map_all_markets(session)  # type: ignore[arg-type]
+    return await _detect(session, ms)  # type: ignore[arg-type]
 
 
-async def _detect(session: AsyncSession) -> list[ActionableSignal]:
-    market_signals = await map_all_markets(session)
+async def detect_signals_short_range(
+    session: AsyncSession | None = None,
+) -> list[ActionableSignal]:
+    """Run signal detection for short-range markets only (≤30h).
+
+    Uses the same pipeline as ``detect_signals`` but only processes
+    markets within 30 hours of resolution, with deduplication against
+    recently created signals.
+    """
+    own_session = session is None
+    if own_session:
+        async with session_factory() as session:
+            ms = await map_short_range_markets(session)
+            return await _detect(session, ms, dedup_minutes=60)
+    ms = await map_short_range_markets(session)  # type: ignore[arg-type]
+    return await _detect(session, ms, dedup_minutes=60)  # type: ignore[arg-type]
+
+
+async def _detect(
+    session: AsyncSession,
+    market_signals: list,
+    dedup_minutes: int = 0,
+) -> list[ActionableSignal]:
     logger.info("Processing %d mapped market signals", len(market_signals))
+
+    # Build dedup set of recently signaled markets
+    recent_market_ids: set[str] = set()
+    if dedup_minutes > 0:
+        cutoff = datetime.now(tz=timezone.utc) - timedelta(minutes=dedup_minutes)
+        stmt = select(Signal.market_id).where(Signal.created_at >= cutoff)
+        result = await session.execute(stmt)
+        recent_market_ids = {row[0] for row in result.all()}
+        if recent_market_ids:
+            logger.info("Dedup: skipping %d recently signaled markets", len(recent_market_ids))
 
     actionable: list[ActionableSignal] = []
 
     for ms in market_signals:
+        if ms.market_id in recent_market_ids:
+            continue
         consensus = await compute_calibrated_consensus(
-            ms.gfs_prob, ms.ecmwf_prob, session
+            ms.gfs_prob,
+            ms.ecmwf_prob,
+            session,
+            aviation_prob=ms.aviation_prob,
+            hours_to_resolution=ms.hours_to_resolution,
+            aviation_context=ms.aviation_context,
         )
 
         edge, direction = compute_edge(consensus.consensus_prob, ms.market_prob)
 
-        if not passes_filters(edge, consensus.confidence, ms.days_to_resolution, ms.market):
+        if not passes_filters(
+            edge,
+            consensus.confidence,
+            ms.days_to_resolution,
+            ms.market,
+            aviation_prob=ms.aviation_prob,
+            hours_to_resolution=ms.hours_to_resolution,
+        ):
             continue
 
         ev_score = abs(edge) * consensus.confidence
@@ -177,7 +262,9 @@ async def _detect(session: AsyncSession) -> list[ActionableSignal]:
             market_prob=ms.market_prob,
             gfs_prob=ms.gfs_prob,
             ecmwf_prob=ms.ecmwf_prob,
+            aviation_prob=ms.aviation_prob,
             days_to_resolution=ms.days_to_resolution,
+            hours_to_resolution=ms.hours_to_resolution,
             ev_score=ev_score,
         )
 

@@ -8,12 +8,15 @@ import logging
 import re
 import traceback
 from datetime import datetime, time, timezone
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.error import RetryAfter, TelegramError
 from telegram.ext import Application, CallbackQueryHandler, ContextTypes
+
+from sqlalchemy import select
 
 from src.config import settings
 from src.db.engine import async_session
@@ -46,6 +49,19 @@ def _confidence_label(confidence: float) -> str:
     if confidence >= 0.55:
         return "MEDIUM"
     return "LOW"
+
+
+def _short_range_line(signal: object, e: Callable[[object], str]) -> str:
+    """Build an optional short-range indicator line for aviation-enhanced signals."""
+    aviation_prob = getattr(signal, "aviation_prob", None)
+    hours = getattr(signal, "hours_to_resolution", None)
+    if aviation_prob is None or hours is None:
+        return ""
+    if hours <= 6:
+        return f"\u2708\ufe0f Short\\-range \\({e(f'{hours:.0f}h')}\\) \\u2014 aviation\\-enhanced\n"
+    if hours <= 12:
+        return f"\u2708\ufe0f Near\\-term \\({e(f'{hours:.0f}h')}\\) \\u2014 aviation\\-enhanced\n"
+    return f"\u2708\ufe0f Aviation data \\({e(f'{hours:.0f}h')}\\) available\n"
 
 
 # ---------------------------------------------------------------------------
@@ -139,13 +155,15 @@ class Alerter:
         while True:
             text, markup = await self._queue.get()
             try:
-                await self._app.bot.send_message(
+                msg = await self._app.bot.send_message(
                     chat_id=self._chat_id,
                     text=text,
                     parse_mode=ParseMode.MARKDOWN_V2,
                     reply_markup=markup,
                     disable_web_page_preview=True,
                 )
+                logger.info("Telegram message delivered (id=%s, queue=%d)",
+                            msg.message_id, self._queue.qsize())
             except RetryAfter as exc:
                 logger.warning("Rate limited — retrying after %ss", exc.retry_after)
                 await asyncio.sleep(exc.retry_after)
@@ -186,6 +204,7 @@ class Alerter:
 
         gfs_str = f"{signal.gfs_prob * 100:.0f}%" if signal.gfs_prob is not None else "n/a"
         ecmwf_str = f"{signal.ecmwf_prob * 100:.0f}%" if signal.ecmwf_prob is not None else "n/a"
+        aviation_str = f"{signal.aviation_prob * 100:.0f}%" if signal.aviation_prob is not None else None
 
         resolve_date = market.end_date.strftime("%B %d") if market.end_date else "TBD"
         liquidity_str = f"${market.liquidity:,.0f}" if market.liquidity else "n/a"
@@ -205,7 +224,9 @@ class Alerter:
             f"\U0001f4c8 Edge: {e(f'+{signal.edge * 100:.1f}%')}\n"
             f"\U0001f3af Confidence: {e(f'{conf_label} ({signal.confidence:.2f})')}\n"
             f"\n"
-            f"Models: GFS {e(gfs_str)} \\| ECMWF {e(ecmwf_str)}\n"
+            f"Models: GFS {e(gfs_str)} \\| ECMWF {e(ecmwf_str)}"
+            f"{'  \\| Aviation ' + e(aviation_str) if aviation_str else ''}\n"
+            f"{_short_range_line(signal, e)}"
             f"\U0001f4c5 Resolves: {e(resolve_date)} \\| Liquidity: {e(liquidity_str)}\n"
             f"\n"
             f"Kelly: {e(f'{kelly_raw}%')}{e(capped_note)} "
@@ -213,18 +234,25 @@ class Alerter:
             f"Bankroll: {e(f'${drawdown.current:,.0f}')} \\| "
             f"Drawdown: {e(f'{drawdown.drawdown_pct * 100:.1f}%')}\n"
             f"\n"
+            f"{'\\u2705 *AUTO\\-EXECUTED*\n' if settings.AUTO_EXECUTE and settings.POLYMARKET_PRIVATE_KEY else ''}"
             f"[Open on Polymarket]({e(url)})"
         )
 
-        keyboard = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("\u2705 Execute", callback_data=f"exec:{signal.market_id[:56]}"),
-                InlineKeyboardButton("\u23ed Skip", callback_data=f"skip:{signal.market_id[:56]}"),
-            ],
-            [
-                InlineKeyboardButton("\U0001f4ca Details", callback_data=f"detail:{signal.market_id[:56]}"),
-            ],
-        ])
+        if settings.AUTO_EXECUTE and settings.POLYMARKET_PRIVATE_KEY:
+            # Auto mode: no execute button, just details
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("\U0001f4ca Details", callback_data=f"detail:{signal.market_id[:56]}")],
+            ])
+        else:
+            keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("\u2705 Execute", callback_data=f"exec:{signal.market_id[:56]}"),
+                    InlineKeyboardButton("\u23ed Skip", callback_data=f"skip:{signal.market_id[:56]}"),
+                ],
+                [
+                    InlineKeyboardButton("\U0001f4ca Details", callback_data=f"detail:{signal.market_id[:56]}"),
+                ],
+            ])
 
         await self._enqueue(text, keyboard)
 
@@ -428,9 +456,36 @@ class Alerter:
         action, market_id = parts
 
         if action == "exec":
-            logger.info("Trade execution intent logged for market %s", market_id)
             await query.edit_message_reply_markup(reply_markup=None)
-            await query.message.reply_text("\u2705 Logged for execution")  # type: ignore[union-attr]
+            # Attempt live execution for the most recent PENDING trade
+            from src.execution.polymarket_client import place_order as _place_order
+            try:
+                async with async_session() as sess:
+                    stmt = (
+                        select(Trade)
+                        .where(Trade.market_id == market_id)
+                        .where(Trade.status == TradeStatus.PENDING)
+                        .order_by(Trade.opened_at.desc())
+                        .limit(1)
+                    )
+                    result = await sess.execute(stmt)
+                    trade = result.scalar_one_or_none()
+                    if trade is not None:
+                        ok = await _place_order(trade, sess)
+                        if ok:
+                            trade.status = TradeStatus.OPEN
+                            await sess.commit()
+                            await query.message.reply_text("\u2705 Order placed")  # type: ignore[union-attr]
+                        else:
+                            await sess.commit()
+                            await query.message.reply_text(  # type: ignore[union-attr]
+                                f"\u274c Order failed: {trade.exchange_status}",
+                            )
+                    else:
+                        await query.message.reply_text("\u26a0\ufe0f No pending trade found")  # type: ignore[union-attr]
+            except Exception:
+                logger.exception("Callback execution failed for %s", market_id)
+                await query.message.reply_text("\u274c Execution error")  # type: ignore[union-attr]
 
         elif action == "skip":
             logger.info("Signal skipped for market %s", market_id)

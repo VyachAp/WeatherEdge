@@ -2,11 +2,13 @@ import enum
 from datetime import datetime
 
 from sqlalchemy import (
+    Boolean,
     Column,
     DateTime,
     Enum,
     Float,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
@@ -98,6 +100,7 @@ class Signal(Base):
     confidence = Column(Float)
     gfs_prob = Column(Float)
     ecmwf_prob = Column(Float)
+    aviation_prob = Column(Float)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
 
     market = relationship("Market", back_populates="signals")
@@ -119,6 +122,13 @@ class Trade(Base):
     opened_at = Column(DateTime, default=datetime.utcnow)
     closed_at = Column(DateTime)
 
+    # Polymarket CLOB execution fields
+    order_id = Column(String)  # CLOB order identifier
+    token_id = Column(String)  # YES/NO conditional token ID
+    fill_price = Column(Float)  # Actual execution price
+    filled_size = Column(Float)  # Shares filled
+    exchange_status = Column(String)  # live|matched|delayed|unmatched|failed
+
     signal = relationship("Signal", back_populates="trades")
     market = relationship("Market", back_populates="trades")
 
@@ -131,3 +141,85 @@ class BankrollLog(Base):
     peak = Column(Float, nullable=False)
     drawdown_pct = Column(Float, nullable=False)
     timestamp = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+
+# ---------------------------------------------------------------------------
+# Aviation weather models
+# ---------------------------------------------------------------------------
+
+
+class MetarObservation(Base):
+    __tablename__ = "metar_observations"
+    __table_args__ = (
+        Index("ix_metar_station_observed", "station_icao", "observed_at"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    station_icao = Column(String, nullable=False)
+    observed_at = Column(DateTime, nullable=False)
+    temp_c = Column(Float)
+    dewpoint_c = Column(Float)
+    temp_f = Column(Float)
+    dewpoint_f = Column(Float)
+    wind_speed_kts = Column(Float)
+    wind_dir = Column(Integer)
+    wind_gust_kts = Column(Float)
+    visibility_m = Column(Float)
+    visibility_miles = Column(Float)
+    pressure_hpa = Column(Float)
+    sky_condition = Column(JSONB)
+    ceiling_ft = Column(Integer)
+    flight_category = Column(String)
+    is_speci = Column(Boolean, default=False)
+    raw_metar = Column(Text)
+    fetched_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+
+class TafForecast(Base):
+    __tablename__ = "taf_forecasts"
+    __table_args__ = (
+        Index("ix_taf_station_issued", "station_icao", "issued_at"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    station_icao = Column(String, nullable=False)
+    issued_at = Column(DateTime, nullable=False)
+    valid_from = Column(DateTime, nullable=False)
+    valid_to = Column(DateTime, nullable=False)
+    periods = Column(JSONB)
+    amendment_number = Column(Integer, default=0)
+    raw_taf = Column(Text)
+    fetched_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+
+class Pirep(Base):
+    __tablename__ = "pireps"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    report_id = Column(String, unique=True)
+    observed_at = Column(DateTime)
+    lat = Column(Float)
+    lon = Column(Float)
+    altitude_ft = Column(Integer)
+    icing_type = Column(String)
+    icing_intensity = Column(String)
+    turbulence_type = Column(String)
+    turbulence_intensity = Column(String)
+    weather = Column(String)
+    raw_text = Column(Text)
+    fetched_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+
+class AviationAlert(Base):
+    __tablename__ = "aviation_alerts"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    alert_id = Column(String, unique=True)
+    alert_type = Column(String)
+    hazard = Column(String)
+    severity = Column(String)
+    area = Column(JSONB)
+    valid_from = Column(DateTime)
+    valid_to = Column(DateTime)
+    raw_text = Column(Text)
+    fetched_at = Column(DateTime, nullable=False, default=datetime.utcnow)

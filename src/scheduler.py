@@ -30,7 +30,8 @@ from src.resolution import (
 from src.risk.drawdown import DrawdownLevel, DrawdownMonitor
 from src.risk.kelly import size_position
 from src.signals.consensus import get_calibration_coefficients
-from src.signals.detector import detect_signals
+from src.execution.polymarket_client import is_live, place_order
+from src.signals.detector import detect_signals, detect_signals_short_range
 from src.signals.mapper import geocode
 
 if TYPE_CHECKING:
@@ -71,6 +72,9 @@ def configure_logging() -> None:
     root = logging.getLogger()
     root.handlers = [handler]
     root.setLevel(logging.INFO)
+    # Suppress httpx request logging — it includes full URLs which can leak
+    # secrets embedded in paths (e.g. Telegram bot tokens).
+    logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
 # ---------------------------------------------------------------------------
@@ -170,6 +174,75 @@ async def job_scan_markets() -> None:
         await get_alerter().send_system_error(exc, "market scan")
 
 
+async def _size_and_create_trades(signals: list, alerter, monitor) -> None:
+    """Shared logic: size positions, create trades, send alerts."""
+    async with async_session() as session:
+        bankroll = await get_current_bankroll(session)
+        exposure = await get_current_exposure(session)
+        dd_state = monitor.check(bankroll)
+
+        for sig in signals:
+            position = size_position(
+                bankroll=bankroll,
+                model_prob=sig.consensus_prob,
+                market_prob=sig.market_prob,
+                current_exposure=exposure,
+            )
+
+            # Apply drawdown multiplier
+            adjusted_stake = position.stake_usd * dd_state.size_multiplier
+            if adjusted_stake < 5.0:
+                logger.info(
+                    "Skipping signal on %s: stake $%.2f after drawdown multiplier",
+                    sig.market_id,
+                    adjusted_stake,
+                )
+                continue
+
+            position.stake_usd = adjusted_stake
+
+            # Look up the Signal DB row for the FK
+            signal_id = await _latest_signal_id(session, sig.market_id)
+            if signal_id is None:
+                logger.warning("No Signal row found for market %s", sig.market_id)
+                continue
+
+            # Create trade
+            trade = Trade(
+                signal_id=signal_id,
+                market_id=sig.market_id,
+                direction=sig.direction,
+                stake_usd=position.stake_usd,
+                entry_price=sig.market_prob,
+                status=TradeStatus.PENDING,
+            )
+            session.add(trade)
+            await session.flush()  # assign trade.id before execution
+
+            # Execute order on Polymarket
+            order_ok = await place_order(trade, session)
+            if order_ok:
+                trade.status = TradeStatus.OPEN
+                exposure += position.stake_usd
+            else:
+                logger.warning(
+                    "Order failed for market %s (status: %s); trade stays PENDING",
+                    sig.market_id,
+                    trade.exchange_status,
+                )
+                continue
+
+            # Fetch Market row for the alert
+            market = await session.get(Market, sig.market_id)
+
+            await alerter.send_signal_alert(sig, position, dd_state, market)
+
+        if dd_state.level in (DrawdownLevel.CAUTION, DrawdownLevel.PAUSED):
+            await alerter.send_drawdown_warning(dd_state)
+
+        await session.commit()
+
+
 async def job_forecast_pipeline() -> None:
     """Every 6 h — fetch forecasts, generate signals, size positions."""
     alerter = get_alerter()
@@ -197,63 +270,29 @@ async def job_forecast_pipeline() -> None:
 
         # 3. Risk sizing and trade creation
         monitor = await _get_drawdown_monitor()
-
-        async with async_session() as session:
-            bankroll = await get_current_bankroll(session)
-            exposure = await get_current_exposure(session)
-            dd_state = monitor.check(bankroll)
-
-            for sig in signals:
-                position = size_position(
-                    bankroll=bankroll,
-                    model_prob=sig.consensus_prob,
-                    market_prob=sig.market_prob,
-                    current_exposure=exposure,
-                )
-
-                # Apply drawdown multiplier
-                adjusted_stake = position.stake_usd * dd_state.size_multiplier
-                if adjusted_stake < 5.0:
-                    logger.info(
-                        "Skipping signal on %s: stake $%.2f after drawdown multiplier",
-                        sig.market_id,
-                        adjusted_stake,
-                    )
-                    continue
-
-                position.stake_usd = adjusted_stake
-
-                # Look up the Signal DB row for the FK
-                signal_id = await _latest_signal_id(session, sig.market_id)
-                if signal_id is None:
-                    logger.warning("No Signal row found for market %s", sig.market_id)
-                    continue
-
-                # Create trade
-                trade = Trade(
-                    signal_id=signal_id,
-                    market_id=sig.market_id,
-                    direction=sig.direction,
-                    stake_usd=position.stake_usd,
-                    entry_price=sig.market_prob,
-                    status=TradeStatus.OPEN,
-                )
-                session.add(trade)
-                exposure += position.stake_usd
-
-                # Fetch Market row for the alert
-                market = await session.get(Market, sig.market_id)
-
-                await alerter.send_signal_alert(sig, position, dd_state, market)
-
-            if dd_state.level in (DrawdownLevel.CAUTION, DrawdownLevel.PAUSED):
-                await alerter.send_drawdown_warning(dd_state)
-
-            await session.commit()
+        await _size_and_create_trades(signals, alerter, monitor)
 
     except Exception as exc:
         logger.exception("Forecast pipeline failed")
         await alerter.send_system_error(exc, "forecast pipeline")
+
+
+async def job_short_range_pipeline() -> None:
+    """Every 60 min — aviation-focused pipeline for markets ≤30h out."""
+    alerter = get_alerter()
+    try:
+        signals = await detect_signals_short_range()
+        logger.info("Short-range pipeline: %d actionable signals", len(signals))
+
+        if not signals:
+            return
+
+        monitor = await _get_drawdown_monitor()
+        await _size_and_create_trades(signals, alerter, monitor)
+
+    except Exception as exc:
+        logger.exception("Short-range pipeline failed")
+        await alerter.send_system_error(exc, "short-range pipeline")
 
 
 async def job_daily_settlement() -> None:
@@ -422,6 +461,13 @@ def setup_scheduler() -> AsyncIOScheduler:
         job_daily_settlement,
         CronTrigger(hour=22, minute=0, timezone="UTC"),
         id="daily_settlement",
+        max_instances=1,
+        coalesce=True,
+    )
+    scheduler.add_job(
+        job_short_range_pipeline,
+        IntervalTrigger(minutes=settings.SR_PIPELINE_INTERVAL_MINUTES),
+        id="short_range_pipeline",
         max_instances=1,
         coalesce=True,
     )
