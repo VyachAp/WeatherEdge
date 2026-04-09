@@ -439,15 +439,23 @@ async def run_scheduler() -> None:
     _shutdown_event = asyncio.Event()
 
     loop = asyncio.get_running_loop()
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        loop.add_signal_handler(sig, _shutdown_event.set)
+    try:
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            loop.add_signal_handler(sig, _shutdown_event.set)
+    except NotImplementedError:
+        # Some runtimes (e.g. DO App Platform) don't support signal handlers
+        logger.warning("Signal handlers not supported; will run until cancelled")
 
     health_server = await start_health_server()
 
     _scheduler = setup_scheduler()
     _scheduler.start()
 
-    await job_startup()
+    try:
+        await job_startup()
+    except Exception as exc:
+        logger.exception("Startup job failed, continuing scheduler")
+        await get_alerter().send_system_error(exc, "startup")
 
     await _shutdown_event.wait()
 
