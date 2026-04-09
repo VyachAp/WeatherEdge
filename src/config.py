@@ -12,6 +12,8 @@ class Settings(BaseSettings):
     def normalize_db_url(cls, v: str) -> str:
         if v.startswith("postgresql://"):
             v = v.replace("postgresql://", "postgresql+asyncpg://", 1)
+        # asyncpg does not understand ?sslmode=; replace with ?ssl=
+        v = v.replace("sslmode=", "ssl=")
         return v
     TELEGRAM_BOT_TOKEN: str = ""
     TELEGRAM_CHAT_ID: str = ""
