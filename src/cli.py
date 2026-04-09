@@ -181,3 +181,7 @@ def paper_trade(days: int) -> None:
         click.echo(f"  Win rate:       {result.win_rate:.1%}")
 
     asyncio.run(_paper_trade())
+
+
+if __name__ == "__main__":
+    main()
