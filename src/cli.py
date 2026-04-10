@@ -227,11 +227,6 @@ def approve() -> None:
     from eth_account import Account
     from web3 import Web3
 
-    try:
-        from web3.middleware import ExtraDataLengthMiddleware as poa_middleware
-    except ImportError:
-        from web3.middleware import geth_poa_middleware as poa_middleware
-
     RPC_URLS = [
         "https://polygon-bor-rpc.publicnode.com",
         "https://rpc.ankr.com/polygon",
@@ -308,7 +303,6 @@ def approve() -> None:
     for rpc_url in RPC_URLS:
         try:
             _w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": 10}))
-            _w3.middleware_onion.inject(poa_middleware, layer=0)
             _w3.eth.get_balance(address)  # test connection
             w3 = _w3
             click.echo(f"Connected to {rpc_url}")
@@ -329,11 +323,14 @@ def approve() -> None:
     usdc = w3.eth.contract(address=Web3.to_checksum_address(USDC), abi=ERC20_ABI)
     ctf = w3.eth.contract(address=Web3.to_checksum_address(CTF), abi=ERC1155_ABI)
 
+    gas_price = w3.eth.gas_price  # eth_gasPrice RPC — no extraData issue
+
     def send_tx(tx_data):
         nonce = w3.eth.get_transaction_count(address)
         tx_data["nonce"] = nonce
         tx_data["chainId"] = CHAIN_ID
         tx_data["from"] = address
+        tx_data["gasPrice"] = gas_price
         if "gas" not in tx_data:
             tx_data["gas"] = w3.eth.estimate_gas(tx_data)
         signed = w3.eth.account.sign_transaction(tx_data, private_key=settings.POLYMARKET_PRIVATE_KEY)
@@ -366,7 +363,7 @@ def approve() -> None:
     # --- USDC approvals ---
     for name, spender in needs_usdc:
         click.echo(f"  Approving USDC for {name}...", nl=False)
-        tx = usdc.functions.approve(spender, max_uint).build_transaction({"from": address})
+        tx = usdc.functions.approve(spender, max_uint).build_transaction({"from": address, "gasPrice": gas_price})
         receipt = send_tx(tx)
         ok = "OK" if receipt["status"] == 1 else "FAILED"
         click.echo(f" {ok} (tx: {receipt['transactionHash'].hex()[:16]}...)")
@@ -374,7 +371,7 @@ def approve() -> None:
     # --- CTF approvals ---
     for name, spender in needs_ctf:
         click.echo(f"  Approving CTF for {name}...", nl=False)
-        tx = ctf.functions.setApprovalForAll(spender, True).build_transaction({"from": address})
+        tx = ctf.functions.setApprovalForAll(spender, True).build_transaction({"from": address, "gasPrice": gas_price})
         receipt = send_tx(tx)
         ok = "OK" if receipt["status"] == 1 else "FAILED"
         click.echo(f" {ok} (tx: {receipt['transactionHash'].hex()[:16]}...)")
