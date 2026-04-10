@@ -184,6 +184,34 @@ def paper_trade(days: int) -> None:
 
 
 @main.command()
+def migrate() -> None:
+    """Run pending database migrations (adds missing columns)."""
+
+    async def _migrate() -> None:
+        from sqlalchemy import text
+
+        from src.db.engine import engine
+
+        columns = [
+            ("trades", "order_id", "VARCHAR"),
+            ("trades", "token_id", "VARCHAR"),
+            ("trades", "fill_price", "FLOAT"),
+            ("trades", "filled_size", "FLOAT"),
+            ("trades", "exchange_status", "VARCHAR"),
+        ]
+
+        async with engine.begin() as conn:
+            for table, col, dtype in columns:
+                stmt = f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {col} {dtype}"
+                await conn.execute(text(stmt))
+                click.echo(f"  OK: {table}.{col}")
+
+        click.echo("Migration complete.")
+
+    asyncio.run(_migrate())
+
+
+@main.command()
 def approve() -> None:
     """Approve USDC + Conditional Token contracts for Polymarket trading.
 
