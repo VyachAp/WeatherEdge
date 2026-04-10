@@ -358,26 +358,25 @@ def approve() -> None:
 
     if not needs_usdc and not needs_ctf:
         click.echo("\nAll approvals already in place!")
-        return
+    else:
+        total_txs = len(needs_usdc) + len(needs_ctf)
+        click.echo(f"\nNeed {total_txs} approval transaction(s). Proceeding...")
 
-    total_txs = len(needs_usdc) + len(needs_ctf)
-    click.echo(f"\nNeed {total_txs} approval transaction(s). Proceeding...")
+        # --- USDC approvals ---
+        for name, spender in needs_usdc:
+            click.echo(f"  Approving USDC for {name}...", nl=False)
+            tx = usdc.functions.approve(spender, max_uint).build_transaction({"from": address, "gasPrice": gas_price})
+            receipt = send_tx(tx)
+            ok = "OK" if receipt["status"] == 1 else "FAILED"
+            click.echo(f" {ok} (tx: {receipt['transactionHash'].hex()[:16]}...)")
 
-    # --- USDC approvals ---
-    for name, spender in needs_usdc:
-        click.echo(f"  Approving USDC for {name}...", nl=False)
-        tx = usdc.functions.approve(spender, max_uint).build_transaction({"from": address, "gasPrice": gas_price})
-        receipt = send_tx(tx)
-        ok = "OK" if receipt["status"] == 1 else "FAILED"
-        click.echo(f" {ok} (tx: {receipt['transactionHash'].hex()[:16]}...)")
-
-    # --- CTF approvals ---
-    for name, spender in needs_ctf:
-        click.echo(f"  Approving CTF for {name}...", nl=False)
-        tx = ctf.functions.setApprovalForAll(spender, True).build_transaction({"from": address, "gasPrice": gas_price})
-        receipt = send_tx(tx)
-        ok = "OK" if receipt["status"] == 1 else "FAILED"
-        click.echo(f" {ok} (tx: {receipt['transactionHash'].hex()[:16]}...)")
+        # --- CTF approvals ---
+        for name, spender in needs_ctf:
+            click.echo(f"  Approving CTF for {name}...", nl=False)
+            tx = ctf.functions.setApprovalForAll(spender, True).build_transaction({"from": address, "gasPrice": gas_price})
+            receipt = send_tx(tx)
+            ok = "OK" if receipt["status"] == 1 else "FAILED"
+            click.echo(f" {ok} (tx: {receipt['transactionHash'].hex()[:16]}...)")
 
     # --- Notify CLOB server ---
     click.echo("\nNotifying Polymarket CLOB server...")
