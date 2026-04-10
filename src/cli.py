@@ -381,16 +381,28 @@ def approve() -> None:
 
     # --- Notify CLOB server ---
     click.echo("\nNotifying Polymarket CLOB server...")
+    from eth_account import Account
     from py_clob_client.client import ClobClient
     from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
+
+    account = Account.from_key(settings.POLYMARKET_PRIVATE_KEY)
+    funder_address = account.address
+
+    temp_client = ClobClient(
+        settings.POLYMARKET_HOST,
+        key=settings.POLYMARKET_PRIVATE_KEY,
+        chain_id=settings.POLYMARKET_CHAIN_ID,
+    )
+    creds = temp_client.create_or_derive_api_creds()
 
     client = ClobClient(
         settings.POLYMARKET_HOST,
         key=settings.POLYMARKET_PRIVATE_KEY,
         chain_id=settings.POLYMARKET_CHAIN_ID,
+        creds=creds,
+        signature_type=0,
+        funder=funder_address,
     )
-    creds = client.create_or_derive_api_creds()
-    client.set_api_creds(creds)
     client.update_balance_allowance(BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
     click.echo("Done! You can now trade on Polymarket.")
 
@@ -410,16 +422,28 @@ def test_trade(amount: float) -> None:
             click.echo("Error: POLYMARKET_PRIVATE_KEY not set in .env")
             raise SystemExit(1)
 
+        from eth_account import Account
         from py_clob_client.client import ClobClient
         from py_clob_client.clob_types import MarketOrderArgs, OrderType
+
+        account = Account.from_key(settings.POLYMARKET_PRIVATE_KEY)
+        funder_address = account.address
+
+        temp_client = ClobClient(
+            settings.POLYMARKET_HOST,
+            key=settings.POLYMARKET_PRIVATE_KEY,
+            chain_id=settings.POLYMARKET_CHAIN_ID,
+        )
+        creds = temp_client.create_or_derive_api_creds()
 
         client = ClobClient(
             settings.POLYMARKET_HOST,
             key=settings.POLYMARKET_PRIVATE_KEY,
             chain_id=settings.POLYMARKET_CHAIN_ID,
+            creds=creds,
+            signature_type=0,
+            funder=funder_address,
         )
-        creds = client.create_or_derive_api_creds()
-        client.set_api_creds(creds)
 
         import httpx
 
