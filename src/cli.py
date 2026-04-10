@@ -428,6 +428,9 @@ def test_trade(amount: float) -> None:
         # Search for markets with valid CLOB token IDs
         found_market = None
         found_token = None
+        found_tick_size = None
+        found_neg_risk = None
+
         for search_tag in ["weather", "climate", None]:
             params = {"limit": 50, "active": "true", "order": "liquidity", "ascending": "false"}
             if search_tag:
@@ -444,33 +447,40 @@ def test_trade(amount: float) -> None:
 
             for m in markets:
                 token_ids = m.get("clobTokenIds") or []
-                if len(token_ids) >= 2 and token_ids[0]:
+                if len(token_ids) < 2 or not token_ids[0]:
+                    continue
+                # Validate the token is actually tradeable on the CLOB
+                try:
+                    ts = client.get_tick_size(token_ids[0])
+                    nr = client.get_neg_risk(token_ids[0])
                     found_market = m
                     found_token = token_ids[0]
+                    found_tick_size = ts
+                    found_neg_risk = nr
                     break
+                except Exception as exc:
+                    click.echo(f"  Skipping {m.get('question', '?')[:40]}... ({exc})")
+                    continue
 
             if found_market:
                 if search_tag:
-                    click.echo(f"Found via tag '{search_tag}'")
+                    click.echo(f"Found tradeable market via tag '{search_tag}'")
                 break
 
         if not found_market or not found_token:
-            click.echo("No tradeable market found with valid token IDs.")
+            click.echo("No tradeable market found with valid CLOB token IDs.")
             return
 
         click.echo(f"Market: {found_market.get('question', 'unknown')[:80]}")
         click.echo(f"YES token: {found_token[:20]}...")
+        click.echo(f"Tick size: {found_tick_size}, Neg risk: {found_neg_risk}")
         click.echo(f"Amount: ${amount:.2f}")
-
-        yes_token = found_token
-        tick_size = client.get_tick_size(yes_token)
-        neg_risk = client.get_neg_risk(yes_token)
 
         from py_clob_client.order_builder.constants import BUY
 
         # Place a small FOK market buy on YES
         click.echo("Placing FOK market order...")
-        market_order = MarketOrderArgs(token_id=yes_token, amount=amount, side=BUY)
+        market_order = MarketOrderArgs(token_id=found_token, amount=amount, side=BUY)
         signed = client.create_market_order(market_order)
         resp = client.post_order(signed, OrderType.FOK)
 
