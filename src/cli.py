@@ -226,6 +226,7 @@ def approve() -> None:
 
     from eth_account import Account
     from web3 import Web3
+    from web3.middleware import ExtraDataLengthMiddleware
 
     RPC_URLS = [
         "https://polygon-bor-rpc.publicnode.com",
@@ -303,6 +304,7 @@ def approve() -> None:
     for rpc_url in RPC_URLS:
         try:
             _w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": 10}))
+            _w3.middleware_onion.inject(ExtraDataLengthMiddleware, layer=0)
             _w3.eth.get_balance(address)  # test connection
             w3 = _w3
             click.echo(f"Connected to {rpc_url}")
