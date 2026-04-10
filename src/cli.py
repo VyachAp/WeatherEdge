@@ -324,9 +324,10 @@ def approve() -> None:
     ctf = w3.eth.contract(address=Web3.to_checksum_address(CTF), abi=ERC1155_ABI)
 
     gas_price = w3.eth.gas_price  # eth_gasPrice RPC — no extraData issue
+    nonce = w3.eth.get_transaction_count(address)
 
     def send_tx(tx_data):
-        nonce = w3.eth.get_transaction_count(address)
+        nonlocal nonce
         tx_data["nonce"] = nonce
         tx_data["chainId"] = CHAIN_ID
         tx_data["from"] = address
@@ -335,7 +336,9 @@ def approve() -> None:
             tx_data["gas"] = w3.eth.estimate_gas(tx_data)
         signed = w3.eth.account.sign_transaction(tx_data, private_key=settings.POLYMARKET_PRIVATE_KEY)
         tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-        return w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+        nonce += 1
+        return receipt
 
     # --- Check existing approvals first ---
     click.echo("\n=== Checking existing approvals ===")
