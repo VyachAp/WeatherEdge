@@ -445,6 +445,29 @@ def test_trade(amount: float) -> None:
         )
 
         import httpx
+        from web3 import Web3
+
+        # --- Diagnostic: check on-chain USDC.e balance ---
+        USDC_E = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+        USDC_NATIVE = "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359"
+        BAL_ABI = [{"inputs": [{"name": "account", "type": "address"}], "name": "balanceOf", "outputs": [{"name": "", "type": "uint256"}], "stateMutability": "view", "type": "function"}]
+
+        w3 = Web3(Web3.HTTPProvider("https://polygon-bor-rpc.publicnode.com", request_kwargs={"timeout": 10}))
+        addr = Web3.to_checksum_address(funder_address)
+        usdc_e_bal = w3.eth.contract(address=Web3.to_checksum_address(USDC_E), abi=BAL_ABI).functions.balanceOf(addr).call()
+        usdc_n_bal = w3.eth.contract(address=Web3.to_checksum_address(USDC_NATIVE), abi=BAL_ABI).functions.balanceOf(addr).call()
+
+        click.echo(f"Wallet: {funder_address}")
+        click.echo(f"USDC.e balance:      ${usdc_e_bal / 1e6:.2f}  (required by Polymarket)")
+        click.echo(f"Native USDC balance: ${usdc_n_bal / 1e6:.2f}")
+
+        if usdc_e_bal == 0 and usdc_n_bal > 0:
+            click.echo("\nError: Your USDC is native USDC, but Polymarket requires USDC.e.")
+            click.echo("Swap native USDC -> USDC.e on a DEX (e.g. Uniswap on Polygon).")
+            raise SystemExit(1)
+        if usdc_e_bal == 0:
+            click.echo("\nError: No USDC.e on this wallet. Deposit USDC.e to trade.")
+            raise SystemExit(1)
 
         click.echo("Finding a tradeable market...")
 
