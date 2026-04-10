@@ -421,57 +421,58 @@ def test_trade(amount: float) -> None:
         creds = client.create_or_derive_api_creds()
         client.set_api_creds(creds)
 
-        # Find a weather market with good liquidity
         import httpx
 
-        click.echo("Finding a liquid weather market...")
-        async with httpx.AsyncClient() as http:
-            resp = await http.get(
-                "https://gamma-api.polymarket.com/markets",
-                params={"tag": "weather", "limit": 10, "active": True, "order": "liquidity", "ascending": False},
-                timeout=15,
-            )
-            resp.raise_for_status()
-            markets = resp.json()
+        click.echo("Finding a tradeable market...")
 
-        if not markets:
-            click.echo("No active weather markets found. Trying any market...")
+        # Search for markets with valid CLOB token IDs
+        found_market = None
+        found_token = None
+        for search_tag in ["weather", "climate", None]:
+            params = {"limit": 50, "active": "true", "order": "liquidity", "ascending": "false"}
+            if search_tag:
+                params["tag"] = search_tag
+
             async with httpx.AsyncClient() as http:
                 resp = await http.get(
                     "https://gamma-api.polymarket.com/markets",
-                    params={"limit": 5, "active": True, "order": "liquidity", "ascending": False},
+                    params=params,
                     timeout=15,
                 )
                 resp.raise_for_status()
                 markets = resp.json()
 
-        if not markets:
-            click.echo("No markets found.")
+            for m in markets:
+                token_ids = m.get("clobTokenIds") or []
+                if len(token_ids) >= 2 and token_ids[0]:
+                    found_market = m
+                    found_token = token_ids[0]
+                    break
+
+            if found_market:
+                if search_tag:
+                    click.echo(f"Found via tag '{search_tag}'")
+                break
+
+        if not found_market or not found_token:
+            click.echo("No tradeable market found with valid token IDs.")
             return
 
-        market = markets[0]
-        token_ids = market.get("clobTokenIds", [])
-        if len(token_ids) < 2:
-            click.echo(f"Market has no token IDs: {market.get('question', 'unknown')}")
-            return
-
-        yes_token = token_ids[0]
-        click.echo(f"Market: {market.get('question', 'unknown')[:80]}")
-        click.echo(f"YES token: {yes_token[:20]}...")
+        click.echo(f"Market: {found_market.get('question', 'unknown')[:80]}")
+        click.echo(f"YES token: {found_token[:20]}...")
         click.echo(f"Amount: ${amount:.2f}")
 
+        yes_token = found_token
         tick_size = client.get_tick_size(yes_token)
         neg_risk = client.get_neg_risk(yes_token)
 
+        from py_clob_client.order_builder.constants import BUY
+
         # Place a small FOK market buy on YES
         click.echo("Placing FOK market order...")
-        market_order = MarketOrderArgs(token_id=yes_token, amount=amount)
+        market_order = MarketOrderArgs(token_id=yes_token, amount=amount, side=BUY)
         signed = client.create_market_order(market_order)
-        resp = client.post_order(
-            signed,
-            OrderType.FOK,
-            options={"tick_size": tick_size, "neg_risk": neg_risk},
-        )
+        resp = client.post_order(signed, OrderType.FOK)
 
         click.echo(f"Response: {resp}")
 

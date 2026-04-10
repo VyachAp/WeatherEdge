@@ -215,13 +215,10 @@ async def place_order(
         market_order = MarketOrderArgs(
             token_id=token_id,
             amount=trade.stake_usd,  # USDC amount to spend
+            side=BUY,
         )
         signed = client.create_market_order(market_order)
-        resp = client.post_order(
-            signed,
-            OrderType.FOK,
-            options={"tick_size": tick_size, "neg_risk": neg_risk},
-        )
+        resp = client.post_order(signed, OrderType.FOK)
 
         trade.order_id = resp.get("orderID")
         trade.exchange_status = resp.get("status", "unknown")
