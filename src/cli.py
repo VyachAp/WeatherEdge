@@ -447,6 +447,9 @@ def test_trade(amount: float) -> None:
 
             for m in markets:
                 token_ids = m.get("clobTokenIds") or []
+                if isinstance(token_ids, str):
+                    import json
+                    token_ids = json.loads(token_ids)
                 if len(token_ids) < 2 or not token_ids[0]:
                     continue
                 # Validate the token is actually tradeable on the CLOB

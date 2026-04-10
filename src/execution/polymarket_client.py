@@ -110,6 +110,9 @@ async def get_token_ids(market_id: str) -> tuple[str, str] | None:
         market_data = data[0] if isinstance(data, list) else data
 
         token_ids = market_data.get("clobTokenIds", [])
+        if isinstance(token_ids, str):
+            import json
+            token_ids = json.loads(token_ids)
         if len(token_ids) < 2:
             logger.warning("Market %s has fewer than 2 token IDs: %s", market_id, token_ids)
             return None
