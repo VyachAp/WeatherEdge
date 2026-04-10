@@ -217,7 +217,7 @@ async def _detect(
     # Build dedup set of recently signaled markets
     recent_market_ids: set[str] = set()
     if dedup_minutes > 0:
-        cutoff = datetime.now(tz=timezone.utc) - timedelta(minutes=dedup_minutes)
+        cutoff = datetime.utcnow() - timedelta(minutes=dedup_minutes)
         stmt = select(Signal.market_id).where(Signal.created_at >= cutoff)
         result = await session.execute(stmt)
         recent_market_ids = {row[0] for row in result.all()}
