@@ -253,15 +253,21 @@ async def job_forecast_pipeline() -> None:
 
         if not locations:
             logger.warning("No locations to fetch forecasts for")
-            return
+            # Continue anyway — aviation data can still produce signals
+            # for bracket markets without NWP ensemble downloads.
 
-        gfs_count, ecmwf_count = await asyncio.gather(
-            ingest_latest_gefs(locations),
-            ingest_latest_ecmwf(locations),
-        )
-        logger.info("Forecast ingestion: GFS=%d, ECMWF=%d", gfs_count, ecmwf_count)
+        # NWP ensemble downloads disabled — aviation data provides the
+        # primary edge for short-range bracket markets and doesn't
+        # require multi-GB GRIB downloads.
+        # To re-enable: uncomment the block below.
+        # if locations:
+        #     gfs_count, ecmwf_count = await asyncio.gather(
+        #         ingest_latest_gefs(locations),
+        #         ingest_latest_ecmwf(locations),
+        #     )
+        #     logger.info("Forecast ingestion: GFS=%d, ECMWF=%d", gfs_count, ecmwf_count)
 
-        # 2. Signal detection
+        # Signal detection
         signals = await detect_signals()
         logger.info("Detected %d actionable signals", len(signals))
 
