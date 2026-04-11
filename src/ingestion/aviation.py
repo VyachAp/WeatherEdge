@@ -123,7 +123,11 @@ def _parse_metar_json(raw: dict[str, Any]) -> dict[str, Any]:
             ceiling_ft = c.get("base")
             break
 
-    vis_miles = raw.get("visib")
+    vis_raw = raw.get("visib")
+    try:
+        vis_miles = float(str(vis_raw).rstrip("+").lstrip("P")) if vis_raw is not None else None
+    except (ValueError, TypeError):
+        vis_miles = None
     vis_m = vis_miles * 1609.34 if vis_miles is not None else None
 
     obs_time_str = raw.get("obsTime") or raw.get("reportTime", "")
