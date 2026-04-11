@@ -355,6 +355,7 @@ async def job_startup() -> None:
 
     await job_scan_markets()
     await job_forecast_pipeline()
+    await job_short_range_pipeline()
 
     try:
         async with async_session() as session:
