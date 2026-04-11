@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, TYPE_CHECKING
 
@@ -493,28 +494,57 @@ async def get_taf_temperature_forecast(
 ) -> dict[str, Any]:
     """Get TAF-based temperature forecast for a station at a target time.
 
-    TAFs don't always include explicit temperature forecasts, so this returns
-    the available conditions and a confidence level.
+    Parses TX (max) and TN (min) temperature groups from the raw TAF text.
+    Returns the forecast high/low in Fahrenheit if available.
     """
     tafs = await fetch_latest_tafs([station])
     if not tafs:
-        return {"temp_f": None, "confidence": 0.0, "source": "no_taf"}
+        return {"temp_f": None, "max_f": None, "min_f": None, "confidence": 0.0, "source": "no_taf"}
 
     taf = tafs[0]
+    raw_text = taf.get("raw_taf", "")
+
+    # Parse TX/TN groups: TX25/1215Z TN12/0306Z
+    # TX = max temp in Celsius, TN = min temp in Celsius
+    # Negative temps: TXM02/1215Z (M = minus)
+    max_c = _parse_taf_temp_group(raw_text, "TX")
+    min_c = _parse_taf_temp_group(raw_text, "TN")
+
+    max_f = _c_to_f(max_c)
+    min_f = _c_to_f(min_c)
+
     period = _find_taf_period(taf.get("periods", []), target_time)
-    if period is None:
-        return {"temp_f": None, "confidence": 0.0, "source": "no_matching_period"}
+    confidence = 0.7 if period and not period.get("overlays") else 0.5
+    if max_f is not None or min_f is not None:
+        confidence = max(confidence, 0.75)
 
     return {
-        "wind_speed_kts": period.get("wind_speed_kts"),
-        "wind_gust_kts": period.get("wind_gust_kts"),
-        "visibility_miles": period.get("visibility_miles"),
-        "sky_condition": period.get("sky_condition"),
-        "weather": period.get("weather"),
-        "overlays": period.get("overlays", []),
-        "confidence": 0.7 if not period.get("overlays") else 0.5,
-        "source": "taf",
+        "temp_f": max_f,  # backwards compat: use max as the point forecast
+        "max_f": max_f,
+        "min_f": min_f,
+        "confidence": confidence,
+        "source": "taf_txtn" if (max_f or min_f) else "taf",
     }
+
+
+# Regex for TAF temperature groups: TX25/1215Z or TNM02/0306Z
+_TAF_TEMP_RE = re.compile(
+    r"\b(?P<type>TX|TN)(?P<sign>M?)(?P<temp>\d{1,2})/(?P<day>\d{2})(?P<hour>\d{2})(?:\d{2})?Z?\b"
+)
+
+
+def _parse_taf_temp_group(raw_taf: str, group_type: str) -> float | None:
+    """Extract TX (max) or TN (min) temperature from raw TAF text.
+
+    Returns temperature in Celsius, or None if not found.
+    """
+    for m in _TAF_TEMP_RE.finditer(raw_taf):
+        if m.group("type") == group_type:
+            temp = float(m.group("temp"))
+            if m.group("sign") == "M":
+                temp = -temp
+            return temp
+    return None
 
 
 async def get_taf_precip_probability(
@@ -930,36 +960,49 @@ async def _prob_temperature(
     target_time: datetime,
     hours_out: float,
 ) -> float:
-    """Temperature exceedance probability using METAR trend + TAF."""
-    trend = await get_temp_trend(station, hours=6)
-    taf_info = await get_taf_temperature_forecast(station, target_time)
+    """Temperature exceedance probability using METAR trend + TAF TX/TN.
+
+    Strategy by lead time:
+    - 0-6h:  METAR trend extrapolation (strong signal, low uncertainty)
+    - 6-30h: TAF TX/TN forecast if available, dampened METAR trend as fallback
+    """
+    trend, taf_info = await asyncio.gather(
+        get_temp_trend(station, hours=6),
+        get_taf_temperature_forecast(station, target_time),
+    )
 
     current_f = trend.get("current")
     rate = trend.get("rate_of_change_per_hour", 0.0)
+    taf_max_f = taf_info.get("max_f")
+    taf_min_f = taf_info.get("min_f")
 
-    # Extrapolate METAR trend to target time
-    metar_forecast_f = None
-    if current_f is not None:
-        metar_forecast_f = current_f + rate * hours_out
+    # --- Build point forecast based on lead time ---------------------------
+    forecast_f = None
 
-    # TAF doesn't directly give temperature, but we can infer from conditions
-    # Use METAR trend as primary signal when close in time
-    if metar_forecast_f is None:
+    if hours_out <= 6 and current_f is not None:
+        # Short range: METAR trend extrapolation
+        forecast_f = current_f + rate * hours_out
+    elif taf_max_f is not None:
+        # 6-30h: use TAF max temperature as the point forecast
+        # For "highest temperature" markets, TX is the right reference
+        forecast_f = taf_max_f
+    elif current_f is not None:
+        # Fallback: dampened METAR trend
+        dampened_rate = rate * 0.3
+        forecast_f = current_f + dampened_rate * min(hours_out, 12)
+
+    if forecast_f is None:
         return 0.5
 
-    # Weight METAR vs TAF based on lead time
+    # --- Lead-time-dependent uncertainty (in Fahrenheit) --------------------
     if hours_out <= 6:
-        forecast_f = metar_forecast_f  # METAR trend dominates for short range
+        sigma = 2.0 + 0.5 * hours_out          # 2-5°F
+    elif hours_out <= 24:
+        sigma = 4.0 + 0.25 * hours_out          # 5.5-10°F
     else:
-        # For longer range, dampen the trend (trend extrapolation loses skill)
-        dampened_rate = rate * 0.5
-        forecast_f = current_f + dampened_rate * hours_out
+        sigma = 8.0 + 0.2 * hours_out           # 12-14°F
 
-    # Uncertainty grows with lead time
-    # Base sigma ~2F for 1h, grows sqrt with time
-    sigma = 2.0 + 1.0 * math.sqrt(hours_out)
-
-    # Account for TAF amendment frequency (high amendments = more uncertainty)
+    # TAF amendments indicate forecast instability → more uncertainty
     taf_amendments = await taf_amendment_count(station, hours=24)
     if taf_amendments > 3:
         sigma *= 1.3

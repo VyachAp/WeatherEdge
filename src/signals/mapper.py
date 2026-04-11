@@ -1,8 +1,8 @@
-"""Map active Polymarket weather markets to NWP model forecast probabilities.
+"""Map active Polymarket temperature markets to aviation forecast probabilities.
 
 Geocodes market locations via a static city lookup, parses target dates,
-converts thresholds to SI units, and fetches GFS + ECMWF exceedance
-probabilities for each market.
+converts thresholds to SI units, and fetches aviation-based (METAR/TAF)
+exceedance probabilities for each market.
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING
 
 from dateutil import parser as dateutil_parser
 
-from src.ingestion import aviation, ecmwf, gfs
+from src.ingestion import aviation
 from src.ingestion.aviation import get_realtime_probability
 from src.ingestion.polymarket import get_active_weather_markets
 
@@ -665,7 +665,7 @@ def parse_target_date(date_str: str) -> datetime | None:
 # Market → signal mapping
 # ---------------------------------------------------------------------------
 
-_FETCH_SEMAPHORE = asyncio.Semaphore(8)
+
 
 
 @dataclass
@@ -778,56 +778,45 @@ async def map_market(
 
     threshold_si = convert_threshold(threshold, variable)
 
-    # --- fetch probabilities concurrently ---------------------------------
-    async with _FETCH_SEMAPHORE:
-        results = await asyncio.gather(
-            gfs.get_probability(lat, lon, target_dt, variable, threshold_si, operator, session),
-            ecmwf.get_probability(lat, lon, target_dt, variable, threshold_si, operator, session),
-            get_realtime_probability(market),
-            return_exceptions=True,
-        )
-
-    gfs_prob = results[0] if not isinstance(results[0], BaseException) else None
-    ecmwf_prob = results[1] if not isinstance(results[1], BaseException) else None
-    aviation_prob = results[2] if not isinstance(results[2], BaseException) else None
-
-    if gfs_prob is not None and isinstance(gfs_prob, BaseException):
-        logger.warning("GFS fetch failed for market %s: %s", market.id, gfs_prob)
-        gfs_prob = None
-    if ecmwf_prob is not None and isinstance(ecmwf_prob, BaseException):
-        logger.warning("ECMWF fetch failed for market %s: %s", market.id, ecmwf_prob)
-        ecmwf_prob = None
-    if aviation_prob is not None and isinstance(aviation_prob, BaseException):
-        logger.warning("Aviation fetch failed for market %s: %s", market.id, aviation_prob)
+    # --- fetch aviation probability ----------------------------------------
+    try:
+        aviation_prob = await get_realtime_probability(market)
+    except Exception as e:
+        logger.warning("Aviation fetch failed for market %s: %s", market.id, e)
         aviation_prob = None
 
-    if gfs_prob is None and ecmwf_prob is None and aviation_prob is None:
-        logger.info("No forecast data for market %s", market.id)
+    if aviation_prob is None:
+        logger.debug(
+            "map_market skip %s: no aviation data (loc=%r, date=%r)",
+            market.id, market.parsed_location, market.parsed_target_date,
+        )
         return None
 
-    # --- gather aviation context (cheap queries when data is cached) -------
+    gfs_prob = None
+    ecmwf_prob = None
+
+    # --- gather aviation context -------------------------------------------
     aviation_ctx = None
-    if aviation_prob is not None:
-        icao = icao_for_location(market.parsed_location)
-        if icao is not None:
-            ctx_results = await asyncio.gather(
-                aviation.taf_amendment_count(icao, hours=24),
-                aviation.detect_speci_events(icao, hours=2),
-                aviation.has_severe_weather_reports(lat, lon),
-                aviation.alerts_affecting_location(lat, lon),
-                return_exceptions=True,
-            )
-            amend = ctx_results[0] if not isinstance(ctx_results[0], BaseException) else 0
-            speci = ctx_results[1] if not isinstance(ctx_results[1], BaseException) else []
-            severe = ctx_results[2] if not isinstance(ctx_results[2], BaseException) else False
-            alerts = ctx_results[3] if not isinstance(ctx_results[3], BaseException) else []
-            aviation_ctx = AviationContext(
-                taf_amendment_count=amend,
-                speci_events_2h=len(speci) if isinstance(speci, list) else 0,
-                has_severe_pireps=bool(severe),
-                active_sigmet_count=sum(1 for a in alerts if getattr(a, "alert_type", None) == "SIGMET"),
-                active_airmet_count=sum(1 for a in alerts if getattr(a, "alert_type", None) == "AIRMET"),
-            )
+    icao = icao_for_location(market.parsed_location)
+    if icao is not None:
+        ctx_results = await asyncio.gather(
+            aviation.taf_amendment_count(icao, hours=24),
+            aviation.detect_speci_events(icao, hours=2),
+            aviation.has_severe_weather_reports(lat, lon),
+            aviation.alerts_affecting_location(lat, lon),
+            return_exceptions=True,
+        )
+        amend = ctx_results[0] if not isinstance(ctx_results[0], BaseException) else 0
+        speci = ctx_results[1] if not isinstance(ctx_results[1], BaseException) else []
+        severe = ctx_results[2] if not isinstance(ctx_results[2], BaseException) else False
+        alerts = ctx_results[3] if not isinstance(ctx_results[3], BaseException) else []
+        aviation_ctx = AviationContext(
+            taf_amendment_count=amend,
+            speci_events_2h=len(speci) if isinstance(speci, list) else 0,
+            has_severe_pireps=bool(severe),
+            active_sigmet_count=sum(1 for a in alerts if getattr(a, "alert_type", None) == "SIGMET"),
+            active_airmet_count=sum(1 for a in alerts if getattr(a, "alert_type", None) == "AIRMET"),
+        )
 
     market_prob = market.current_yes_price or 0.5
 
@@ -912,31 +901,24 @@ async def map_bracket_market(
 
     icao = icao_for_location(market.parsed_location)
 
-    # --- fetch bracket probabilities concurrently ---
-    async with _FETCH_SEMAPHORE:
-        tasks = [
-            gfs.get_bracket_probability(lat, lon, target_dt, "temperature", low_si, high_si, session),
-            ecmwf.get_bracket_probability(lat, lon, target_dt, "temperature", low_si, high_si, session),
-        ]
-        # Aviation bracket probability (uses Fahrenheit directly)
-        if icao is not None:
-            tasks.append(aviation.get_bracket_probability(icao, low_f, high_f, target_dt))
-
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-    gfs_prob = results[0] if not isinstance(results[0], BaseException) else None
-    ecmwf_prob = results[1] if not isinstance(results[1], BaseException) else None
+    # --- fetch aviation bracket probability --------------------------------
     aviation_prob = None
-    if icao is not None and len(results) > 2:
-        aviation_prob = results[2] if not isinstance(results[2], BaseException) else None
+    if icao is not None:
+        try:
+            aviation_prob = await aviation.get_bracket_probability(icao, low_f, high_f, target_dt)
+        except Exception as e:
+            logger.warning("Aviation bracket fetch failed for market %s: %s", market.id, e)
 
-    if gfs_prob is None and ecmwf_prob is None and aviation_prob is None:
-        logger.info("No forecast data for bracket market %s", market.id)
+    if aviation_prob is None:
+        logger.debug("map_bracket skip %s: no aviation data", market.id)
         return None
+
+    gfs_prob = None
+    ecmwf_prob = None
 
     # --- gather aviation context ---
     aviation_ctx = None
-    if aviation_prob is not None and icao is not None:
+    if icao is not None:
         ctx_results = await asyncio.gather(
             aviation.taf_amendment_count(icao, hours=24),
             aviation.detect_speci_events(icao, hours=2),

@@ -126,10 +126,20 @@ def compute_consensus(
     if aviation_prob is not None:
         raw += weights["aviation"] * aviation_prob
 
-    # Confidence scoring based on model spread
+    # Confidence scoring based on model spread and lead time
     available = [p for p in (gfs_prob, ecmwf_prob, aviation_prob) if p is not None]
     if len(available) >= 2:
         confidence = 1.0 - (max(available) - min(available))
+    elif len(available) == 1 and aviation_prob is not None:
+        # Aviation-only: confidence scales with lead time
+        if hrs <= 6:
+            confidence = 0.80
+        elif hrs <= 12:
+            confidence = 0.70
+        elif hrs <= 24:
+            confidence = 0.55
+        else:
+            confidence = 0.40
     else:
         confidence = 0.5
 

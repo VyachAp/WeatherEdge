@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 import time
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -146,9 +146,9 @@ class TestNormalizeLon:
 class TestResolveRun:
     def test_same_day(self):
         # Valid time 2026-04-07 18:00 with "now" well past availability
-        valid = datetime(2026, 4, 7, 18, 0)
+        valid = datetime(2026, 4, 7, 18, 0, tzinfo=timezone.utc)
         with patch("src.ingestion.gfs.datetime") as mock_dt:
-            mock_dt.utcnow.return_value = datetime(2026, 4, 8, 12, 0)
+            mock_dt.now.return_value = datetime(2026, 4, 8, 12, 0, tzinfo=timezone.utc)
             mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
             rd, rh, fxx = _resolve_run_for_valid_time(valid)
 
@@ -157,9 +157,9 @@ class TestResolveRun:
         assert fxx in FORECAST_HOURS
 
     def test_fxx_in_forecast_hours(self):
-        valid = datetime(2026, 4, 8, 6, 0)
+        valid = datetime(2026, 4, 8, 6, 0, tzinfo=timezone.utc)
         with patch("src.ingestion.gfs.datetime") as mock_dt:
-            mock_dt.utcnow.return_value = datetime(2026, 4, 8, 12, 0)
+            mock_dt.now.return_value = datetime(2026, 4, 8, 12, 0, tzinfo=timezone.utc)
             mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
             _, _, fxx = _resolve_run_for_valid_time(valid)
 
@@ -167,15 +167,15 @@ class TestResolveRun:
 
     def test_falls_back_when_recent(self):
         # Valid time is in the future, now is close to valid_time
-        valid = datetime(2026, 4, 8, 12, 0)
+        valid = datetime(2026, 4, 8, 12, 0, tzinfo=timezone.utc)
         with patch("src.ingestion.gfs.datetime") as mock_dt:
-            mock_dt.utcnow.return_value = datetime(2026, 4, 8, 10, 0)
+            mock_dt.now.return_value = datetime(2026, 4, 8, 10, 0, tzinfo=timezone.utc)
             mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
             rd, rh, fxx = _resolve_run_for_valid_time(valid)
 
         # Should find a run from before the availability delay
-        run_dt = datetime(rd.year, rd.month, rd.day, rh)
-        assert run_dt + timedelta(hours=5) <= datetime(2026, 4, 8, 10, 0)
+        run_dt = datetime(rd.year, rd.month, rd.day, rh, tzinfo=timezone.utc)
+        assert run_dt + timedelta(hours=5) <= datetime(2026, 4, 8, 10, 0, tzinfo=timezone.utc)
 
 
 # ---------------------------------------------------------------------------

@@ -262,19 +262,23 @@ class TestIsWeatherMarket:
         assert is_weather_market(SAMPLE_TEMP_MARKET)
 
     def test_tag_match(self):
-        m = {"question": "Something ambiguous", "tags": [{"label": "weather"}]}
+        m = {"question": "Something ambiguous", "tags": [{"label": "temperature"}]}
         assert is_weather_market(m)
 
     def test_non_weather(self):
         assert not is_weather_market(SAMPLE_NON_WEATHER_MARKET)
 
-    def test_empty_question_with_climate_tag(self):
-        m = {"question": "", "tags": [{"label": "climate"}]}
-        assert is_weather_market(m)
+    def test_rejects_non_temperature_weather(self):
+        m = {"question": "HURRICANE SEASON outlook?", "tags": []}
+        assert not is_weather_market(m)
 
     def test_keyword_case_insensitive(self):
-        m = {"question": "HURRICANE SEASON outlook?", "tags": []}
+        m = {"question": "TEMPERATURE in NYC?", "tags": []}
         assert is_weather_market(m)
+
+    def test_degree_symbols(self):
+        assert is_weather_market({"question": "Will it reach 100°F?", "tags": []})
+        assert is_weather_market({"question": "Above 30°C tomorrow?", "tags": []})
 
 
 # ---------------------------------------------------------------------------
@@ -426,9 +430,15 @@ class TestFetchWeatherMarkets:
         markets = await fetch_weather_markets(client=client)
         ids = {m["id"] for m in markets}
 
-        # All weather markets found, non-weather excluded
-        for s in ALL_WEATHER_SAMPLES:
-            assert s["id"] in ids
+        # Temperature markets found, non-weather excluded
+        temp_samples = [
+            s for s in ALL_WEATHER_SAMPLES
+            if "temperature" in (s.get("question") or "").lower()
+            or "°f" in (s.get("question") or "").lower()
+            or "°c" in (s.get("question") or "").lower()
+        ]
+        for s in temp_samples:
+            assert s["id"] in ids, f"Expected {s['id']} in results"
         assert SAMPLE_NON_WEATHER_MARKET["id"] not in ids
 
     @pytest.mark.asyncio
@@ -472,8 +482,8 @@ class TestFetchWeatherMarkets:
         # Should not raise — returns empty list after retries exhaust
         markets = await fetch_weather_markets(client=client)
         assert markets == []
-        # 3 retries for first paginated call + 3 each for 2 tag calls = 9
-        assert call_count == 9
+        # 3 retries for first paginated call + 3 for 1 tag call = 6
+        assert call_count == 6
 
 
 # ---------------------------------------------------------------------------

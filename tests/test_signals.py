@@ -164,9 +164,8 @@ def _make_market(**overrides):
 
 class TestMapMarket:
     @pytest.mark.asyncio
-    @patch("src.signals.mapper.ecmwf.get_probability", new_callable=AsyncMock, return_value=0.72)
-    @patch("src.signals.mapper.gfs.get_probability", new_callable=AsyncMock, return_value=0.68)
-    async def test_valid_market_returns_signal(self, mock_gfs, mock_ecmwf):
+    @patch("src.signals.mapper.get_realtime_probability", new_callable=AsyncMock, return_value=0.70)
+    async def test_valid_market_returns_signal(self, mock_avx):
         from src.signals.mapper import map_market
 
         market = _make_market()
@@ -174,8 +173,9 @@ class TestMapMarket:
 
         assert result is not None
         assert result.market_id == "mkt_001"
-        assert result.gfs_prob == 0.68
-        assert result.ecmwf_prob == 0.72
+        assert result.aviation_prob == 0.70
+        assert result.gfs_prob is None
+        assert result.ecmwf_prob is None
         assert result.market_prob == 0.45
         assert result.days_to_resolution > 0
 
@@ -196,22 +196,8 @@ class TestMapMarket:
         assert result is None
 
     @pytest.mark.asyncio
-    @patch("src.signals.mapper.ecmwf.get_probability", new_callable=AsyncMock, return_value=0.72)
-    @patch("src.signals.mapper.gfs.get_probability", new_callable=AsyncMock, side_effect=Exception("GFS down"))
-    async def test_single_model_failure_still_returns(self, mock_gfs, mock_ecmwf):
-        from src.signals.mapper import map_market
-
-        market = _make_market()
-        result = await map_market(market)
-
-        assert result is not None
-        assert result.gfs_prob is None
-        assert result.ecmwf_prob == 0.72
-
-    @pytest.mark.asyncio
-    @patch("src.signals.mapper.ecmwf.get_probability", new_callable=AsyncMock, side_effect=Exception("ECMWF down"))
-    @patch("src.signals.mapper.gfs.get_probability", new_callable=AsyncMock, side_effect=Exception("GFS down"))
-    async def test_both_models_fail_returns_none(self, mock_gfs, mock_ecmwf):
+    @patch("src.signals.mapper.get_realtime_probability", new_callable=AsyncMock, side_effect=Exception("Aviation down"))
+    async def test_aviation_failure_returns_none(self, mock_avx):
         from src.signals.mapper import map_market
 
         market = _make_market()
@@ -219,9 +205,17 @@ class TestMapMarket:
         assert result is None
 
     @pytest.mark.asyncio
-    @patch("src.signals.mapper.ecmwf.get_probability", new_callable=AsyncMock, return_value=0.72)
-    @patch("src.signals.mapper.gfs.get_probability", new_callable=AsyncMock, return_value=0.68)
-    async def test_occurs_operator_maps_to_below(self, mock_gfs, mock_ecmwf):
+    @patch("src.signals.mapper.get_realtime_probability", new_callable=AsyncMock, return_value=None)
+    async def test_no_aviation_data_returns_none(self, mock_avx):
+        from src.signals.mapper import map_market
+
+        market = _make_market()
+        result = await map_market(market)
+        assert result is None
+
+    @pytest.mark.asyncio
+    @patch("src.signals.mapper.get_realtime_probability", new_callable=AsyncMock, return_value=0.70)
+    async def test_occurs_operator_maps_to_below(self, mock_avx):
         from src.signals.mapper import map_market
 
         market = _make_market(parsed_operator="occurs")
@@ -334,14 +328,13 @@ class TestPassesFilters:
 
 
 class TestDetectSignalsE2E:
-    """End-to-end test with mocked market data and forecast probabilities."""
+    """End-to-end test with mocked market data and aviation probabilities."""
 
     @pytest.mark.asyncio
     @patch("src.signals.mapper.get_active_weather_markets", new_callable=AsyncMock)
-    @patch("src.signals.mapper.ecmwf.get_probability", new_callable=AsyncMock)
-    @patch("src.signals.mapper.gfs.get_probability", new_callable=AsyncMock)
+    @patch("src.signals.mapper.get_realtime_probability", new_callable=AsyncMock)
     @patch("src.signals.consensus.get_calibration_coefficients", new_callable=AsyncMock, return_value=None)
-    async def test_end_to_end(self, mock_calib, mock_gfs, mock_ecmwf, mock_markets):
+    async def test_end_to_end(self, mock_calib, mock_avx, mock_markets):
         from src.signals.detector import detect_signals
 
         # --- 3 markets: 1 good, 1 small edge, 1 unsupported variable ---
@@ -351,7 +344,7 @@ class TestDetectSignalsE2E:
             parsed_variable="temperature",
             parsed_threshold=100.0,
             parsed_operator="above",
-            parsed_target_date=_future_date_str(5),
+            parsed_target_date=_future_date_str(1),
             current_yes_price=0.45,
             liquidity=1000.0,
             volume=5000.0,
@@ -362,8 +355,8 @@ class TestDetectSignalsE2E:
             parsed_variable="temperature",
             parsed_threshold=90.0,
             parsed_operator="above",
-            parsed_target_date=_future_date_str(5),
-            current_yes_price=0.48,  # close to model prob → small edge
+            parsed_target_date=_future_date_str(1),
+            current_yes_price=0.48,
             liquidity=1000.0,
             volume=5000.0,
         )
@@ -373,46 +366,32 @@ class TestDetectSignalsE2E:
         )
 
         mock_markets.return_value = [good_market, small_edge_market, unsupported_market]
+        mock_avx.return_value = 0.70
 
-        # Model says ~70% for both good and small-edge markets
-        mock_gfs.return_value = 0.68
-        mock_ecmwf.return_value = 0.72
-
-        # Use a mock session
         session = AsyncMock()
         session.flush = AsyncMock()
 
         result = await detect_signals(session)
 
-        # Only the good market should produce a signal
-        # (small edge market: consensus ≈ 0.704, edge ≈ 0.704-0.48 = 0.224 → passes edge
-        #  but both may pass if edge is large enough)
-        # Actually both good and small_edge will pass since 0.704-0.48=0.224 > 0.10
-        # and 0.704-0.45=0.254 > 0.10
-        # The unsupported one should not appear
         assert len(result) >= 1
         assert all(s.market_id != "unsup_003" for s in result)
 
-        # Signals should be sorted by ev_score descending
         if len(result) > 1:
             assert result[0].ev_score >= result[1].ev_score
 
-        # The good market signal should have correct direction
         good_sig = next(s for s in result if s.market_id == "good_001")
         assert good_sig.direction == TradeDirection.BUY_YES
         assert good_sig.edge > 0
-        assert good_sig.confidence > 0.55
+        assert good_sig.confidence > 0.3
 
-        # Verify persistence
         assert session.add.called
         assert session.flush.called
 
     @pytest.mark.asyncio
     @patch("src.signals.mapper.get_active_weather_markets", new_callable=AsyncMock)
-    @patch("src.signals.mapper.ecmwf.get_probability", new_callable=AsyncMock)
-    @patch("src.signals.mapper.gfs.get_probability", new_callable=AsyncMock)
+    @patch("src.signals.mapper.get_realtime_probability", new_callable=AsyncMock)
     @patch("src.signals.consensus.get_calibration_coefficients", new_callable=AsyncMock, return_value=None)
-    async def test_no_markets_returns_empty(self, mock_calib, mock_gfs, mock_ecmwf, mock_markets):
+    async def test_no_markets_returns_empty(self, mock_calib, mock_avx, mock_markets):
         from src.signals.detector import detect_signals
 
         mock_markets.return_value = []
@@ -424,18 +403,17 @@ class TestDetectSignalsE2E:
 
     @pytest.mark.asyncio
     @patch("src.signals.mapper.get_active_weather_markets", new_callable=AsyncMock)
-    @patch("src.signals.mapper.ecmwf.get_probability", new_callable=AsyncMock, return_value=0.46)
-    @patch("src.signals.mapper.gfs.get_probability", new_callable=AsyncMock, return_value=0.44)
+    @patch("src.signals.mapper.get_realtime_probability", new_callable=AsyncMock, return_value=0.46)
     @patch("src.signals.consensus.get_calibration_coefficients", new_callable=AsyncMock, return_value=None)
-    async def test_insufficient_edge_filtered_out(self, mock_calib, mock_gfs, mock_ecmwf, mock_markets):
+    async def test_insufficient_edge_filtered_out(self, mock_calib, mock_avx, mock_markets):
         from src.signals.detector import detect_signals
 
-        # Market prob = 0.45, model ≈ 0.452 → edge < 0.10
+        # Market prob = 0.45, aviation ≈ 0.46 → edge < 0.10
         market = _make_market(
             current_yes_price=0.45,
             liquidity=1000.0,
             volume=5000.0,
-            parsed_target_date=_future_date_str(5),
+            parsed_target_date=_future_date_str(1),
         )
         mock_markets.return_value = [market]
 
@@ -520,7 +498,7 @@ class TestConsensusWithAviation:
     def test_aviation_only_works(self):
         result = compute_consensus(None, None, aviation_prob=0.75, hours_to_resolution=4.0)
         assert pytest.approx(result.consensus_prob, abs=0.001) == 0.75
-        assert result.confidence == 0.5
+        assert result.confidence == 0.80  # aviation-only, <=6h
 
     def test_all_none_raises(self):
         with pytest.raises(ValueError):
@@ -560,11 +538,9 @@ class TestPassesFiltersAviation:
 class TestDetectSignalsAviationE2E:
     @pytest.mark.asyncio
     @patch("src.signals.mapper.get_active_weather_markets", new_callable=AsyncMock)
-    @patch("src.signals.mapper.ecmwf.get_probability", new_callable=AsyncMock, return_value=0.70)
-    @patch("src.signals.mapper.gfs.get_probability", new_callable=AsyncMock, return_value=0.68)
     @patch("src.signals.mapper.get_realtime_probability", new_callable=AsyncMock, return_value=0.75)
     @patch("src.signals.consensus.get_calibration_coefficients", new_callable=AsyncMock, return_value=None)
-    async def test_short_range_with_aviation(self, mock_calib, mock_avx, mock_gfs, mock_ecmwf, mock_markets):
+    async def test_short_range_with_aviation(self, mock_calib, mock_avx, mock_markets):
         from src.signals.detector import detect_signals
 
         # 1-day-out market with aviation data
