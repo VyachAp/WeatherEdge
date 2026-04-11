@@ -504,6 +504,29 @@ async def get_probability(
     return count / len(members)
 
 
+async def get_bracket_probability(
+    lat: float,
+    lon: float,
+    valid_date: datetime,
+    variable: str,
+    low: float,
+    high: float,
+    session: AsyncSession | None = None,
+) -> float:
+    """P(low ≤ variable < high) from ensemble members.
+
+    Thresholds are in SI units (Kelvin for temperature).
+    Returns probability in [0, 1], or 0.0 if no members are available.
+    """
+    stats = await get_ensemble_stats(lat, lon, valid_date, variable, session=session)
+    members = stats["members"]
+    if not members:
+        return 0.0
+
+    count = sum(1 for v in members if low <= v < high)
+    return count / len(members)
+
+
 # ---------------------------------------------------------------------------
 # DB persistence
 # ---------------------------------------------------------------------------

@@ -219,6 +219,15 @@ _p(
     {"variable": "record", "operator": "record_breaking"},
 )
 
+# 16 — Bracket temperature market (daily high/low)
+#      "Highest temperature in Austin on April 8?"
+#      "Lowest temperature in Seoul on April 12?"
+_p(
+    r"(?:highest|lowest|high|low)\s+temperature\s+in\s+" + _L +
+    r"(?:\s+on\s+(?P<date>[\w\s,]+))?\s*\??",
+    {"variable": "temperature", "operator": "bracket"},
+)
+
 # Operator normalization map
 _OP_MAP = {
     "exceed": "above", "surpass": "above", "go above": "above", "top": "above",
@@ -232,6 +241,63 @@ def _normalize_operator(raw_op: str | None) -> str | None:
     if raw_op is None:
         return None
     return _OP_MAP.get(raw_op.lower().strip(), raw_op.lower().strip())
+
+
+# ---------------------------------------------------------------------------
+# Bracket outcome parsing (for daily temperature markets)
+# ---------------------------------------------------------------------------
+
+_BRACKET_RE = re.compile(
+    r"(?P<low>-?\d+(?:\.\d+)?)\s*[-–]\s*(?P<high>-?\d+(?:\.\d+)?)\s*°?\s*[FC]?",
+    re.IGNORECASE,
+)
+_BRACKET_GTE_RE = re.compile(
+    r"[≥>=]+\s*(?P<val>-?\d+(?:\.\d+)?)\s*°?\s*[FC]?",
+    re.IGNORECASE,
+)
+_BRACKET_LTE_RE = re.compile(
+    r"[≤<=]+\s*(?P<val>-?\d+(?:\.\d+)?)\s*°?\s*[FC]?",
+    re.IGNORECASE,
+)
+
+
+def parse_temperature_brackets(
+    outcomes: list[str] | None,
+) -> list[tuple[float, float]] | None:
+    """Parse bracket outcomes into (low_f, high_f) bounds.
+
+    Examples:
+        ["65-69°F", "70-74°F", "≥90°F"]
+        → [(65, 70), (70, 75), (90, 150)]
+
+    The upper bound is exclusive (+1 from the stated range end).
+    Open-ended brackets use -60 / 150 as sentinels.
+    Returns None if outcomes cannot be parsed as brackets.
+    """
+    if not outcomes or len(outcomes) < 2:
+        return None
+
+    brackets: list[tuple[float, float]] = []
+    for o in outcomes:
+        o_stripped = o.strip()
+        m = _BRACKET_RE.match(o_stripped)
+        if m:
+            low = float(m.group("low"))
+            high = float(m.group("high")) + 1  # exclusive upper bound
+            brackets.append((low, high))
+            continue
+        m = _BRACKET_GTE_RE.match(o_stripped)
+        if m:
+            brackets.append((float(m.group("val")), 150.0))
+            continue
+        m = _BRACKET_LTE_RE.match(o_stripped)
+        if m:
+            brackets.append((-60.0, float(m.group("val")) + 1))
+            continue
+        # Outcome doesn't look like a temperature bracket
+        return None
+
+    return brackets if brackets else None
 
 
 def _extract_date_from_text(text: str) -> str | None:
@@ -289,16 +355,19 @@ def parse_question(question: str) -> ParsedQuestion:
             # IGNORECASE makes [A-Z] match lowercase, so the location group
             # may swallow trailing words like " in", " before".  Trim them:
             # keep only the leading run of capitalized words (+ connectors).
+            # Strip leading filler words before cleanup (handles "the US ...")
+            location = re.sub(
+                r"^(?:Will|Does|Is|Can|Has|the)\s+", "", location,
+                flags=re.IGNORECASE,
+            ).strip()
+            # Keep only leading run of capitalized words (case-sensitive
+            # so lowercase prepositions like "in", "before" act as stop words).
             loc_match = re.match(
                 r"(?:[A-Z][A-Za-z'\.]*(?:\s+(?:of|the|D\.C\.|DC)\b)?(?:\s+[A-Z][A-Za-z'\.]*)*)",
                 location,
             )
             if loc_match:
                 location = loc_match.group(0).strip()
-            # Strip leading filler words that greedy capture may grab
-            location = re.sub(
-                r"^(?:Will|Does|Is|Can|Has)\s+", "", location,
-            ).strip()
 
         raw_op = groups.get("operator", defaults.get("operator"))
         operator = _normalize_operator(raw_op)

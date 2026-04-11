@@ -1005,6 +1005,49 @@ async def _prob_wind(
     return max(0.01, min(0.99, prob))
 
 
+async def get_bracket_probability(
+    station: str,
+    low_f: float,
+    high_f: float,
+    target_time: datetime,
+) -> float | None:
+    """P(low_f ≤ temp < high_f) using METAR trend + Gaussian uncertainty.
+
+    Reuses the same trend extrapolation and uncertainty model as
+    ``_prob_temperature``, but computes CDF difference for a bracket.
+    """
+    hours_out = (target_time - datetime.now(timezone.utc)).total_seconds() / 3600.0
+    if hours_out > 30 or hours_out < 0:
+        return None
+
+    trend = await get_temp_trend(station, hours=6)
+    current_f = trend.get("current")
+    rate = trend.get("rate_of_change_per_hour", 0.0)
+
+    if current_f is None:
+        return None
+
+    # Extrapolate METAR trend
+    if hours_out <= 6:
+        forecast_f = current_f + rate * hours_out
+    else:
+        forecast_f = current_f + rate * 0.5 * hours_out
+
+    # Uncertainty grows with lead time
+    sigma = 2.0 + 1.0 * math.sqrt(hours_out)
+
+    taf_amendments = await taf_amendment_count(station, hours=24)
+    if taf_amendments > 3:
+        sigma *= 1.3
+
+    # P(low ≤ temp < high) = CDF(high) - CDF(low)
+    z_high = (high_f - forecast_f) / sigma
+    z_low = (low_f - forecast_f) / sigma
+    prob = _normal_cdf(z_high) - _normal_cdf(z_low)
+
+    return max(0.01, min(0.99, prob))
+
+
 async def get_realtime_probability(market: Any) -> float | None:
     """Compute aviation-based probability for a market.
 

@@ -183,6 +183,54 @@ CITIES: dict[str, tuple[float, float]] = {
     "west virginia": (38.3498, -81.6326),
     "wisconsin": (43.0731, -89.4012),
     "wyoming": (41.1400, -104.8202),
+    # International cities commonly seen on Polymarket
+    "seoul": (37.5665, 126.9780),
+    "toronto": (43.6532, -79.3832),
+    "kuala lumpur": (3.1390, 101.6869),
+    "london": (51.5074, -0.1278),
+    "tokyo": (35.6762, 139.6503),
+    "sydney": (-33.8688, 151.2093),
+    "paris": (48.8566, 2.3522),
+    "bangkok": (13.7563, 100.5018),
+    "singapore": (1.3521, 103.8198),
+    "dubai": (25.2048, 55.2708),
+    "mumbai": (19.0760, 72.8777),
+    "mexico city": (19.4326, -99.1332),
+    "berlin": (52.5200, 13.4050),
+    "rome": (41.9028, 12.4964),
+    "madrid": (40.4168, -3.7038),
+    "beijing": (39.9042, 116.4074),
+    "shanghai": (31.2304, 121.4737),
+    "hong kong": (22.3193, 114.1694),
+    "taipei": (25.0330, 121.5654),
+    "cairo": (30.0444, 31.2357),
+    "lagos": (6.5244, 3.3792),
+    "buenos aires": (-34.6037, -58.3816),
+    "são paulo": (-23.5505, -46.6333),
+    "sao paulo": (-23.5505, -46.6333),
+    "jakarta": (-6.2088, 106.8456),
+    "istanbul": (41.0082, 28.9784),
+    "moscow": (55.7558, 37.6173),
+    "johannesburg": (-26.2041, 28.0473),
+    "nairobi": (-1.2921, 36.8219),
+    "lima": (-12.0464, -77.0428),
+    "bogota": (4.7110, -74.0721),
+    "montreal": (45.5017, -73.5673),
+    "vancouver": (49.2827, -123.1207),
+    "osaka": (34.6937, 135.5023),
+    "delhi": (28.7041, 77.1025),
+    "new delhi": (28.7041, 77.1025),
+    "riyadh": (24.7136, 46.6753),
+    "doha": (25.2854, 51.5310),
+    "athens": (37.9838, 23.7275),
+    "lisbon": (38.7223, -9.1393),
+    "amsterdam": (52.3676, 4.9041),
+    "zurich": (47.3769, 8.5417),
+    "stockholm": (59.3293, 18.0686),
+    "manila": (14.5995, 120.9842),
+    "hanoi": (21.0278, 105.8342),
+    "ho chi minh city": (10.8231, 106.6297),
+    "tel aviv": (32.0853, 34.7818),
 }
 
 
@@ -342,6 +390,54 @@ CITY_ICAO: dict[str, str] = {
     "west virginia": "KCRW",
     "wisconsin": "KMKE",
     "wyoming": "KCPR",
+    # International cities
+    "seoul": "RKSI",
+    "toronto": "CYYZ",
+    "kuala lumpur": "WMKK",
+    "london": "EGLL",
+    "tokyo": "RJTT",
+    "sydney": "YSSY",
+    "paris": "LFPG",
+    "bangkok": "VTBS",
+    "singapore": "WSSS",
+    "dubai": "OMDB",
+    "mumbai": "VABB",
+    "mexico city": "MMMX",
+    "berlin": "EDDB",
+    "rome": "LIRF",
+    "madrid": "LEMD",
+    "beijing": "ZBAA",
+    "shanghai": "ZSPD",
+    "hong kong": "VHHH",
+    "taipei": "RCTP",
+    "cairo": "HECA",
+    "lagos": "DNMM",
+    "buenos aires": "SAEZ",
+    "são paulo": "SBGR",
+    "sao paulo": "SBGR",
+    "jakarta": "WIII",
+    "istanbul": "LTFM",
+    "moscow": "UUEE",
+    "johannesburg": "FAOR",
+    "nairobi": "HKJK",
+    "lima": "SPJC",
+    "bogota": "SKBO",
+    "montreal": "CYUL",
+    "vancouver": "CYVR",
+    "osaka": "RJBB",
+    "delhi": "VIDP",
+    "new delhi": "VIDP",
+    "riyadh": "OERK",
+    "doha": "OTHH",
+    "athens": "LGAV",
+    "lisbon": "LPPT",
+    "amsterdam": "EHAM",
+    "zurich": "LSZH",
+    "stockholm": "ESSA",
+    "manila": "RPLL",
+    "hanoi": "VVNB",
+    "ho chi minh city": "VVTS",
+    "tel aviv": "LLBG",
 }
 
 
@@ -628,6 +724,119 @@ async def map_market(
     )
 
 
+async def map_bracket_market(
+    market: Market,
+    session: AsyncSession | None = None,
+) -> MarketSignal | None:
+    """Map a bracket temperature market to forecast probabilities.
+
+    Bracket markets (e.g. "Highest temperature in Austin on April 8?") have
+    outcomes like "70-74°F" instead of a single threshold.  We parse the
+    bracket bounds from the outcomes and compute P(low ≤ temp < high).
+    """
+    from src.ingestion.polymarket import parse_temperature_brackets
+
+    if not all([market.parsed_location, market.parsed_variable, market.parsed_target_date]):
+        return None
+    if market.parsed_operator != "bracket":
+        return None
+
+    brackets = parse_temperature_brackets(market.outcomes)
+    if not brackets:
+        return None
+
+    coords = geocode(market.parsed_location)
+    if coords is None:
+        return None
+    lat, lon = coords
+
+    target_dt = parse_target_date(market.parsed_target_date)
+    if target_dt is None:
+        return None
+
+    now = datetime.now(tz=timezone.utc)
+    hours_to_resolution = (target_dt - now).total_seconds() / 3600.0
+    days_to_resolution = (target_dt - now).days
+    if days_to_resolution < 0 and hours_to_resolution < 0:
+        return None
+
+    # Use the market's YES price — this corresponds to the first outcome bracket
+    market_prob = market.current_yes_price or 0.5
+
+    # The first bracket's bounds determine our probability target
+    low_f, high_f = brackets[0]
+
+    # Convert bracket bounds from Fahrenheit to Kelvin for NWP models
+    low_si = convert_threshold(low_f, "temperature")
+    high_si = convert_threshold(high_f, "temperature")
+
+    icao = icao_for_location(market.parsed_location)
+
+    # --- fetch bracket probabilities concurrently ---
+    async with _FETCH_SEMAPHORE:
+        tasks = [
+            gfs.get_bracket_probability(lat, lon, target_dt, "temperature", low_si, high_si, session),
+            ecmwf.get_bracket_probability(lat, lon, target_dt, "temperature", low_si, high_si, session),
+        ]
+        # Aviation bracket probability (uses Fahrenheit directly)
+        if icao is not None:
+            tasks.append(aviation.get_bracket_probability(icao, low_f, high_f, target_dt))
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    gfs_prob = results[0] if not isinstance(results[0], BaseException) else None
+    ecmwf_prob = results[1] if not isinstance(results[1], BaseException) else None
+    aviation_prob = None
+    if icao is not None and len(results) > 2:
+        aviation_prob = results[2] if not isinstance(results[2], BaseException) else None
+
+    if gfs_prob is None and ecmwf_prob is None and aviation_prob is None:
+        logger.info("No forecast data for bracket market %s", market.id)
+        return None
+
+    # --- gather aviation context ---
+    aviation_ctx = None
+    if aviation_prob is not None and icao is not None:
+        ctx_results = await asyncio.gather(
+            aviation.taf_amendment_count(icao, hours=24),
+            aviation.detect_speci_events(icao, hours=2),
+            aviation.has_severe_weather_reports(lat, lon),
+            aviation.alerts_affecting_location(lat, lon),
+            return_exceptions=True,
+        )
+        amend = ctx_results[0] if not isinstance(ctx_results[0], BaseException) else 0
+        speci = ctx_results[1] if not isinstance(ctx_results[1], BaseException) else []
+        severe = ctx_results[2] if not isinstance(ctx_results[2], BaseException) else False
+        alerts = ctx_results[3] if not isinstance(ctx_results[3], BaseException) else []
+        aviation_ctx = AviationContext(
+            taf_amendment_count=amend,
+            speci_events_2h=len(speci) if isinstance(speci, list) else 0,
+            has_severe_pireps=bool(severe),
+            active_sigmet_count=sum(1 for a in alerts if getattr(a, "alert_type", None) == "SIGMET"),
+            active_airmet_count=sum(1 for a in alerts if getattr(a, "alert_type", None) == "AIRMET"),
+        )
+
+    return MarketSignal(
+        market_id=market.id,
+        question=market.question,
+        market_prob=market_prob,
+        gfs_prob=gfs_prob,
+        ecmwf_prob=ecmwf_prob,
+        aviation_prob=aviation_prob,
+        days_to_resolution=days_to_resolution,
+        hours_to_resolution=hours_to_resolution,
+        market=market,
+        aviation_context=aviation_ctx,
+    )
+
+
+def _choose_mapper(market: Market):
+    """Return the appropriate mapping function for a market."""
+    if market.parsed_operator == "bracket":
+        return map_bracket_market
+    return map_market
+
+
 async def map_all_markets(
     session: AsyncSession | None = None,
 ) -> list[MarketSignal]:
@@ -635,7 +844,7 @@ async def map_all_markets(
     markets = await get_active_weather_markets(session)
     logger.info("Mapping %d active weather markets to forecasts", len(markets))
 
-    tasks = [map_market(m, session) for m in markets]
+    tasks = [_choose_mapper(m)(m, session) for m in markets]
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
     signals: list[MarketSignal] = []
@@ -671,7 +880,7 @@ async def map_short_range_markets(
         "Short-range pipeline: %d / %d markets within 30h", len(short_range), len(markets),
     )
 
-    tasks = [map_market(m, session) for m in short_range]
+    tasks = [_choose_mapper(m)(m, session) for m in short_range]
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
     signals: list[MarketSignal] = []
