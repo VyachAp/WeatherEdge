@@ -14,7 +14,7 @@ import shutil
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -118,7 +118,7 @@ def _resolve_run_for_valid_time(
     Walks backward through run cycles, accounting for data-availability delay,
     and returns the first match whose forecast hour is in FORECAST_HOURS.
     """
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     max_fxx = max(FORECAST_HOURS)
 
     for hours_back in range(0, max_fxx + 24, 6):
@@ -530,7 +530,7 @@ async def _persist_forecast(
         ensemble_mean=stats["mean"],
         ensemble_std=stats["std"],
         ensemble_members=stats["members"],
-        fetched_at=datetime.utcnow(),
+        fetched_at=datetime.now(timezone.utc),
     )
     session.add(forecast)
     await session.commit()
@@ -550,7 +550,7 @@ async def ingest_latest_gefs(
     Returns count of forecast rows persisted.
     """
     variables = variables or list(VARIABLE_MAP.keys())
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     avail = now - timedelta(hours=DATA_AVAILABILITY_DELAY_H)
     run_hour = max(h for h in RUN_HOURS if h <= avail.hour)
     run_date = avail.date()

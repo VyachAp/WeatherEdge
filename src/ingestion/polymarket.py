@@ -37,12 +37,17 @@ GAMMA_BASE = "https://gamma-api.polymarket.com"
 MARKETS_URL = f"{GAMMA_BASE}/markets"
 
 WEATHER_KEYWORDS: set[str] = {
-    "temperature", "heat", "cold", "snow", "rain", "hurricane", "storm",
-    "precipitation", "wind", "tornado", "freeze", "drought", "wildfire",
-    "flood", "weather", "°f", "°c", "inches",
+    "temperature", "°f", "°c",
 }
 
-WEATHER_TAGS: list[str] = ["weather", "climate"]
+# Compiled pattern for temperature-market matching.
+import re as _re
+_WEATHER_KW_RE = _re.compile(
+    r"\btemperature\b|°[fc]",
+    _re.IGNORECASE,
+)
+
+WEATHER_TAGS: list[str] = ["weather"]
 
 # Rate-limit: ≤10 requests / second
 _rate_semaphore = asyncio.Semaphore(10)
@@ -426,8 +431,8 @@ def parse_question(question: str) -> ParsedQuestion:
 
 def is_weather_market(market: dict[str, Any]) -> bool:
     """Return True if a Gamma API market dict is weather-related."""
-    question = (market.get("question") or "").lower()
-    if any(kw in question for kw in WEATHER_KEYWORDS):
+    question = market.get("question") or ""
+    if _WEATHER_KW_RE.search(question):
         return True
     tags: list[str] = market.get("tags") or []
     if isinstance(tags, list):
@@ -690,7 +695,7 @@ async def get_active_weather_markets(
     try:
         stmt = (
             select(Market)
-            .where(Market.parsed_variable.isnot(None))
+            .where(Market.parsed_variable == "temperature")
             .where(Market.end_date > datetime.utcnow())
             .order_by(Market.end_date)
         )
