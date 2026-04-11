@@ -129,6 +129,8 @@ class Alerter:
         self._app.add_handler(CallbackQueryHandler(self._handle_callback))
 
         await self._app.initialize()
+        # Terminate any lingering getUpdates session from a previous instance
+        await self._app.bot.delete_webhook(drop_pending_updates=True)
         await self._app.start()
         await self._app.updater.start_polling(drop_pending_updates=True)  # type: ignore[union-attr]
 
