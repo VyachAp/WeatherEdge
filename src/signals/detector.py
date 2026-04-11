@@ -225,9 +225,12 @@ async def _detect(
             logger.info("Dedup: skipping %d recently signaled markets", len(recent_market_ids))
 
     actionable: list[ActionableSignal] = []
+    deduped = 0
+    filtered = 0
 
     for ms in market_signals:
         if ms.market_id in recent_market_ids:
+            deduped += 1
             continue
         consensus = await compute_calibrated_consensus(
             ms.gfs_prob,
@@ -248,6 +251,14 @@ async def _detect(
             aviation_prob=ms.aviation_prob,
             hours_to_resolution=ms.hours_to_resolution,
         ):
+            logger.debug(
+                "Filtered market %s: edge=%.4f confidence=%.3f days=%d "
+                "liq=%s vol=%s aviation=%s hours=%.1f (question=%r)",
+                ms.market_id, edge, consensus.confidence, ms.days_to_resolution,
+                ms.market.liquidity, ms.market.volume, ms.aviation_prob,
+                ms.hours_to_resolution, ms.question[:60] if ms.question else None,
+            )
+            filtered += 1
             continue
 
         ev_score = abs(edge) * consensus.confidence
@@ -278,5 +289,8 @@ async def _detect(
         await persist_signal(sig, session)
     await session.flush()
 
-    logger.info("Detected %d actionable signals", len(actionable))
+    logger.info(
+        "Detected %d actionable signals (filtered=%d, deduped=%d, total_input=%d)",
+        len(actionable), filtered, deduped, len(market_signals),
+    )
     return actionable

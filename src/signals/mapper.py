@@ -648,9 +648,13 @@ def parse_target_date(date_str: str) -> datetime | None:
     Returns ``None`` on failure.
     """
     try:
-        dt = dateutil_parser.parse(date_str, fuzzy=True, default=datetime(2026, 1, 15))
+        now = datetime.now(tz=timezone.utc)
+        dt = dateutil_parser.parse(
+            date_str, fuzzy=True, default=datetime(now.year, now.month, 15),
+        )
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
+        logger.debug("parse_target_date: %r -> %s", date_str, dt.isoformat())
         return dt
     except (ValueError, OverflowError):
         logger.warning("parse_target_date: could not parse %r", date_str)
@@ -708,6 +712,21 @@ async def map_market(
         market.parsed_operator,
         market.parsed_target_date,
     ]):
+        missing = []
+        if not market.parsed_location:
+            missing.append("location")
+        if not market.parsed_variable:
+            missing.append("variable")
+        if market.parsed_threshold is None:
+            missing.append("threshold")
+        if not market.parsed_operator:
+            missing.append("operator")
+        if not market.parsed_target_date:
+            missing.append("target_date")
+        logger.debug(
+            "map_market skip market %s: missing fields %s (question=%r)",
+            market.id, missing, market.question[:80] if market.question else None,
+        )
         return None
 
     # Resolve variable aliases (snowfall→precipitation, freeze→temperature, etc.)
@@ -718,25 +737,43 @@ async def map_market(
     )
 
     if variable not in SUPPORTED_VARIABLES:
+        logger.debug(
+            "map_market skip market %s: unsupported variable %r (raw=%r)",
+            market.id, variable, market.parsed_variable,
+        )
         return None
 
     operator = normalize_operator(operator_raw)
     if operator is None:
+        logger.debug(
+            "map_market skip market %s: unsupported operator %r", market.id, operator_raw,
+        )
         return None
 
     coords = geocode(market.parsed_location)
     if coords is None:
+        logger.debug(
+            "map_market skip market %s: geocode failed for %r", market.id, market.parsed_location,
+        )
         return None
     lat, lon = coords
 
     target_dt = parse_target_date(market.parsed_target_date)
     if target_dt is None:
+        logger.debug(
+            "map_market skip market %s: date parse failed for %r",
+            market.id, market.parsed_target_date,
+        )
         return None
 
     now = datetime.now(tz=timezone.utc)
     hours_to_resolution = (target_dt - now).total_seconds() / 3600.0
     days_to_resolution = (target_dt - now).days
     if days_to_resolution < 0 and hours_to_resolution < 0:
+        logger.debug(
+            "map_market skip market %s: expired (target=%s, hours=%.1f)",
+            market.id, target_dt.isoformat(), hours_to_resolution,
+        )
         return None
 
     threshold_si = convert_threshold(threshold, variable)
@@ -821,27 +858,46 @@ async def map_bracket_market(
     from src.ingestion.polymarket import parse_temperature_brackets
 
     if not all([market.parsed_location, market.parsed_variable, market.parsed_target_date]):
+        missing = []
+        if not market.parsed_location:
+            missing.append("location")
+        if not market.parsed_variable:
+            missing.append("variable")
+        if not market.parsed_target_date:
+            missing.append("target_date")
+        logger.debug(
+            "map_bracket skip market %s: missing fields %s (question=%r)",
+            market.id, missing, market.question[:80] if market.question else None,
+        )
         return None
     if market.parsed_operator != "bracket":
+        logger.debug("map_bracket skip market %s: operator is %r not bracket", market.id, market.parsed_operator)
         return None
 
     brackets = parse_temperature_brackets(market.outcomes)
     if not brackets:
+        logger.debug("map_bracket skip market %s: no parseable brackets from outcomes", market.id)
         return None
 
     coords = geocode(market.parsed_location)
     if coords is None:
+        logger.debug("map_bracket skip market %s: geocode failed for %r", market.id, market.parsed_location)
         return None
     lat, lon = coords
 
     target_dt = parse_target_date(market.parsed_target_date)
     if target_dt is None:
+        logger.debug("map_bracket skip market %s: date parse failed for %r", market.id, market.parsed_target_date)
         return None
 
     now = datetime.now(tz=timezone.utc)
     hours_to_resolution = (target_dt - now).total_seconds() / 3600.0
     days_to_resolution = (target_dt - now).days
     if days_to_resolution < 0 and hours_to_resolution < 0:
+        logger.debug(
+            "map_bracket skip market %s: expired (target=%s, hours=%.1f)",
+            market.id, target_dt.isoformat(), hours_to_resolution,
+        )
         return None
 
     # Use the market's YES price — this corresponds to the first outcome bracket
@@ -932,13 +988,21 @@ async def map_all_markets(
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
     signals: list[MarketSignal] = []
+    errors = 0
+    skipped = 0
     for r in results:
         if isinstance(r, BaseException):
-            logger.error("map_market error: %s", r)
+            logger.error("map_market error: %s", r, exc_info=r)
+            errors += 1
         elif r is not None:
             signals.append(r)
+        else:
+            skipped += 1
 
-    logger.info("Mapped %d / %d markets successfully", len(signals), len(markets))
+    logger.info(
+        "Mapped %d / %d markets successfully (skipped=%d, errors=%d)",
+        len(signals), len(markets), skipped, errors,
+    )
     return signals
 
 
@@ -950,28 +1014,46 @@ async def map_short_range_markets(
     now = datetime.now(tz=timezone.utc)
 
     short_range = []
+    no_date = 0
+    parse_fail = 0
+    out_of_range = 0
     for m in markets:
         if not m.parsed_target_date:
+            no_date += 1
             continue
         target_dt = parse_target_date(m.parsed_target_date)
         if target_dt is None:
+            parse_fail += 1
             continue
         hours_out = (target_dt - now).total_seconds() / 3600.0
         if 0 <= hours_out <= 30:
             short_range.append(m)
+        else:
+            out_of_range += 1
 
     logger.info(
-        "Short-range pipeline: %d / %d markets within 30h", len(short_range), len(markets),
+        "Short-range pipeline: %d / %d markets within 30h "
+        "(no_date=%d, parse_fail=%d, out_of_range=%d)",
+        len(short_range), len(markets), no_date, parse_fail, out_of_range,
     )
 
     tasks = [_choose_mapper(m)(m, session) for m in short_range]
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
     signals: list[MarketSignal] = []
+    errors = 0
+    skipped = 0
     for r in results:
         if isinstance(r, BaseException):
-            logger.error("map_market error: %s", r)
+            logger.error("map_short_range error: %s", r, exc_info=r)
+            errors += 1
         elif r is not None:
             signals.append(r)
+        else:
+            skipped += 1
 
+    logger.info(
+        "Short-range mapped %d / %d signals (skipped=%d, errors=%d)",
+        len(signals), len(short_range), skipped, errors,
+    )
     return signals

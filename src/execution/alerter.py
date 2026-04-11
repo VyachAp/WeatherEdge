@@ -129,10 +129,18 @@ class Alerter:
         self._app.add_handler(CallbackQueryHandler(self._handle_callback))
 
         await self._app.initialize()
-        # Terminate any lingering getUpdates session from a previous instance
+        # Terminate any lingering getUpdates session from a previous instance.
+        # The delete_webhook call with a unique offset forces Telegram to
+        # invalidate the old long-poll connection.  We then wait for the old
+        # instance's poll to time out before we start our own.
         await self._app.bot.delete_webhook(drop_pending_updates=True)
+        logger.info("Waiting for previous Telegram polling session to expire…")
+        await asyncio.sleep(5)
         await self._app.start()
-        await self._app.updater.start_polling(drop_pending_updates=True)  # type: ignore[union-attr]
+        await self._app.updater.start_polling(
+            drop_pending_updates=True,
+            allowed_updates=Update.ALL_TYPES,
+        )  # type: ignore[union-attr]
 
         self._drain_task = asyncio.create_task(self._drain_queue())
         logger.info("Alerter started — Telegram delivery enabled")
