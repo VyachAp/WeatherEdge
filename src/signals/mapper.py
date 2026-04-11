@@ -984,6 +984,46 @@ async def map_all_markets(
     markets = await get_active_weather_markets(session)
     logger.info("Mapping %d active weather markets to forecasts", len(markets))
 
+    # --- pre-mapping diagnostic (INFO-level) --------------------------------
+    from collections import Counter
+    skip_reasons: Counter[str] = Counter()
+    now_diag = datetime.now(tz=timezone.utc)
+    for m in markets:
+        if not m.parsed_location:
+            skip_reasons["no_location"] += 1
+        elif not m.parsed_variable:
+            skip_reasons["no_variable"] += 1
+        elif m.parsed_threshold is None and m.parsed_operator != "bracket":
+            skip_reasons["no_threshold"] += 1
+        elif not m.parsed_operator:
+            skip_reasons["no_operator"] += 1
+        elif not m.parsed_target_date:
+            skip_reasons["no_target_date"] += 1
+        else:
+            v, _t, _o = resolve_variable(m.parsed_variable, m.parsed_threshold, m.parsed_operator)
+            if v not in SUPPORTED_VARIABLES:
+                skip_reasons["unsupported_variable"] += 1
+            elif geocode(m.parsed_location) is None:
+                skip_reasons["geocode_fail"] += 1
+            else:
+                tdt = parse_target_date(m.parsed_target_date)
+                if tdt is None:
+                    skip_reasons["date_parse_fail"] += 1
+                elif (tdt - now_diag).total_seconds() < 0:
+                    skip_reasons["expired"] += 1
+                else:
+                    skip_reasons["mappable"] += 1
+    logger.info("Pre-mapping diagnostic: %s", dict(skip_reasons))
+    # Log a few sample markets for debugging
+    for m in markets[:3]:
+        logger.info(
+            "Sample market id=%s loc=%r var=%r thresh=%s op=%r date=%r q=%r",
+            m.id, m.parsed_location, m.parsed_variable, m.parsed_threshold,
+            m.parsed_operator, m.parsed_target_date,
+            m.question[:80] if m.question else None,
+        )
+    # -----------------------------------------------------------------------
+
     tasks = [_choose_mapper(m)(m, session) for m in markets]
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
