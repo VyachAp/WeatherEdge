@@ -90,6 +90,7 @@ class ParsedQuestion:
     target_date: str | None = None    # free-text date or range
     matched: bool = False
     raw: str = ""
+    pattern_index: int | None = None   # which _PATTERNS entry matched (0-based)
     extras: dict[str, Any] = field(default_factory=dict)
 
 
@@ -219,9 +220,21 @@ _p(
     {"variable": "record", "operator": "record_breaking"},
 )
 
-# 16 — Bracket temperature market (daily high/low)
-#      "Highest temperature in Austin on April 8?"
-#      "Lowest temperature in Seoul on April 12?"
+# 16a — Single-value high/low temperature market (Yes/No)
+#       "Will the highest temperature in Paris be 22°C on April 11?"
+#       "Will the highest temperature in Paris be 28°C or higher on April 11?"
+#       "Will the lowest temperature in Seoul be 5°C or lower on April 12?"
+_p(
+    r"(?P<hilo>highest|lowest|high|low)\s+temperature\s+in\s+" + _L +
+    r"\s+be\s+(?P<threshold>-?\d+(?:\.\d+)?)\s*°?\s*(?:[FC])?"
+    r"(?:\s+or\s+(?P<operator>higher|lower))?"
+    r"(?:\s+on\s+(?P<date>[\w\s,]+))?\s*\??",
+    {"variable": "temperature", "operator": "at_least"},
+)
+
+# 16b — Bracket temperature market (daily high/low)
+#       "Highest temperature in Austin on April 8?"
+#       "Lowest temperature in Seoul on April 12?"
 _p(
     r"(?:highest|lowest|high|low)\s+temperature\s+in\s+" + _L +
     r"(?:\s+on\s+(?P<date>[\w\s,]+))?\s*\??",
@@ -234,6 +247,7 @@ _OP_MAP = {
     "reach": "at_least", "hit": "at_least",
     "drop below": "below", "fall below": "below", "go below": "below",
     "at or above": "at_least", "at or below": "at_most",
+    "higher": "above", "lower": "below",
 }
 
 
@@ -343,7 +357,7 @@ def _extract_date_from_text(text: str) -> str | None:
 
 def parse_question(question: str) -> ParsedQuestion:
     """Parse a Polymarket weather-market question into structured fields."""
-    for pattern, defaults in _PATTERNS:
+    for pat_idx, (pattern, defaults) in enumerate(_PATTERNS):
         m = pattern.search(question)
         if not m:
             continue
@@ -369,7 +383,7 @@ def parse_question(question: str) -> ParsedQuestion:
             if loc_match:
                 location = loc_match.group(0).strip()
 
-        raw_op = groups.get("operator", defaults.get("operator"))
+        raw_op = groups.get("operator") or defaults.get("operator")
         operator = _normalize_operator(raw_op)
 
         threshold_str = groups.get("threshold", defaults.get("threshold"))
@@ -391,6 +405,7 @@ def parse_question(question: str) -> ParsedQuestion:
             target_date=target_date,
             matched=True,
             raw=question,
+            pattern_index=pat_idx,
             extras={k: v for k, v in groups.items()
                     if k not in ("location", "variable", "threshold", "operator", "date")
                     and v is not None},
@@ -594,8 +609,17 @@ def _parse_dt(val: str | None) -> datetime | None:
 
 async def ingest_markets(session: AsyncSession, raw_markets: list[dict[str, Any]]) -> int:
     """Parse and upsert markets + create snapshots. Returns count ingested."""
+    from collections import Counter
+
     now = datetime.utcnow()
     count = 0
+
+    # --- parse diagnostic counters ------------------------------------------
+    by_pattern: Counter[str] = Counter()     # pattern_index → count
+    by_variable: Counter[str] = Counter()    # variable → count
+    by_operator: Counter[str] = Counter()    # operator → count
+    unmatched_questions: list[str] = []       # every unmatched question
+    matched_count = 0
 
     for raw in raw_markets:
         mid = raw.get("id") or raw.get("conditionId")
@@ -604,6 +628,15 @@ async def ingest_markets(session: AsyncSession, raw_markets: list[dict[str, Any]
 
         parsed = parse_question(raw.get("question", ""))
         row_data = _market_to_row(raw, parsed, now)
+
+        # track parse results
+        if parsed.matched:
+            matched_count += 1
+            by_pattern[f"p{parsed.pattern_index}"] += 1
+            by_variable[parsed.variable or "?"] += 1
+            by_operator[parsed.operator or "none"] += 1
+        else:
+            unmatched_questions.append(raw.get("question", "")[:120])
 
         existing = await session.get(Market, mid)
         if existing:
@@ -626,6 +659,18 @@ async def ingest_markets(session: AsyncSession, raw_markets: list[dict[str, Any]
 
     await session.commit()
     logger.info("Ingested %d markets with snapshots", count)
+
+    # --- log parse diagnostic -----------------------------------------------
+    logger.info(
+        "Parse stats: matched=%d/%d by_pattern=%s",
+        matched_count, count, dict(by_pattern),
+    )
+    logger.info("Parse by_variable=%s by_operator=%s", dict(by_variable), dict(by_operator))
+    if unmatched_questions:
+        logger.info("Unmatched questions (%d):", len(unmatched_questions))
+        for q in unmatched_questions:
+            logger.info("  UNMATCHED: %s", q)
+
     return count
 
 

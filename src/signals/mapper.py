@@ -876,7 +876,7 @@ async def map_bracket_market(
 
     brackets = parse_temperature_brackets(market.outcomes)
     if not brackets:
-        logger.debug("map_bracket skip market %s: no parseable brackets from outcomes", market.id)
+        logger.info("map_bracket skip market %s: no parseable brackets from outcomes, outcomes=%r", market.id, market.outcomes)
         return None
 
     coords = geocode(market.parsed_location)
