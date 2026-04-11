@@ -139,7 +139,7 @@ def paper_trade(days: int) -> None:
         from src.risk.simulate import SimSignal, simulate_bankroll
 
         async with async_session() as session:
-            cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+            cutoff = datetime.utcnow() - timedelta(days=days)
             signals = (
                 await session.execute(
                     select(Signal)

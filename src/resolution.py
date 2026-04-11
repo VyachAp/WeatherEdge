@@ -27,7 +27,7 @@ async def resolve_trades(session: AsyncSession) -> list[Trade]:
 
     Returns the list of trades whose status was updated.
     """
-    now = datetime.now(timezone.utc)
+    now = datetime.utcnow()
 
     result = await session.execute(
         select(Trade)

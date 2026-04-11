@@ -131,7 +131,7 @@ async def get_token_ids(market_id: str) -> tuple[str, str] | None:
 
 async def get_daily_spend(session: AsyncSession) -> float:
     """Sum of stake_usd for all trades opened in the last 24 hours."""
-    cutoff = datetime.now(tz=timezone.utc) - timedelta(hours=24)
+    cutoff = datetime.utcnow() - timedelta(hours=24)
     stmt = (
         select(func.coalesce(func.sum(Trade.stake_usd), 0.0))
         .where(Trade.opened_at >= cutoff)
