@@ -8,6 +8,7 @@ persists markets + price snapshots to the database.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 from dataclasses import dataclass, field
@@ -554,10 +555,20 @@ async def fetch_weather_markets(client: httpx.AsyncClient | None = None) -> list
 def _market_to_row(raw: dict[str, Any], parsed: ParsedQuestion, now: datetime) -> dict[str, Any]:
     outcomes = raw.get("outcomes")
     if isinstance(outcomes, str):
-        outcomes = [outcomes]
+        try:
+            parsed_outcomes = json.loads(outcomes)
+            if isinstance(parsed_outcomes, list):
+                outcomes = parsed_outcomes
+        except (json.JSONDecodeError, TypeError):
+            outcomes = [outcomes]
 
     yes_price: float | None = None
     tokens = raw.get("outcomePrices") or raw.get("tokens")
+    if isinstance(tokens, str):
+        try:
+            tokens = json.loads(tokens)
+        except (json.JSONDecodeError, TypeError):
+            pass
     if isinstance(tokens, list) and tokens:
         first = tokens[0]
         if isinstance(first, dict):

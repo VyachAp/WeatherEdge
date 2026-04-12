@@ -719,3 +719,67 @@ class TestAviationContextConsensus:
             0.60, 0.60, aviation_prob=0.60, hours_to_resolution=4.0,
         )
         assert result.confidence == result2.confidence
+
+
+# ===================================================================
+# mapper.py – map_exactly_market
+# ===================================================================
+
+
+class TestMapExactlyMarket:
+    @pytest.mark.asyncio
+    @patch("src.signals.mapper.aviation.get_bracket_probability", new_callable=AsyncMock, return_value=0.15)
+    @patch("src.signals.mapper.aviation.taf_amendment_count", new_callable=AsyncMock, return_value=0)
+    @patch("src.signals.mapper.aviation.detect_speci_events", new_callable=AsyncMock, return_value=[])
+    @patch("src.signals.mapper.aviation.has_severe_weather_reports", new_callable=AsyncMock, return_value=False)
+    @patch("src.signals.mapper.aviation.alerts_affecting_location", new_callable=AsyncMock, return_value=[])
+    async def test_happy_path(self, _alerts, _severe, _speci, _amend, mock_bracket):
+        from src.signals.mapper import map_exactly_market
+
+        market = _make_market(parsed_operator="exactly", parsed_threshold=75.0)
+        result = await map_exactly_market(market)
+
+        assert result is not None
+        assert result.market_id == "mkt_001"
+        assert result.aviation_prob == 0.15
+        assert result.gfs_prob is None
+        assert result.ecmwf_prob is None
+        mock_bracket.assert_called_once()
+        call_args = mock_bracket.call_args
+        assert call_args[0][1] == 74.0  # low_f = 75 - 1
+        assert call_args[0][2] == 76.0  # high_f = 75 + 1
+
+    @pytest.mark.asyncio
+    async def test_missing_threshold_returns_none(self):
+        from src.signals.mapper import map_exactly_market
+
+        market = _make_market(parsed_operator="exactly", parsed_threshold=None)
+        result = await map_exactly_market(market)
+        assert result is None
+
+    @pytest.mark.asyncio
+    @patch("src.signals.mapper.aviation.get_bracket_probability", new_callable=AsyncMock, return_value=None)
+    async def test_no_aviation_returns_none(self, _mock):
+        from src.signals.mapper import map_exactly_market
+
+        market = _make_market(parsed_operator="exactly", parsed_threshold=75.0)
+        result = await map_exactly_market(market)
+        assert result is None
+
+    def test_choose_mapper_routes_exactly(self):
+        from src.signals.mapper import _choose_mapper, map_exactly_market
+
+        market = _make_market(parsed_operator="exactly")
+        assert _choose_mapper(market) is map_exactly_market
+
+    def test_choose_mapper_routes_bracket(self):
+        from src.signals.mapper import _choose_mapper, map_bracket_market
+
+        market = _make_market(parsed_operator="bracket")
+        assert _choose_mapper(market) is map_bracket_market
+
+    def test_choose_mapper_routes_default(self):
+        from src.signals.mapper import _choose_mapper, map_market
+
+        market = _make_market(parsed_operator="above")
+        assert _choose_mapper(market) is map_market

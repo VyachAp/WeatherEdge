@@ -26,6 +26,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Limit concurrent market-mapping coroutines to avoid DB connection exhaustion.
+_FETCH_SEMAPHORE = asyncio.Semaphore(8)
+
 # ---------------------------------------------------------------------------
 # Geocoding – static lookup for major US cities & state capitals
 # ---------------------------------------------------------------------------
@@ -954,10 +957,126 @@ async def map_bracket_market(
     )
 
 
+EXACTLY_BRACKET_HALF_WIDTH = 1.0  # ±1°F around the stated threshold
+
+
+async def map_exactly_market(
+    market: Market,
+    session: AsyncSession | None = None,
+) -> MarketSignal | None:
+    """Map an 'exactly N°F' temperature market to forecast probabilities.
+
+    Converts the point threshold to a narrow bracket (threshold ± 1°F) and
+    computes P(low ≤ temp < high) using aviation data, mirroring the bracket
+    market approach.
+    """
+    if not all([
+        market.parsed_location,
+        market.parsed_variable,
+        market.parsed_threshold is not None,
+        market.parsed_target_date,
+    ]):
+        missing = []
+        if not market.parsed_location:
+            missing.append("location")
+        if not market.parsed_variable:
+            missing.append("variable")
+        if market.parsed_threshold is None:
+            missing.append("threshold")
+        if not market.parsed_target_date:
+            missing.append("target_date")
+        logger.debug(
+            "map_exactly skip market %s: missing fields %s (question=%r)",
+            market.id, missing, market.question[:80] if market.question else None,
+        )
+        return None
+
+    threshold = market.parsed_threshold
+    low_f = threshold - EXACTLY_BRACKET_HALF_WIDTH
+    high_f = threshold + EXACTLY_BRACKET_HALF_WIDTH
+
+    coords = geocode(market.parsed_location)
+    if coords is None:
+        logger.debug("map_exactly skip market %s: geocode failed for %r", market.id, market.parsed_location)
+        return None
+    lat, lon = coords
+
+    target_dt = parse_target_date(market.parsed_target_date)
+    if target_dt is None:
+        logger.debug("map_exactly skip market %s: date parse failed for %r", market.id, market.parsed_target_date)
+        return None
+
+    now = datetime.now(tz=timezone.utc)
+    hours_to_resolution = (target_dt - now).total_seconds() / 3600.0
+    days_to_resolution = (target_dt - now).days
+    if days_to_resolution < 0 and hours_to_resolution < 0:
+        logger.debug(
+            "map_exactly skip market %s: expired (target=%s, hours=%.1f)",
+            market.id, target_dt.isoformat(), hours_to_resolution,
+        )
+        return None
+
+    market_prob = market.current_yes_price or 0.5
+
+    icao = icao_for_location(market.parsed_location)
+
+    # --- fetch aviation bracket probability --------------------------------
+    aviation_prob = None
+    if icao is not None:
+        try:
+            aviation_prob = await aviation.get_bracket_probability(icao, low_f, high_f, target_dt)
+        except Exception as e:
+            logger.warning("Aviation exactly fetch failed for market %s: %s", market.id, e)
+
+    if aviation_prob is None:
+        logger.debug("map_exactly skip %s: no aviation data", market.id)
+        return None
+
+    gfs_prob = None
+    ecmwf_prob = None
+
+    # --- gather aviation context ---
+    aviation_ctx = None
+    if icao is not None:
+        ctx_results = await asyncio.gather(
+            aviation.taf_amendment_count(icao, hours=24),
+            aviation.detect_speci_events(icao, hours=2),
+            aviation.has_severe_weather_reports(lat, lon),
+            aviation.alerts_affecting_location(lat, lon),
+            return_exceptions=True,
+        )
+        amend = ctx_results[0] if not isinstance(ctx_results[0], BaseException) else 0
+        speci = ctx_results[1] if not isinstance(ctx_results[1], BaseException) else []
+        severe = ctx_results[2] if not isinstance(ctx_results[2], BaseException) else False
+        alerts = ctx_results[3] if not isinstance(ctx_results[3], BaseException) else []
+        aviation_ctx = AviationContext(
+            taf_amendment_count=amend,
+            speci_events_2h=len(speci) if isinstance(speci, list) else 0,
+            has_severe_pireps=bool(severe),
+            active_sigmet_count=sum(1 for a in alerts if getattr(a, "alert_type", None) == "SIGMET"),
+            active_airmet_count=sum(1 for a in alerts if getattr(a, "alert_type", None) == "AIRMET"),
+        )
+
+    return MarketSignal(
+        market_id=market.id,
+        question=market.question,
+        market_prob=market_prob,
+        gfs_prob=gfs_prob,
+        ecmwf_prob=ecmwf_prob,
+        aviation_prob=aviation_prob,
+        days_to_resolution=days_to_resolution,
+        hours_to_resolution=hours_to_resolution,
+        market=market,
+        aviation_context=aviation_ctx,
+    )
+
+
 def _choose_mapper(market: Market):
     """Return the appropriate mapping function for a market."""
     if market.parsed_operator == "bracket":
         return map_bracket_market
+    if market.parsed_operator == "exactly":
+        return map_exactly_market
     return map_market
 
 
@@ -1026,6 +1145,10 @@ async def map_all_markets(
                 except Exception:
                     logger.warning("Pre-fetch METAR failed for %s", stn)
                 try:
+                    await aviation.fetch_metar_history(stn, hours=6)
+                except Exception:
+                    logger.warning("Pre-fetch METAR (6h) failed for %s", stn)
+                try:
                     await aviation.fetch_latest_tafs([stn])
                 except Exception:
                     logger.warning("Pre-fetch TAF failed for %s", stn)
@@ -1038,7 +1161,11 @@ async def map_all_markets(
         logger.warning("Aviation pre-fetch failed; falling back to per-market fetch")
     # -----------------------------------------------------------------------
 
-    tasks = [_choose_mapper(m)(m, session) for m in markets]
+    async def _bounded(coro):
+        async with _FETCH_SEMAPHORE:
+            return await coro
+
+    tasks = [_bounded(_choose_mapper(m)(m, session)) for m in markets]
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
     signals: list[MarketSignal] = []
@@ -1109,6 +1236,10 @@ async def map_short_range_markets(
                 except Exception:
                     logger.warning("Pre-fetch METAR failed for %s", stn)
                 try:
+                    await aviation.fetch_metar_history(stn, hours=6)
+                except Exception:
+                    logger.warning("Pre-fetch METAR (6h) failed for %s", stn)
+                try:
                     await aviation.fetch_latest_tafs([stn])
                 except Exception:
                     logger.warning("Pre-fetch TAF failed for %s", stn)
@@ -1121,7 +1252,11 @@ async def map_short_range_markets(
         logger.warning("Aviation pre-fetch failed; falling back to per-market fetch")
     # -----------------------------------------------------------------------
 
-    tasks = [_choose_mapper(m)(m, session) for m in short_range]
+    async def _bounded(coro):
+        async with _FETCH_SEMAPHORE:
+            return await coro
+
+    tasks = [_bounded(_choose_mapper(m)(m, session)) for m in short_range]
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
     signals: list[MarketSignal] = []

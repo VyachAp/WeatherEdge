@@ -183,7 +183,7 @@ def _parse_metar_json(raw: dict[str, Any]) -> dict[str, Any]:
         "temp_f": _c_to_f(temp_c),
         "dewpoint_f": _c_to_f(dewpoint_c),
         "wind_speed_kts": raw.get("wspd"),
-        "wind_dir": raw.get("wdir"),
+        "wind_dir": str(raw.get("wdir")) if raw.get("wdir") is not None else None,
         "wind_gust_kts": raw.get("wgst"),
         "visibility_m": vis_m,
         "visibility_miles": vis_miles,

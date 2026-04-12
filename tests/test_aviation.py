@@ -274,7 +274,7 @@ class TestMetarParsing:
         assert result["station_icao"] == "KPHX"
         assert result["temp_c"] == 32.2
         assert result["wind_speed_kts"] == 12
-        assert result["wind_dir"] == 220
+        assert result["wind_dir"] == "220"
         assert result["wind_gust_kts"] == 18
         assert result["visibility_miles"] == 10
         assert result["pressure_hpa"] == 1013.2
