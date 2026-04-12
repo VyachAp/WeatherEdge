@@ -72,9 +72,10 @@ def configure_logging() -> None:
     root = logging.getLogger()
     root.handlers = [handler]
     root.setLevel(logging.INFO)
-    # Suppress httpx request logging — it includes full URLs which can leak
-    # secrets embedded in paths (e.g. Telegram bot tokens).
-    logging.getLogger("httpx").setLevel(logging.WARNING)
+    # Suppress noisy third-party loggers (httpx URLs can leak Telegram tokens, etc.)
+    from src.logging_utils import NOISY_LOGGERS
+    for name in NOISY_LOGGERS:
+        logging.getLogger(name).setLevel(logging.WARNING)
 
 
 # ---------------------------------------------------------------------------

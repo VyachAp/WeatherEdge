@@ -654,6 +654,8 @@ def parse_target_date(date_str: str) -> datetime | None:
         )
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
+        if dt.hour == 0 and dt.minute == 0 and dt.second == 0:
+            dt = dt.replace(hour=23, minute=59, second=59)
         logger.debug("parse_target_date: %r -> %s", date_str, dt.isoformat())
         return dt
     except (ValueError, OverflowError):
@@ -1006,6 +1008,36 @@ async def map_all_markets(
         )
     # -----------------------------------------------------------------------
 
+    # --- pre-fetch aviation data to prime cache (best-effort) ---------------
+    try:
+        stations = set()
+        for m in markets:
+            if m.parsed_location:
+                icao = icao_for_location(m.parsed_location)
+                if icao:
+                    stations.add(icao)
+
+        if stations:
+            station_list = sorted(stations)
+            logger.info("Pre-fetching aviation data for %d stations: %s", len(station_list), station_list)
+            for stn in station_list:
+                try:
+                    await aviation.fetch_metar_history(stn, hours=24)
+                except Exception:
+                    logger.warning("Pre-fetch METAR failed for %s", stn)
+                try:
+                    await aviation.fetch_latest_tafs([stn])
+                except Exception:
+                    logger.warning("Pre-fetch TAF failed for %s", stn)
+
+        try:
+            await aviation._fetch_airsigmets()
+        except Exception:
+            logger.warning("Pre-fetch SIGMETs failed")
+    except Exception:
+        logger.warning("Aviation pre-fetch failed; falling back to per-market fetch")
+    # -----------------------------------------------------------------------
+
     tasks = [_choose_mapper(m)(m, session) for m in markets]
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -1058,6 +1090,36 @@ async def map_short_range_markets(
         "(no_date=%d, parse_fail=%d, out_of_range=%d)",
         len(short_range), len(markets), no_date, parse_fail, out_of_range,
     )
+
+    # --- pre-fetch aviation data to prime cache (best-effort) ---------------
+    try:
+        stations = set()
+        for m in short_range:
+            if m.parsed_location:
+                icao = icao_for_location(m.parsed_location)
+                if icao:
+                    stations.add(icao)
+
+        if stations:
+            station_list = sorted(stations)
+            logger.info("Pre-fetching aviation data for %d stations: %s", len(station_list), station_list)
+            for stn in station_list:
+                try:
+                    await aviation.fetch_metar_history(stn, hours=24)
+                except Exception:
+                    logger.warning("Pre-fetch METAR failed for %s", stn)
+                try:
+                    await aviation.fetch_latest_tafs([stn])
+                except Exception:
+                    logger.warning("Pre-fetch TAF failed for %s", stn)
+
+        try:
+            await aviation._fetch_airsigmets()
+        except Exception:
+            logger.warning("Pre-fetch SIGMETs failed")
+    except Exception:
+        logger.warning("Aviation pre-fetch failed; falling back to per-market fetch")
+    # -----------------------------------------------------------------------
 
     tasks = [_choose_mapper(m)(m, session) for m in short_range]
     results = await asyncio.gather(*tasks, return_exceptions=True)

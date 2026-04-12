@@ -234,7 +234,7 @@ _p(
     r"\s+be\s+(?P<threshold>-?\d+(?:\.\d+)?)\s*°?\s*(?:[FC])?"
     r"(?:\s+or\s+(?P<operator>higher|lower))?"
     r"(?:\s+on\s+(?P<date>[\w\s,]+))?\s*\??",
-    {"variable": "temperature", "operator": "at_least"},
+    {"variable": "temperature", "operator": "exactly"},
 )
 
 # 16b — Bracket temperature market (daily high/low)
@@ -252,7 +252,7 @@ _OP_MAP = {
     "reach": "at_least", "hit": "at_least",
     "drop below": "below", "fall below": "below", "go below": "below",
     "at or above": "at_least", "at or below": "at_most",
-    "higher": "above", "lower": "below",
+    "higher": "at_least", "lower": "at_most",
 }
 
 

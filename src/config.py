@@ -5,7 +5,7 @@ from pydantic_settings import BaseSettings
 class Settings(BaseSettings):
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 
-    DATABASE_URL: str = "postgresql+asyncpg://weather:weather@localhost:5432/weatheredge"
+    DATABASE_URL: str = ""
 
     @field_validator("DATABASE_URL")
     @classmethod
@@ -26,7 +26,7 @@ class Settings(BaseSettings):
     ECMWF_CACHE_DIR: str = "/tmp/weather-edge/ecmwf/"
     ECMWF_CACHE_TTL_HOURS: int = 24
     AWC_USER_AGENT: str = "WeatherEdge/1.0 (weather-trading-bot; contact@example.com)"
-    AWC_RATE_LIMIT_RPS: float = 1.0
+    AWC_RATE_LIMIT_RPS: float = 2.0
 
     # Short-range trading tunables
     SR_MIN_LIQUIDITY: float = 100.0

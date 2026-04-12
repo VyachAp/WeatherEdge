@@ -94,6 +94,8 @@ class TestParseDateTarget:
         assert dt.month == 7
         assert dt.day == 15
         assert dt.year == 2026
+        assert dt.hour == 23
+        assert dt.minute == 59
 
     def test_month_year_defaults_to_15th(self):
         dt = parse_target_date("January 2026")
@@ -101,6 +103,8 @@ class TestParseDateTarget:
         assert dt.day == 15
         assert dt.month == 1
         assert dt.year == 2026
+        assert dt.hour == 23
+        assert dt.minute == 59
 
     def test_invalid_returns_none(self):
         assert parse_target_date("someday maybe") is None
@@ -109,6 +113,13 @@ class TestParseDateTarget:
         dt = parse_target_date("July 15, 2026")
         assert dt is not None
         assert dt.tzinfo is not None
+
+    def test_end_of_day(self):
+        dt = parse_target_date("April 12")
+        assert dt is not None
+        assert dt.hour == 23
+        assert dt.minute == 59
+        assert dt.second == 59
 
 
 # ===================================================================

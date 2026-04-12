@@ -17,6 +17,7 @@ from src.ingestion.aviation import (
     _parse_pirep_json,
     _parse_taf_json,
     _point_in_polygon,
+    clear_aviation_cache,
     compute_taf_based_probability,
     detect_speci_events,
     fetch_active_airmets,
@@ -34,6 +35,14 @@ from src.ingestion.aviation import (
     has_severe_weather_reports,
     taf_amendment_count,
 )
+
+@pytest.fixture(autouse=True)
+def _clear_cache():
+    """Clear the aviation TTL cache before each test."""
+    clear_aviation_cache()
+    yield
+    clear_aviation_cache()
+
 
 # ---------------------------------------------------------------------------
 # Sample AWC API response fixtures

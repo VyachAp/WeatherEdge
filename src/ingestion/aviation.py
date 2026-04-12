@@ -11,8 +11,9 @@ import asyncio
 import logging
 import math
 import re
+import time as _time
 from datetime import datetime, timedelta, timezone
-from typing import Any, TYPE_CHECKING
+from typing import Any, Hashable, TYPE_CHECKING
 
 import httpx
 from tenacity import (
@@ -49,10 +50,47 @@ _PRECIP_CODES = {"RA", "SN", "TS", "TSRA", "TSSN", "DZ", "FZRA", "FZDZ",
                  "SG", "GR", "GS", "PL", "IC", "SHRA", "SHSN", "SHGR"}
 
 # ---------------------------------------------------------------------------
+# In-memory TTL cache for aviation HTTP responses
+# ---------------------------------------------------------------------------
+
+
+class _TTLCache:
+    """Simple in-memory TTL cache. Not thread-safe, but fine for asyncio."""
+
+    def __init__(self, ttl_seconds: float = 300.0) -> None:
+        self._ttl = ttl_seconds
+        self._store: dict[Hashable, tuple[float, Any]] = {}
+
+    def get(self, key: Hashable) -> Any | None:
+        entry = self._store.get(key)
+        if entry is None:
+            return None
+        ts, value = entry
+        if _time.monotonic() - ts > self._ttl:
+            del self._store[key]
+            return None
+        return value
+
+    def set(self, key: Hashable, value: Any) -> None:
+        self._store[key] = (_time.monotonic(), value)
+
+    def clear(self) -> None:
+        self._store.clear()
+
+
+_cache = _TTLCache(ttl_seconds=300)  # 5-minute TTL
+
+
+def clear_aviation_cache() -> None:
+    """Clear the in-memory aviation data cache. Useful for testing."""
+    _cache.clear()
+
+
+# ---------------------------------------------------------------------------
 # Rate limiting & HTTP helpers
 # ---------------------------------------------------------------------------
 
-_awc_semaphore = asyncio.Semaphore(1)
+_awc_semaphore = asyncio.Semaphore(max(1, int(settings.AWC_RATE_LIMIT_RPS)))
 _awc_interval = 1.0 / settings.AWC_RATE_LIMIT_RPS
 
 
@@ -225,6 +263,11 @@ async def fetch_metar_history(
     session: AsyncSession | None = None,
 ) -> list[dict[str, Any]]:
     """Fetch historical METARs for a single station."""
+    cache_key = ("metar_history", station, hours)
+    cached = _cache.get(cache_key)
+    if cached is not None:
+        return cached
+
     own_session = session is None
     if own_session:
         session = async_session()
@@ -257,6 +300,7 @@ async def fetch_metar_history(
         if own_session:
             await session.close()
 
+    _cache.set(cache_key, parsed)
     return parsed
 
 
@@ -406,6 +450,11 @@ async def fetch_latest_tafs(
     if not station_list:
         return []
 
+    cache_key = ("tafs", tuple(sorted(station_list)))
+    cached = _cache.get(cache_key)
+    if cached is not None:
+        return cached
+
     own_session = session is None
     if own_session:
         session = async_session()
@@ -451,6 +500,7 @@ async def fetch_latest_tafs(
         if own_session:
             await session.close()
 
+    _cache.set(cache_key, all_parsed)
     return all_parsed
 
 
@@ -662,6 +712,11 @@ async def fetch_pireps_near(
     session: AsyncSession | None = None,
 ) -> list[dict[str, Any]]:
     """Fetch PIREPs near a location within a radius (nautical miles)."""
+    cache_key = ("pireps", round(lat, 2), round(lon, 2), radius_nm)
+    cached = _cache.get(cache_key)
+    if cached is not None:
+        return cached
+
     own_session = session is None
     if own_session:
         session = async_session()
@@ -699,6 +754,7 @@ async def fetch_pireps_near(
         if own_session:
             await session.close()
 
+    _cache.set(cache_key, parsed)
     return parsed
 
 
@@ -759,6 +815,11 @@ async def _fetch_airsigmets(
     session: AsyncSession | None = None,
 ) -> list[dict[str, Any]]:
     """Fetch all active SIGMETs and AIRMETs."""
+    cache_key = ("airsigmets",)
+    cached = _cache.get(cache_key)
+    if cached is not None:
+        return cached
+
     own_session = session is None
     if own_session:
         session = async_session()
@@ -788,6 +849,7 @@ async def _fetch_airsigmets(
         if own_session:
             await session.close()
 
+    _cache.set(cache_key, parsed)
     return parsed
 
 

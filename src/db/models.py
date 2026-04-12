@@ -1,5 +1,5 @@
 import enum
-from datetime import datetime
+from datetime import datetime, timezone
 
 from sqlalchemy import (
     Boolean,
@@ -43,7 +43,7 @@ class Market(Base):
     current_yes_price = Column(Float)
     volume = Column(Float)
     liquidity = Column(Float)
-    end_date = Column(DateTime)
+    end_date = Column(DateTime(timezone=True))
     resolution_source = Column(String)
     tags = Column(JSONB)
     parsed_location = Column(String)
@@ -51,7 +51,7 @@ class Market(Base):
     parsed_threshold = Column(Float)
     parsed_operator = Column(String)
     parsed_target_date = Column(String)
-    fetched_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    fetched_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
 
     snapshots = relationship("MarketSnapshot", back_populates="market")
     signals = relationship("Signal", back_populates="market")
@@ -67,7 +67,7 @@ class MarketSnapshot(Base):
     no_price = Column(Float)
     volume = Column(Float)
     liquidity = Column(Float)
-    timestamp = Column(DateTime, nullable=False, default=datetime.utcnow)
+    timestamp = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
 
     market = relationship("Market", back_populates="snapshots")
 
@@ -77,15 +77,15 @@ class Forecast(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     model_source = Column(String, nullable=False)
-    run_time = Column(DateTime, nullable=False)
-    valid_time = Column(DateTime, nullable=False)
+    run_time = Column(DateTime(timezone=True), nullable=False)
+    valid_time = Column(DateTime(timezone=True), nullable=False)
     location_lat = Column(Float, nullable=False)
     location_lon = Column(Float, nullable=False)
     variable = Column(String, nullable=False)
     ensemble_mean = Column(Float)
     ensemble_std = Column(Float)
     ensemble_members = Column(JSONB)
-    fetched_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    fetched_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
 
 
 class Signal(Base):
@@ -101,7 +101,7 @@ class Signal(Base):
     gfs_prob = Column(Float)
     ecmwf_prob = Column(Float)
     aviation_prob = Column(Float)
-    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
 
     market = relationship("Market", back_populates="signals")
     trades = relationship("Trade", back_populates="signal")
@@ -119,8 +119,8 @@ class Trade(Base):
     exit_price = Column(Float)
     pnl = Column(Float)
     status = Column(Enum(TradeStatus), nullable=False, default=TradeStatus.PENDING)
-    opened_at = Column(DateTime, default=datetime.utcnow)
-    closed_at = Column(DateTime)
+    opened_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    closed_at = Column(DateTime(timezone=True))
 
     # Polymarket CLOB execution fields
     order_id = Column(String)  # CLOB order identifier
@@ -140,7 +140,7 @@ class BankrollLog(Base):
     balance = Column(Float, nullable=False)
     peak = Column(Float, nullable=False)
     drawdown_pct = Column(Float, nullable=False)
-    timestamp = Column(DateTime, nullable=False, default=datetime.utcnow)
+    timestamp = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
 
 
 # ---------------------------------------------------------------------------
@@ -156,13 +156,13 @@ class MetarObservation(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     station_icao = Column(String, nullable=False)
-    observed_at = Column(DateTime, nullable=False)
+    observed_at = Column(DateTime(timezone=True), nullable=False)
     temp_c = Column(Float)
     dewpoint_c = Column(Float)
     temp_f = Column(Float)
     dewpoint_f = Column(Float)
     wind_speed_kts = Column(Float)
-    wind_dir = Column(Integer)
+    wind_dir = Column(String)
     wind_gust_kts = Column(Float)
     visibility_m = Column(Float)
     visibility_miles = Column(Float)
@@ -172,7 +172,7 @@ class MetarObservation(Base):
     flight_category = Column(String)
     is_speci = Column(Boolean, default=False)
     raw_metar = Column(Text)
-    fetched_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    fetched_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
 
 
 class TafForecast(Base):
@@ -183,13 +183,13 @@ class TafForecast(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     station_icao = Column(String, nullable=False)
-    issued_at = Column(DateTime, nullable=False)
-    valid_from = Column(DateTime, nullable=False)
-    valid_to = Column(DateTime, nullable=False)
+    issued_at = Column(DateTime(timezone=True), nullable=False)
+    valid_from = Column(DateTime(timezone=True), nullable=False)
+    valid_to = Column(DateTime(timezone=True), nullable=False)
     periods = Column(JSONB)
     amendment_number = Column(Integer, default=0)
     raw_taf = Column(Text)
-    fetched_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    fetched_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
 
 
 class Pirep(Base):
@@ -197,7 +197,7 @@ class Pirep(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     report_id = Column(String, unique=True)
-    observed_at = Column(DateTime)
+    observed_at = Column(DateTime(timezone=True))
     lat = Column(Float)
     lon = Column(Float)
     altitude_ft = Column(Integer)
@@ -207,7 +207,7 @@ class Pirep(Base):
     turbulence_intensity = Column(String)
     weather = Column(String)
     raw_text = Column(Text)
-    fetched_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    fetched_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
 
 
 class AviationAlert(Base):
@@ -219,7 +219,7 @@ class AviationAlert(Base):
     hazard = Column(String)
     severity = Column(String)
     area = Column(JSONB)
-    valid_from = Column(DateTime)
-    valid_to = Column(DateTime)
+    valid_from = Column(DateTime(timezone=True))
+    valid_to = Column(DateTime(timezone=True))
     raw_text = Column(Text)
-    fetched_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    fetched_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
