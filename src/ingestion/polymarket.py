@@ -16,7 +16,7 @@ from datetime import datetime
 from typing import Any
 
 import httpx
-from sqlalchemy import select
+from sqlalchemy import insert, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from tenacity import (
     retry,
@@ -232,7 +232,7 @@ _p(
 #       "Will the lowest temperature in Seoul be 5°C or lower on April 12?"
 _p(
     r"(?P<hilo>highest|lowest|high|low)\s+temperature\s+in\s+" + _L +
-    r"\s+be\s+(?P<threshold>-?\d+(?:\.\d+)?)\s*°?\s*(?:[FC])?"
+    r"\s+be\s+(?P<threshold>-?\d+(?:\.\d+)?)\s*°?\s*(?P<unit>[FC])?"
     r"(?:\s+or\s+(?P<operator>higher|lower))?"
     r"(?:\s+on\s+(?P<date>[\w\s,]+))?\s*\??",
     {"variable": "temperature", "operator": "exactly"},
@@ -320,6 +320,34 @@ def parse_temperature_brackets(
     return brackets if brackets else None
 
 
+_QUESTION_BRACKET_RE = re.compile(
+    r"between\s+(?P<low>-?\d+(?:\.\d+)?)\s*[-–]\s*(?P<high>-?\d+(?:\.\d+)?)\s*°?\s*(?P<unit>[FC])",
+    re.IGNORECASE,
+)
+
+
+def parse_bracket_from_question(question: str | None) -> tuple[float, float] | None:
+    """Extract (low_f, high_f) from a bracket market's question text.
+
+    Fallback for binary Yes/No bracket markets whose outcomes list is just
+    ['Yes','No'] and therefore unparseable by parse_temperature_brackets.
+    Upper bound is exclusive (+1 from the stated range end) to match
+    parse_temperature_brackets semantics.
+    """
+    if not question:
+        return None
+    m = _QUESTION_BRACKET_RE.search(question)
+    if m is None:
+        return None
+    low = float(m.group("low"))
+    high = float(m.group("high"))
+    unit = m.group("unit").upper()
+    if unit == "C":
+        low = low * 9.0 / 5.0 + 32.0
+        high = high * 9.0 / 5.0 + 32.0
+    return (low, high + 1.0)
+
+
 def _extract_date_from_text(text: str) -> str | None:
     """Best-effort date/range extraction from trailing question text."""
     # "on July 15, 2026" / "in January 2026" / "in 2026" / "before Nov 1"
@@ -400,6 +428,11 @@ def parse_question(question: str) -> ParsedQuestion:
                 threshold = float(threshold_str)
             except ValueError:
                 pass
+
+        # Convert °C to °F — all downstream code assumes Fahrenheit
+        unit = groups.get("unit")
+        if threshold is not None and unit and unit.upper() == "C":
+            threshold = threshold * 9.0 / 5.0 + 32.0
 
         target_date = groups.get("date") or _extract_date_from_text(question)
 
@@ -637,6 +670,14 @@ async def ingest_markets(session: AsyncSession, raw_markets: list[dict[str, Any]
     unmatched_questions: list[str] = []       # every unmatched question
     matched_count = 0
 
+    # --- bulk-fetch existing markets in one query ----------------------------
+    all_ids = [r.get("id") or r.get("conditionId")
+               for r in raw_markets if r.get("id") or r.get("conditionId")]
+    result = await session.execute(select(Market).where(Market.id.in_(all_ids)))
+    existing_map = {m.id: m for m in result.scalars().all()}
+
+    snapshot_rows: list[dict[str, Any]] = []
+
     for raw in raw_markets:
         mid = raw.get("id") or raw.get("conditionId")
         if not mid:
@@ -654,7 +695,7 @@ async def ingest_markets(session: AsyncSession, raw_markets: list[dict[str, Any]
         else:
             unmatched_questions.append(raw.get("question", "")[:120])
 
-        existing = await session.get(Market, mid)
+        existing = existing_map.get(mid)
         if existing:
             for k, v in row_data.items():
                 if k != "id":
@@ -662,8 +703,8 @@ async def ingest_markets(session: AsyncSession, raw_markets: list[dict[str, Any]
         else:
             session.add(Market(**row_data))
 
-        # snapshot
-        session.add(MarketSnapshot(
+        # collect snapshot for bulk insert
+        snapshot_rows.append(dict(
             market_id=mid,
             yes_price=row_data["current_yes_price"],
             no_price=(1.0 - row_data["current_yes_price"]) if row_data["current_yes_price"] is not None else None,
@@ -672,6 +713,10 @@ async def ingest_markets(session: AsyncSession, raw_markets: list[dict[str, Any]
             timestamp=now,
         ))
         count += 1
+
+    # bulk-insert all snapshots in one statement
+    if snapshot_rows:
+        await session.execute(insert(MarketSnapshot).values(snapshot_rows))
 
     await session.commit()
     logger.info("Ingested %d markets with snapshots", count)
@@ -709,28 +754,6 @@ async def get_active_weather_markets(
             .where(Market.parsed_variable == "temperature")
             .where(Market.end_date > datetime.utcnow())
             .order_by(Market.end_date)
-        )
-        result = await session.execute(stmt)
-        return list(result.scalars().all())
-    finally:
-        if own_session:
-            await session.close()
-
-
-async def get_market_history(
-    market_id: str,
-    session: AsyncSession | None = None,
-) -> list[MarketSnapshot]:
-    """Return price snapshots for a market, ordered by time."""
-    own_session = session is None
-    if own_session:
-        session = async_session()
-
-    try:
-        stmt = (
-            select(MarketSnapshot)
-            .where(MarketSnapshot.market_id == market_id)
-            .order_by(MarketSnapshot.timestamp)
         )
         result = await session.execute(stmt)
         return list(result.scalars().all())

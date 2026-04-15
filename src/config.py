@@ -21,12 +21,17 @@ class Settings(BaseSettings):
     KELLY_FRACTION: float = 0.25
     MAX_POSITION_PCT: float = 0.05
     INITIAL_BANKROLL: float = 750.0
-    GEFS_CACHE_DIR: str = "/tmp/weather-edge/gfs/"
-    GEFS_CACHE_TTL_HOURS: int = 24
-    ECMWF_CACHE_DIR: str = "/tmp/weather-edge/ecmwf/"
-    ECMWF_CACHE_TTL_HOURS: int = 24
     AWC_USER_AGENT: str = "WeatherEdge/1.0 (weather-trading-bot; contact@example.com)"
     AWC_RATE_LIMIT_RPS: float = 2.0
+
+    # Multi-provider aviation API keys (empty = provider disabled)
+    CHECKWX_API_KEY: str = ""
+    AVWX_API_KEY: str = ""
+    CHECKWX_DAILY_BUDGET: int = 2000
+    IEM_RATE_LIMIT_RPS: float = 1.0
+    OGIMET_RATE_LIMIT_RPS: float = 0.2
+    NOAA_RATE_LIMIT_RPS: float = 1.0
+    AVWX_RATE_LIMIT_RPS: float = 1.0
 
     # Short-range trading tunables
     SR_MIN_LIQUIDITY: float = 100.0

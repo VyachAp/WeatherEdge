@@ -72,22 +72,6 @@ class MarketSnapshot(Base):
     market = relationship("Market", back_populates="snapshots")
 
 
-class Forecast(Base):
-    __tablename__ = "forecasts"
-
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    model_source = Column(String, nullable=False)
-    run_time = Column(DateTime(timezone=True), nullable=False)
-    valid_time = Column(DateTime(timezone=True), nullable=False)
-    location_lat = Column(Float, nullable=False)
-    location_lon = Column(Float, nullable=False)
-    variable = Column(String, nullable=False)
-    ensemble_mean = Column(Float)
-    ensemble_std = Column(Float)
-    ensemble_members = Column(JSONB)
-    fetched_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
-
-
 class Signal(Base):
     __tablename__ = "signals"
 
@@ -98,8 +82,8 @@ class Signal(Base):
     edge = Column(Float, nullable=False)
     direction = Column(Enum(TradeDirection), nullable=False)
     confidence = Column(Float)
-    gfs_prob = Column(Float)
-    ecmwf_prob = Column(Float)
+    gfs_prob = Column(Float)  # Legacy — always NULL, drop via migration later
+    ecmwf_prob = Column(Float)  # Legacy — always NULL, drop via migration later
     aviation_prob = Column(Float)
     created_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
 
@@ -207,6 +191,27 @@ class Pirep(Base):
     turbulence_intensity = Column(String)
     weather = Column(String)
     raw_text = Column(Text)
+    fetched_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
+
+
+class SynopObservation(Base):
+    __tablename__ = "synop_observations"
+    __table_args__ = (
+        Index("ix_synop_wmo_observed", "wmo_id", "observed_at"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    wmo_id = Column(String, nullable=False)
+    observed_at = Column(DateTime(timezone=True), nullable=False)
+    temp_c = Column(Float)
+    dewpoint_c = Column(Float)
+    pressure_hpa = Column(Float)
+    wind_speed_kts = Column(Float)
+    wind_dir = Column(Integer)
+    precip_mm = Column(Float)
+    precip_period_hours = Column(Integer)
+    cloud_cover_oktas = Column(Integer)
+    raw_synop = Column(Text)
     fetched_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
 
 

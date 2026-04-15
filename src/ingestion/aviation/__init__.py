@@ -1,8 +1,15 @@
-"""Aviation weather data fetcher using the FAA Aviation Weather Center API.
+"""Multi-source global aviation weather data system.
 
-Fetches METARs, TAFs, PIREPs, and SIGMETs/AIRMETs from aviationweather.gov.
-Provides real-time ground-truth observations and short-range forecasts that
-are more accurate than NWP models for 0-30 hour horizons.
+Aggregates data from 6 providers with automatic failover:
+  - AWC (aviationweather.gov) — METAR, TAF, PIREP, SIGMET
+  - CheckWX — real-time parsed METAR/TAF (API key required)
+  - IEM (Iowa Environmental Mesonet) — METAR history, 1-minute ASOS
+  - OGIMET — global METAR/TAF/SYNOP archive
+  - NOAA/NWS — raw METAR text
+  - AVWX — backup parsed METAR/TAF (API key required)
+
+All original function signatures are preserved for backward compatibility.
+New multi-source functions are also exported from this module.
 """
 
 from __future__ import annotations
@@ -144,6 +151,34 @@ def _c_to_f(temp_c: float | None) -> float | None:
     return temp_c * 9.0 / 5.0 + 32.0
 
 
+def _parse_awc_observed_at(raw: dict[str, Any]) -> datetime:
+    """Extract observation timestamp from an AWC API object.
+
+    AWC returns ``obsTime`` as a Unix epoch integer and ``reportTime`` as an
+    ISO8601 string. Try ISO first, then epoch, then fall back to now().
+    The historical implementation tried ``fromisoformat`` on the Unix int,
+    silently failed, and stamped every observation with ``now()`` — which
+    made temperature-trend regression collapse the time axis and blow up
+    the slope.
+    """
+    report_time = raw.get("reportTime")
+    if report_time:
+        try:
+            return datetime.fromisoformat(str(report_time).replace("Z", "+00:00"))
+        except (ValueError, AttributeError):
+            pass
+    obs_time = raw.get("obsTime")
+    if obs_time is not None:
+        try:
+            return datetime.fromtimestamp(int(obs_time), tz=timezone.utc)
+        except (ValueError, TypeError):
+            try:
+                return datetime.fromisoformat(str(obs_time).replace("Z", "+00:00"))
+            except (ValueError, AttributeError):
+                pass
+    return datetime.now(timezone.utc)
+
+
 def _parse_metar_json(raw: dict[str, Any]) -> dict[str, Any]:
     """Convert AWC METAR JSON object to DB-ready dict."""
     temp_c = raw.get("temp")
@@ -169,11 +204,7 @@ def _parse_metar_json(raw: dict[str, Any]) -> dict[str, Any]:
         vis_miles = None
     vis_m = vis_miles * 1609.34 if vis_miles is not None else None
 
-    obs_time_str = raw.get("obsTime") or raw.get("reportTime", "")
-    try:
-        observed_at = datetime.fromisoformat(obs_time_str.replace("Z", "+00:00"))
-    except (ValueError, AttributeError):
-        observed_at = datetime.now(timezone.utc)
+    observed_at = _parse_awc_observed_at(raw)
 
     return {
         "station_icao": raw.get("icaoId"),
@@ -683,11 +714,7 @@ async def taf_amendment_count(
 
 def _parse_pirep_json(raw: dict[str, Any]) -> dict[str, Any]:
     """Convert AWC PIREP JSON object to DB-ready dict."""
-    obs_str = raw.get("obsTime") or raw.get("reportTime", "")
-    try:
-        observed_at = datetime.fromisoformat(obs_str.replace("Z", "+00:00"))
-    except (ValueError, AttributeError):
-        observed_at = datetime.now(timezone.utc)
+    observed_at = _parse_awc_observed_at(raw)
 
     return {
         "report_id": raw.get("airepId") or raw.get("pirepId"),
@@ -996,22 +1023,23 @@ async def compute_taf_based_probability(
     variable: str,
     threshold: float,
     target_time: datetime,
+    operator: str = "above",
 ) -> float:
-    """Compute probability that a variable exceeds a threshold at target_time.
+    """Compute probability that a variable exceeds/falls-below a threshold.
 
     Uses METAR trend + TAF forecast with lead-time-dependent weighting.
     Threshold is in market units (Fahrenheit for temp, inches for precip,
-    mph for wind).
+    mph for wind).  *operator* should be ``"above"`` or ``"below"``.
     """
     hours_out = (target_time - datetime.now(timezone.utc)).total_seconds() / 3600.0
     hours_out = max(hours_out, 0.0)
 
     if variable == "temperature":
-        return await _prob_temperature(station, threshold, target_time, hours_out)
+        return await _prob_temperature(station, threshold, target_time, hours_out, operator)
     elif variable == "precipitation":
         return await _prob_precipitation(station, target_time)
     elif variable == "wind_speed":
-        return await _prob_wind(station, threshold, target_time, hours_out)
+        return await _prob_wind(station, threshold, target_time, hours_out, operator)
 
     return 0.5
 
@@ -1021,6 +1049,7 @@ async def _prob_temperature(
     threshold_f: float,
     target_time: datetime,
     hours_out: float,
+    operator: str = "above",
 ) -> float:
     """Temperature exceedance probability using METAR trend + TAF TX/TN.
 
@@ -1069,11 +1098,17 @@ async def _prob_temperature(
     if taf_amendments > 3:
         sigma *= 1.3
 
-    # P(temp > threshold)
     z = (threshold_f - forecast_f) / sigma
-    prob = 1.0 - _normal_cdf(z)
+    if operator == "below":
+        prob = _normal_cdf(z)           # P(temp < threshold)
+    else:
+        prob = 1.0 - _normal_cdf(z)    # P(temp > threshold)
 
-    return max(0.01, min(0.99, prob))
+    # No [0.01, 0.99] clamp. A 0.99 ceiling against a longshot market at
+    # 0.0005 manufactures +0.9895 of fake YES edge; the same for the floor
+    # in the opposite direction. Filters downstream must handle values in
+    # [0, 1] and decide whether the underlying CDF is trustworthy.
+    return max(0.0, min(1.0, prob))
 
 
 async def _prob_precipitation(
@@ -1089,6 +1124,7 @@ async def _prob_wind(
     threshold_mph: float,
     target_time: datetime,
     hours_out: float,
+    operator: str = "above",
 ) -> float:
     """Wind speed exceedance probability using TAF forecast."""
     taf_info = await get_taf_temperature_forecast(station, target_time)
@@ -1109,9 +1145,13 @@ async def _prob_wind(
     sigma = 5.0 + 1.0 * math.sqrt(hours_out)
 
     z = (threshold_kts - max_wind) / sigma
-    prob = 1.0 - _normal_cdf(z)
+    if operator == "below":
+        prob = _normal_cdf(z)
+    else:
+        prob = 1.0 - _normal_cdf(z)
 
-    return max(0.01, min(0.99, prob))
+    # See _prob_temperature: no [0.01, 0.99] clamp so raw CDF passes through.
+    return max(0.0, min(1.0, prob))
 
 
 async def get_bracket_probability(
@@ -1154,7 +1194,10 @@ async def get_bracket_probability(
     z_low = (low_f - forecast_f) / sigma
     prob = _normal_cdf(z_high) - _normal_cdf(z_low)
 
-    return max(0.01, min(0.99, prob))
+    # No [0.01, 0.99] floor/ceiling here: narrow-bracket markets have genuinely
+    # near-zero true probabilities, and a floor would fabricate edge against
+    # deep-longshot market prices. Callers must tolerate probs in [0, 1].
+    return max(0.0, min(1.0, prob))
 
 
 async def get_realtime_probability(market: Any) -> float | None:
@@ -1163,13 +1206,13 @@ async def get_realtime_probability(market: Any) -> float | None:
     Returns None if aviation data cannot contribute (unsupported variable,
     unknown location, or target beyond 30-hour TAF range).
     """
-    from src.signals.mapper import icao_for_location, parse_target_date, resolve_variable
+    from src.signals.mapper import icao_for_location, normalize_operator, parse_target_date, resolve_variable
 
     if not market.parsed_variable:
         return None
 
     # Resolve variable aliases (e.g., snowfall→precipitation, freeze→temperature)
-    variable, threshold, _operator = resolve_variable(
+    variable, threshold, operator_raw = resolve_variable(
         market.parsed_variable,
         market.parsed_threshold,
         market.parsed_operator,
@@ -1201,9 +1244,77 @@ async def get_realtime_probability(market: Any) -> float | None:
     if threshold is None:
         return None
 
+    op = normalize_operator(operator_raw) if operator_raw else "above"
+
     return await compute_taf_based_probability(
         icao,
         variable,
         threshold,
         target_dt,
+        operator=op or "above",
     )
+
+
+# ---------------------------------------------------------------------------
+# New multi-source API (re-exports from submodules)
+# ---------------------------------------------------------------------------
+
+from src.ingestion.aviation._types import (  # noqa: E402
+    MinuteObs,
+    Observation,
+    PrecipAccum,
+    SynopObs,
+    TempTrend,
+    WeatherBriefing,
+)
+from src.ingestion.aviation._conversions import (  # noqa: E402
+    c_to_f,
+    f_to_c,
+    kts_to_mph,
+    mph_to_kts,
+    kts_to_kmh,
+    kts_to_ms,
+    m_to_miles,
+    miles_to_m,
+    m_to_ft,
+    hpa_to_inhg,
+    inhg_to_hpa,
+    hpa_to_mmhg,
+    mm_to_inches,
+    inches_to_mm,
+    mm_to_cm,
+    nm_to_km,
+)
+from src.ingestion.aviation._caching import (  # noqa: E402
+    _TTLCache as _TTLCacheNew,
+    clear_all_caches,
+)
+from src.ingestion.aviation._rate_limit import (  # noqa: E402
+    ProviderRateLimiter,
+    RateLimitExhausted,
+)
+from src.ingestion.aviation._base_provider import AviationProvider  # noqa: E402
+from src.ingestion.aviation._aggregator import (  # noqa: E402
+    ProviderAggregator,
+    get_aggregator,
+    reset_aggregator,
+)
+from src.ingestion.aviation._provider_awc import AWCProvider  # noqa: E402
+from src.ingestion.aviation._parsers import (  # noqa: E402
+    parse_raw_metar,
+    parse_raw_synop,
+)
+from src.ingestion.aviation._composite import (  # noqa: E402
+    get_latest_observation,
+    get_latest_observations_bulk,
+    get_observation_history,
+    get_synop_history,
+    get_one_minute_data,
+    get_latest_taf,
+    get_taf_amendment_count_multi,
+    get_active_sigmets,
+    get_pireps_near as get_pireps_near_multi,
+    compute_temperature_trend,
+    compute_precip_accumulation,
+    get_full_weather_picture,
+)

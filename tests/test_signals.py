@@ -156,6 +156,12 @@ def _future_date_str(days: int = 3) -> str:
     return dt.strftime("%B %d, %Y")
 
 
+def _short_range_date_str() -> str:
+    """Return today's date string — parsed as end-of-day, within 30h window."""
+    dt = datetime.now(tz=timezone.utc)
+    return dt.strftime("%B %d, %Y")
+
+
 def _make_market(**overrides):
     """Create a mock Market ORM object with sensible defaults."""
     m = MagicMock()
@@ -185,8 +191,6 @@ class TestMapMarket:
         assert result is not None
         assert result.market_id == "mkt_001"
         assert result.aviation_prob == 0.70
-        assert result.gfs_prob is None
-        assert result.ecmwf_prob is None
         assert result.market_prob == 0.45
         assert result.days_to_resolution > 0
 
@@ -241,40 +245,29 @@ class TestMapMarket:
 
 
 class TestComputeConsensus:
-    def test_both_models_weighted_average(self):
-        result = compute_consensus(0.40, 0.60)
-        # 0.6*0.60 + 0.4*0.40 = 0.36 + 0.16 = 0.52
-        assert pytest.approx(result.consensus_prob, abs=0.001) == 0.52
+    def test_aviation_only_short_range(self):
+        result = compute_consensus(aviation_prob=0.75, hours_to_resolution=4.0)
+        assert pytest.approx(result.consensus_prob, abs=0.001) == 0.75
+        assert result.confidence == 0.80
 
-    def test_confidence_perfect_agreement(self):
-        result = compute_consensus(0.50, 0.50)
-        assert pytest.approx(result.confidence, abs=0.001) == 1.0
-
-    def test_confidence_disagreement(self):
-        result = compute_consensus(0.20, 0.80)
-        assert pytest.approx(result.confidence, abs=0.001) == 0.4
-
-    def test_single_model_gfs_only(self):
-        result = compute_consensus(0.65, None)
+    def test_aviation_only_medium_range(self):
+        result = compute_consensus(aviation_prob=0.65, hours_to_resolution=10.0)
         assert pytest.approx(result.consensus_prob, abs=0.001) == 0.65
-        assert result.confidence == 0.5
+        assert result.confidence == 0.70
 
-    def test_single_model_ecmwf_only(self):
-        result = compute_consensus(None, 0.70)
-        assert pytest.approx(result.consensus_prob, abs=0.001) == 0.70
-        assert result.confidence == 0.5
-
-    def test_both_none_raises(self):
+    def test_none_raises(self):
         with pytest.raises(ValueError):
-            compute_consensus(None, None)
+            compute_consensus(None)
 
-    def test_probability_clamped_high(self):
-        result = compute_consensus(1.0, 1.0)
-        assert result.consensus_prob <= 0.99
+    def test_probability_passthrough_high(self):
+        # Consensus no longer clamps to [0.01, 0.99]; raw aviation_prob passes through
+        # so that narrow-bracket longshots (genuine ~0) aren't floored into fake edge.
+        result = compute_consensus(aviation_prob=1.0, hours_to_resolution=4.0)
+        assert result.consensus_prob == 1.0
 
-    def test_probability_clamped_low(self):
-        result = compute_consensus(0.0, 0.0)
-        assert result.consensus_prob >= 0.01
+    def test_probability_passthrough_low(self):
+        result = compute_consensus(aviation_prob=0.0, hours_to_resolution=4.0)
+        assert result.consensus_prob == 0.0
 
 
 # ===================================================================
@@ -334,19 +327,30 @@ class TestPassesFilters:
 
 
 # ===================================================================
-# End-to-end: detect_signals
+# End-to-end: detect_signals_short_range
 # ===================================================================
 
 
 class TestDetectSignalsE2E:
     """End-to-end test with mocked market data and aviation probabilities."""
 
+    @staticmethod
+    def _mock_session():
+        """Create a mock session that handles dedup query."""
+        session = AsyncMock()
+        session.flush = AsyncMock()
+        # Mock the dedup query: session.execute(stmt) → result with .all() returning []
+        mock_result = MagicMock()
+        mock_result.all.return_value = []
+        session.execute = AsyncMock(return_value=mock_result)
+        return session
+
     @pytest.mark.asyncio
     @patch("src.signals.mapper.get_active_weather_markets", new_callable=AsyncMock)
     @patch("src.signals.mapper.get_realtime_probability", new_callable=AsyncMock)
     @patch("src.signals.consensus.get_calibration_coefficients", new_callable=AsyncMock, return_value=None)
     async def test_end_to_end(self, mock_calib, mock_avx, mock_markets):
-        from src.signals.detector import detect_signals
+        from src.signals.detector import detect_signals_short_range
 
         # --- 3 markets: 1 good, 1 small edge, 1 unsupported variable ---
         good_market = _make_market(
@@ -355,7 +359,7 @@ class TestDetectSignalsE2E:
             parsed_variable="temperature",
             parsed_threshold=100.0,
             parsed_operator="above",
-            parsed_target_date=_future_date_str(1),
+            parsed_target_date=_short_range_date_str(),
             current_yes_price=0.45,
             liquidity=1000.0,
             volume=5000.0,
@@ -366,7 +370,7 @@ class TestDetectSignalsE2E:
             parsed_variable="temperature",
             parsed_threshold=90.0,
             parsed_operator="above",
-            parsed_target_date=_future_date_str(1),
+            parsed_target_date=_short_range_date_str(),
             current_yes_price=0.48,
             liquidity=1000.0,
             volume=5000.0,
@@ -379,10 +383,9 @@ class TestDetectSignalsE2E:
         mock_markets.return_value = [good_market, small_edge_market, unsupported_market]
         mock_avx.return_value = 0.70
 
-        session = AsyncMock()
-        session.flush = AsyncMock()
+        session = self._mock_session()
 
-        result = await detect_signals(session)
+        result = await detect_signals_short_range(session)
 
         assert len(result) >= 1
         assert all(s.market_id != "unsup_003" for s in result)
@@ -403,13 +406,12 @@ class TestDetectSignalsE2E:
     @patch("src.signals.mapper.get_realtime_probability", new_callable=AsyncMock)
     @patch("src.signals.consensus.get_calibration_coefficients", new_callable=AsyncMock, return_value=None)
     async def test_no_markets_returns_empty(self, mock_calib, mock_avx, mock_markets):
-        from src.signals.detector import detect_signals
+        from src.signals.detector import detect_signals_short_range
 
         mock_markets.return_value = []
-        session = AsyncMock()
-        session.flush = AsyncMock()
+        session = self._mock_session()
 
-        result = await detect_signals(session)
+        result = await detect_signals_short_range(session)
         assert result == []
 
     @pytest.mark.asyncio
@@ -417,21 +419,20 @@ class TestDetectSignalsE2E:
     @patch("src.signals.mapper.get_realtime_probability", new_callable=AsyncMock, return_value=0.46)
     @patch("src.signals.consensus.get_calibration_coefficients", new_callable=AsyncMock, return_value=None)
     async def test_insufficient_edge_filtered_out(self, mock_calib, mock_avx, mock_markets):
-        from src.signals.detector import detect_signals
+        from src.signals.detector import detect_signals_short_range
 
         # Market prob = 0.45, aviation ≈ 0.46 → edge < 0.10
         market = _make_market(
             current_yes_price=0.45,
             liquidity=1000.0,
             volume=5000.0,
-            parsed_target_date=_future_date_str(1),
+            parsed_target_date=_short_range_date_str(),
         )
         mock_markets.return_value = [market]
 
-        session = AsyncMock()
-        session.flush = AsyncMock()
+        session = self._mock_session()
 
-        result = await detect_signals(session)
+        result = await detect_signals_short_range(session)
         assert result == []
 
 
@@ -441,79 +442,48 @@ class TestDetectSignalsE2E:
 
 
 class TestComputeWeights:
-    def test_short_range_aviation_50pct(self):
-        w = _compute_weights(4.0, has_aviation=True, has_gfs=True, has_ecmwf=True)
-        assert pytest.approx(w["aviation"], abs=0.001) == 0.50
-        assert pytest.approx(w["gfs"] + w["ecmwf"] + w["aviation"], abs=0.001) == 1.0
-
-    def test_medium_range_aviation_30pct(self):
-        w = _compute_weights(10.0, has_aviation=True, has_gfs=True, has_ecmwf=True)
-        assert pytest.approx(w["aviation"], abs=0.001) == 0.30
-
-    def test_12_24h_aviation_15pct(self):
-        w = _compute_weights(18.0, has_aviation=True, has_gfs=True, has_ecmwf=True)
-        assert pytest.approx(w["aviation"], abs=0.001) == 0.15
-
-    def test_24_30h_aviation_8pct(self):
-        w = _compute_weights(28.0, has_aviation=True, has_gfs=True, has_ecmwf=True)
-        assert pytest.approx(w["aviation"], abs=0.001) == 0.08
+    def test_short_range_aviation(self):
+        w = _compute_weights(4.0, has_aviation=True)
+        assert w["aviation"] == 1.0
 
     def test_beyond_30h_no_aviation(self):
-        w = _compute_weights(48.0, has_aviation=True, has_gfs=True, has_ecmwf=True)
+        w = _compute_weights(48.0, has_aviation=True)
         assert w["aviation"] == 0.0
 
     def test_no_aviation_flag(self):
-        w = _compute_weights(4.0, has_aviation=False, has_gfs=True, has_ecmwf=True)
+        w = _compute_weights(4.0, has_aviation=False)
         assert w["aviation"] == 0.0
-        assert pytest.approx(w["ecmwf"], abs=0.001) == 0.6
-        assert pytest.approx(w["gfs"], abs=0.001) == 0.4
 
     def test_aviation_only(self):
-        w = _compute_weights(4.0, has_aviation=True, has_gfs=False, has_ecmwf=False)
+        w = _compute_weights(4.0, has_aviation=True)
         assert w["aviation"] == 1.0
-        assert w["gfs"] == 0.0
-        assert w["ecmwf"] == 0.0
-
-    def test_nwp_ratio_preserved(self):
-        w = _compute_weights(4.0, has_aviation=True, has_gfs=True, has_ecmwf=True)
-        # Remaining 50% should split 60/40
-        assert pytest.approx(w["ecmwf"] / w["gfs"], abs=0.01) == 1.5
 
 
 class TestConsensusWithAviation:
-    def test_short_range_aviation_dominates(self):
-        result = compute_consensus(0.40, 0.60, aviation_prob=0.80, hours_to_resolution=4.0)
-        # aviation 50%, ecmwf 30%, gfs 20%
-        expected = 0.50 * 0.80 + 0.30 * 0.60 + 0.20 * 0.40
-        assert pytest.approx(result.consensus_prob, abs=0.01) == expected
-
-    def test_no_aviation_backward_compat(self):
-        result = compute_consensus(0.40, 0.60)
-        assert pytest.approx(result.consensus_prob, abs=0.001) == 0.52
-        assert result.aviation_prob is None
-
-    def test_confidence_boost_on_agreement(self):
-        result = compute_consensus(0.70, 0.70, aviation_prob=0.70, hours_to_resolution=4.0)
-        assert result.confidence == 1.0
-
-    def test_confidence_boost_when_close(self):
-        # Use values where GFS/ECMWF disagree enough that base confidence < 1.0
-        result_with = compute_consensus(0.55, 0.65, aviation_prob=0.60, hours_to_resolution=4.0)
-        result_without = compute_consensus(0.55, 0.65)
-        assert result_with.confidence > result_without.confidence
-
-    def test_no_boost_when_disagreeing(self):
-        result = compute_consensus(0.60, 0.60, aviation_prob=0.20, hours_to_resolution=4.0)
-        assert result.confidence < 0.7
-
     def test_aviation_only_works(self):
-        result = compute_consensus(None, None, aviation_prob=0.75, hours_to_resolution=4.0)
+        result = compute_consensus(aviation_prob=0.75, hours_to_resolution=4.0)
         assert pytest.approx(result.consensus_prob, abs=0.001) == 0.75
         assert result.confidence == 0.80  # aviation-only, <=6h
 
-    def test_all_none_raises(self):
+    def test_none_raises(self):
         with pytest.raises(ValueError):
-            compute_consensus(None, None, None)
+            compute_consensus(None)
+
+    def test_confidence_by_lead_time_6h(self):
+        result = compute_consensus(aviation_prob=0.60, hours_to_resolution=4.0)
+        assert result.confidence == 0.80
+
+    def test_confidence_by_lead_time_12h(self):
+        result = compute_consensus(aviation_prob=0.60, hours_to_resolution=10.0)
+        assert result.confidence == 0.70
+
+    def test_confidence_by_lead_time_24h(self):
+        result = compute_consensus(aviation_prob=0.60, hours_to_resolution=18.0)
+        assert result.confidence == 0.55
+
+    def test_confidence_by_lead_time_30h(self):
+        result = compute_consensus(aviation_prob=0.60, hours_to_resolution=28.0)
+        assert result.confidence == 0.40
 
 
 # ===================================================================
@@ -552,7 +522,7 @@ class TestDetectSignalsAviationE2E:
     @patch("src.signals.mapper.get_realtime_probability", new_callable=AsyncMock, return_value=0.75)
     @patch("src.signals.consensus.get_calibration_coefficients", new_callable=AsyncMock, return_value=None)
     async def test_short_range_with_aviation(self, mock_calib, mock_avx, mock_markets):
-        from src.signals.detector import detect_signals
+        from src.signals.detector import detect_signals_short_range
 
         # 1-day-out market with aviation data
         market = _make_market(
@@ -561,7 +531,7 @@ class TestDetectSignalsAviationE2E:
             parsed_variable="temperature",
             parsed_threshold=100.0,
             parsed_operator="above",
-            parsed_target_date=_future_date_str(1),
+            parsed_target_date=_short_range_date_str(),
             current_yes_price=0.45,
             liquidity=1000.0,
             volume=5000.0,
@@ -570,8 +540,11 @@ class TestDetectSignalsAviationE2E:
 
         session = AsyncMock()
         session.flush = AsyncMock()
+        mock_result = MagicMock()
+        mock_result.all.return_value = []
+        session.execute = AsyncMock(return_value=mock_result)
 
-        result = await detect_signals(session)
+        result = await detect_signals_short_range(session)
 
         assert len(result) >= 1
         sig = result[0]
@@ -667,56 +640,55 @@ class TestAviationContextConsensus:
     def test_taf_amendments_reduce_confidence(self):
         ctx = AviationContext(taf_amendment_count=5)
         result = compute_consensus(
-            0.60, 0.60, aviation_prob=0.60, hours_to_resolution=4.0,
+            aviation_prob=0.60, hours_to_resolution=4.0,
             aviation_context=ctx,
         )
         result_no_ctx = compute_consensus(
-            0.60, 0.60, aviation_prob=0.60, hours_to_resolution=4.0,
+            aviation_prob=0.60, hours_to_resolution=4.0,
         )
         # 5 amendments → 3 extra → -0.15
         assert result.confidence < result_no_ctx.confidence
 
     def test_speci_events_boost_confidence(self):
-        # Use wide spread so base confidence is well below 1.0
         ctx = AviationContext(speci_events_2h=2)
         result = compute_consensus(
-            0.40, 0.70, aviation_prob=0.80, hours_to_resolution=4.0,
+            aviation_prob=0.80, hours_to_resolution=4.0,
             aviation_context=ctx,
         )
         result_no_ctx = compute_consensus(
-            0.40, 0.70, aviation_prob=0.80, hours_to_resolution=4.0,
+            aviation_prob=0.80, hours_to_resolution=4.0,
         )
         assert result.confidence > result_no_ctx.confidence
 
     def test_severe_pireps_boost_confidence(self):
         ctx = AviationContext(has_severe_pireps=True)
         result = compute_consensus(
-            0.40, 0.70, aviation_prob=0.80, hours_to_resolution=4.0,
+            aviation_prob=0.80, hours_to_resolution=4.0,
             aviation_context=ctx,
         )
         result_no_ctx = compute_consensus(
-            0.40, 0.70, aviation_prob=0.80, hours_to_resolution=4.0,
+            aviation_prob=0.80, hours_to_resolution=4.0,
         )
         assert result.confidence > result_no_ctx.confidence
 
     def test_sigmet_boosts_confidence(self):
         ctx = AviationContext(active_sigmet_count=1)
         result = compute_consensus(
-            0.40, 0.70, aviation_prob=0.80, hours_to_resolution=4.0,
+            aviation_prob=0.80, hours_to_resolution=4.0,
             aviation_context=ctx,
         )
         result_no_ctx = compute_consensus(
-            0.40, 0.70, aviation_prob=0.80, hours_to_resolution=4.0,
+            aviation_prob=0.80, hours_to_resolution=4.0,
         )
         assert result.confidence > result_no_ctx.confidence
 
     def test_no_context_unchanged(self):
         result = compute_consensus(
-            0.60, 0.60, aviation_prob=0.60, hours_to_resolution=4.0,
+            aviation_prob=0.60, hours_to_resolution=4.0,
             aviation_context=None,
         )
         result2 = compute_consensus(
-            0.60, 0.60, aviation_prob=0.60, hours_to_resolution=4.0,
+            aviation_prob=0.60, hours_to_resolution=4.0,
         )
         assert result.confidence == result2.confidence
 
@@ -742,8 +714,6 @@ class TestMapExactlyMarket:
         assert result is not None
         assert result.market_id == "mkt_001"
         assert result.aviation_prob == 0.15
-        assert result.gfs_prob is None
-        assert result.ecmwf_prob is None
         mock_bracket.assert_called_once()
         call_args = mock_bracket.call_args
         assert call_args[0][1] == 74.0  # low_f = 75 - 1

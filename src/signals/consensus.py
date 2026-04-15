@@ -1,8 +1,8 @@
-"""Multi-model consensus probability with optional Bayesian recalibration.
+"""Aviation-based probability confidence scoring with optional recalibration.
 
-Combines GFS and ECMWF exceedance probabilities into a single consensus
-estimate, computes a confidence score based on model agreement, and applies
-a simple linear recalibration when enough historical data is available.
+Computes a confidence score for aviation-derived probabilities based on
+forecast lead time and aviation intelligence context, and applies a simple
+linear recalibration when enough historical data is available.
 """
 
 from __future__ import annotations
@@ -27,8 +27,6 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-ECMWF_WEIGHT: float = 0.6
-GFS_WEIGHT: float = 0.4
 MIN_CALIBRATION_SAMPLES: int = 50
 
 
@@ -39,12 +37,10 @@ MIN_CALIBRATION_SAMPLES: int = 50
 
 @dataclass
 class ConsensusResult:
-    """Result of multi-model consensus computation."""
+    """Result of aviation probability confidence computation."""
 
     consensus_prob: float
     confidence: float
-    gfs_prob: float | None
-    ecmwf_prob: float | None
     aviation_prob: float | None = None
     calibrated: bool = False
 
@@ -53,102 +49,43 @@ class ConsensusResult:
 # Core consensus logic
 # ---------------------------------------------------------------------------
 
-# Confidence boost when aviation agrees with NWP consensus within this spread.
-_AVIATION_AGREEMENT_THRESHOLD: float = 0.15
-_AVIATION_AGREEMENT_BOOST: float = 0.10
-
 
 def _compute_weights(
     hours_to_resolution: float,
     has_aviation: bool,
-    has_gfs: bool,
-    has_ecmwf: bool,
 ) -> dict[str, float]:
-    """Compute dynamic model weights based on forecast horizon."""
+    """Compute aviation weight based on forecast horizon."""
     if not has_aviation or hours_to_resolution > 30:
-        aw = 0.0
-    elif hours_to_resolution <= 6:
-        aw = 0.50
-    elif hours_to_resolution <= 12:
-        aw = 0.30
-    elif hours_to_resolution <= 24:
-        aw = 0.15
-    else:  # 24-30h
-        aw = 0.08
-
-    nwp_share = 1.0 - aw
-
-    if has_gfs and has_ecmwf:
-        gw = nwp_share * GFS_WEIGHT / (GFS_WEIGHT + ECMWF_WEIGHT)
-        ew = nwp_share * ECMWF_WEIGHT / (GFS_WEIGHT + ECMWF_WEIGHT)
-    elif has_ecmwf:
-        gw = 0.0
-        ew = nwp_share
-    elif has_gfs:
-        gw = nwp_share
-        ew = 0.0
-    else:
-        # Only aviation available
-        gw = 0.0
-        ew = 0.0
-        aw = 1.0
-
-    return {"aviation": aw, "gfs": gw, "ecmwf": ew}
+        return {"aviation": 0.0}
+    return {"aviation": 1.0}
 
 
 def compute_consensus(
-    gfs_prob: float | None,
-    ecmwf_prob: float | None,
     aviation_prob: float | None = None,
     hours_to_resolution: float | None = None,
     aviation_context: object | None = None,
 ) -> ConsensusResult:
-    """Weighted average of model probabilities with dynamic horizon-based weighting.
+    """Compute aviation-based probability with lead-time confidence scoring.
 
-    Raises ``ValueError`` if all inputs are ``None``.
+    Raises ``ValueError`` if aviation_prob is ``None``.
     """
-    if gfs_prob is None and ecmwf_prob is None and aviation_prob is None:
-        raise ValueError("At least one model probability is required")
+    if aviation_prob is None:
+        raise ValueError("Aviation probability is required")
 
     hrs = hours_to_resolution if hours_to_resolution is not None else 999.0
-    weights = _compute_weights(
-        hrs,
-        has_aviation=aviation_prob is not None,
-        has_gfs=gfs_prob is not None,
-        has_ecmwf=ecmwf_prob is not None,
-    )
+    weights = _compute_weights(hrs, has_aviation=True)
 
-    raw = 0.0
-    if gfs_prob is not None:
-        raw += weights["gfs"] * gfs_prob
-    if ecmwf_prob is not None:
-        raw += weights["ecmwf"] * ecmwf_prob
-    if aviation_prob is not None:
-        raw += weights["aviation"] * aviation_prob
+    raw = weights["aviation"] * aviation_prob
 
-    # Confidence scoring based on model spread and lead time
-    available = [p for p in (gfs_prob, ecmwf_prob, aviation_prob) if p is not None]
-    if len(available) >= 2:
-        confidence = 1.0 - (max(available) - min(available))
-    elif len(available) == 1 and aviation_prob is not None:
-        # Aviation-only: confidence scales with lead time
-        if hrs <= 6:
-            confidence = 0.80
-        elif hrs <= 12:
-            confidence = 0.70
-        elif hrs <= 24:
-            confidence = 0.55
-        else:
-            confidence = 0.40
+    # Confidence scales with lead time
+    if hrs <= 6:
+        confidence = 0.80
+    elif hrs <= 12:
+        confidence = 0.70
+    elif hrs <= 24:
+        confidence = 0.55
     else:
-        confidence = 0.5
-
-    # Boost confidence when aviation agrees with NWP consensus
-    if aviation_prob is not None and (gfs_prob is not None or ecmwf_prob is not None):
-        nwp_probs = [p for p in (gfs_prob, ecmwf_prob) if p is not None]
-        nwp_avg = sum(nwp_probs) / len(nwp_probs)
-        if abs(aviation_prob - nwp_avg) < _AVIATION_AGREEMENT_THRESHOLD:
-            confidence = min(1.0, confidence + _AVIATION_AGREEMENT_BOOST)
+        confidence = 0.40
 
     # Apply aviation intelligence adjustments
     if aviation_context is not None:
@@ -162,14 +99,16 @@ def compute_consensus(
         if getattr(aviation_context, "active_sigmet_count", 0) > 0:
             confidence += 0.10
 
-    consensus_prob = max(0.01, min(0.99, raw))
+    # No [0.01, 0.99] clamp: weights are always 0 or 1, so raw == aviation_prob.
+    # Above/below/wind probabilities are already clamped in the aviation layer;
+    # bracket probabilities intentionally pass through raw so that near-zero
+    # longshots don't get floored into fake edge.
+    consensus_prob = max(0.0, min(1.0, raw))
     confidence = max(0.0, min(1.0, confidence))
 
     return ConsensusResult(
         consensus_prob=consensus_prob,
         confidence=confidence,
-        gfs_prob=gfs_prob,
-        ecmwf_prob=ecmwf_prob,
         aviation_prob=aviation_prob,
     )
 
@@ -222,10 +161,8 @@ async def get_calibration_coefficients(
 
 
 async def compute_calibrated_consensus(
-    gfs_prob: float | None,
-    ecmwf_prob: float | None,
-    session: AsyncSession | None = None,
     aviation_prob: float | None = None,
+    session: AsyncSession | None = None,
     hours_to_resolution: float | None = None,
     aviation_context: object | None = None,
 ) -> ConsensusResult:
@@ -235,7 +172,7 @@ async def compute_calibrated_consensus(
     linear recalibration to the raw consensus probability.
     """
     result = compute_consensus(
-        gfs_prob, ecmwf_prob, aviation_prob, hours_to_resolution, aviation_context,
+        aviation_prob, hours_to_resolution, aviation_context,
     )
 
     if session is not None:

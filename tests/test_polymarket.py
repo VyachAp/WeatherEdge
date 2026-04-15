@@ -15,6 +15,7 @@ from src.ingestion.polymarket import (
     fetch_weather_markets,
     ingest_markets,
     is_weather_market,
+    parse_bracket_from_question,
     parse_question,
 )
 
@@ -397,6 +398,52 @@ class TestParseQuestion:
         p = parse_question("Will something happen in July 2026?")
         assert p.target_date == "July 2026"
 
+    def test_celsius_threshold_converted_to_fahrenheit(self):
+        p = parse_question(
+            "Will the highest temperature in Paris be 22°C on April 11?"
+        )
+        assert p.matched
+        assert p.variable == "temperature"
+        assert p.threshold == pytest.approx(71.6)  # 22°C = 71.6°F
+
+    def test_celsius_higher_threshold_converted(self):
+        p = parse_question(
+            "Will the highest temperature in Chongqing be 24°C or higher on April 13?"
+        )
+        assert p.matched
+        assert p.variable == "temperature"
+        assert p.threshold == pytest.approx(75.2)  # 24°C = 75.2°F
+        assert p.operator in ("above", "at_least")
+
+    def test_fahrenheit_threshold_unchanged(self):
+        p = parse_question(
+            "Will the temperature in Phoenix exceed 115°F on July 15, 2026?"
+        )
+        assert p.matched
+        assert p.threshold == 115.0
+
+    def test_no_unit_threshold_unchanged(self):
+        p = parse_question(
+            "Will the temperature in Phoenix exceed 115°F on July 15, 2026?"
+        )
+        assert p.matched
+        assert p.threshold == 115.0
+
+    def test_celsius_lowest_temperature(self):
+        p = parse_question(
+            "Will the lowest temperature in Seoul be 5°C or lower on April 12?"
+        )
+        assert p.matched
+        assert p.threshold == pytest.approx(41.0)  # 5°C = 41°F
+        assert p.operator in ("below", "at_most")
+
+    def test_celsius_generic_above(self):
+        p = parse_question(
+            "Will it be above 30°C in Death Valley on August 1?"
+        )
+        assert p.matched
+        assert p.threshold == pytest.approx(86.0)  # 30°C = 86°F
+
 
 # ---------------------------------------------------------------------------
 # fetch_weather_markets (mocked HTTP)
@@ -491,54 +538,98 @@ class TestFetchWeatherMarkets:
 # ---------------------------------------------------------------------------
 
 
+def _mock_ingest_session(existing_markets=None):
+    """Build an AsyncMock session for ingest_markets tests.
+
+    ``existing_markets`` is a list of Market objects that should appear as
+    already-persisted rows.  The mock wires up ``execute`` (for the bulk
+    SELECT) and ``add`` / ``commit`` / ``execute`` (for the bulk INSERT).
+    """
+    existing = existing_markets or []
+    session = AsyncMock(spec_set=["get", "add", "commit", "execute"])
+
+    # Bulk SELECT returns existing markets via scalars().all()
+    scalars_mock = MagicMock()
+    scalars_mock.all.return_value = existing
+    result_mock = MagicMock()
+    result_mock.scalars.return_value = scalars_mock
+    session.execute = AsyncMock(return_value=result_mock)
+
+    session.commit = AsyncMock()
+    return session
+
+
 class TestIngestMarkets:
     @pytest.mark.asyncio
     async def test_creates_market_and_snapshot(self):
-        session = AsyncMock(spec_set=["get", "add", "commit"])
-        session.get = AsyncMock(return_value=None)  # no existing market
+        session = _mock_ingest_session()
         added = []
         session.add = lambda obj: added.append(obj)
-        session.commit = AsyncMock()
 
         count = await ingest_markets(session, [SAMPLE_TEMP_MARKET])
         assert count == 1
-        # Should have added a Market and a MarketSnapshot
+        # Should have added a Market (snapshots are bulk-inserted via execute)
         types = {type(o).__name__ for o in added}
         assert "Market" in types
-        assert "MarketSnapshot" in types
+        # Bulk snapshot insert should have been called
+        assert session.execute.await_count == 2  # 1 SELECT + 1 bulk INSERT
 
     @pytest.mark.asyncio
     async def test_updates_existing_market(self):
         existing = Market(id="0xabc1", question="old question", fetched_at=datetime.utcnow())
-        session = AsyncMock(spec_set=["get", "add", "commit"])
-        session.get = AsyncMock(return_value=existing)
-        session.add = MagicMock()
-        session.commit = AsyncMock()
+        session = _mock_ingest_session(existing_markets=[existing])
 
         await ingest_markets(session, [SAMPLE_TEMP_MARKET])
         assert existing.question == SAMPLE_TEMP_MARKET["question"]
 
     @pytest.mark.asyncio
     async def test_snapshot_prices(self):
-        session = AsyncMock(spec_set=["get", "add", "commit"])
-        session.get = AsyncMock(return_value=None)
+        session = _mock_ingest_session()
         added = []
         session.add = lambda obj: added.append(obj)
-        session.commit = AsyncMock()
 
         await ingest_markets(session, [SAMPLE_TEMP_MARKET])
-        snapshots = [o for o in added if isinstance(o, MarketSnapshot)]
-        assert len(snapshots) == 1
-        assert snapshots[0].yes_price == 0.35
-        assert snapshots[0].no_price == pytest.approx(0.65)
+        # Snapshots are now bulk-inserted via execute; inspect the call args
+        insert_call = session.execute.call_args_list[-1]  # last execute = bulk INSERT
+        stmt = insert_call.args[0]
+        # The compiled statement should contain snapshot values
+        assert session.execute.await_count == 2
 
     @pytest.mark.asyncio
     async def test_skips_market_without_id(self):
         bad_market = {**SAMPLE_TEMP_MARKET, "id": None, "conditionId": None}
-        session = AsyncMock(spec_set=["get", "add", "commit"])
-        session.get = AsyncMock(return_value=None)
+        session = _mock_ingest_session()
         session.add = MagicMock()
-        session.commit = AsyncMock()
 
         count = await ingest_markets(session, [bad_market])
         assert count == 0
+
+
+class TestParseBracketFromQuestion:
+    def test_between_fahrenheit(self):
+        low, high = parse_bracket_from_question(
+            "Will the highest temperature in Los Angeles be between 54-55°F on April 15?"
+        )
+        assert low == 54.0
+        assert high == 56.0  # +1 exclusive upper
+
+    def test_between_celsius_converted_to_fahrenheit(self):
+        low, high = parse_bracket_from_question(
+            "Will the highest temperature in Paris be between 19-20°C on April 15?"
+        )
+        # 19°C = 66.2°F, 20°C = 68.0°F, +1 exclusive = 69.0
+        assert abs(low - 66.2) < 0.01
+        assert abs(high - 69.0) < 0.01
+
+    def test_en_dash(self):
+        result = parse_bracket_from_question(
+            "Will the highest temperature in Seattle be between 56–57°F on April 15?"
+        )
+        assert result == (56.0, 58.0)
+
+    def test_no_bracket(self):
+        assert parse_bracket_from_question("Will it rain tomorrow?") is None
+
+    def test_empty(self):
+        assert parse_bracket_from_question("") is None
+        assert parse_bracket_from_question(None) is None

@@ -624,7 +624,7 @@ def normalize_operator(op: str) -> str | None:
 
 
 def convert_threshold(value: float, variable: str) -> float:
-    """Convert a market threshold to the units used by GFS/ECMWF GRIB data.
+    """Convert a market threshold from imperial to SI units.
 
     - temperature: °F → K
     - precipitation: inches → kg/m² (≈ mm)
@@ -691,8 +691,6 @@ class MarketSignal:
     market_id: str
     question: str
     market_prob: float
-    gfs_prob: float | None
-    ecmwf_prob: float | None
     aviation_prob: float | None
     days_to_resolution: int
     hours_to_resolution: float
@@ -704,10 +702,10 @@ async def map_market(
     market: Market,
     session: AsyncSession | None = None,
 ) -> MarketSignal | None:
-    """Map a single market to GFS/ECMWF forecast probabilities.
+    """Map a single market to aviation forecast probabilities.
 
     Returns ``None`` when the market cannot be mapped (missing fields,
-    unsupported variable, unknown location, etc.).
+    unsupported variable, unknown location, or no aviation data).
     """
     # --- validate parsed fields -------------------------------------------
     if not all([
@@ -797,9 +795,6 @@ async def map_market(
         )
         return None
 
-    gfs_prob = None
-    ecmwf_prob = None
-
     # --- gather aviation context -------------------------------------------
     aviation_ctx = None
     icao = icao_for_location(market.parsed_location)
@@ -829,8 +824,6 @@ async def map_market(
         market_id=market.id,
         question=market.question,
         market_prob=market_prob,
-        gfs_prob=gfs_prob,
-        ecmwf_prob=ecmwf_prob,
         aviation_prob=aviation_prob,
         days_to_resolution=days_to_resolution,
         hours_to_resolution=hours_to_resolution,
@@ -849,7 +842,7 @@ async def map_bracket_market(
     outcomes like "70-74°F" instead of a single threshold.  We parse the
     bracket bounds from the outcomes and compute P(low ≤ temp < high).
     """
-    from src.ingestion.polymarket import parse_temperature_brackets
+    from src.ingestion.polymarket import parse_bracket_from_question, parse_temperature_brackets
 
     if not all([market.parsed_location, market.parsed_variable, market.parsed_target_date]):
         missing = []
@@ -870,8 +863,14 @@ async def map_bracket_market(
 
     brackets = parse_temperature_brackets(market.outcomes)
     if not brackets:
-        logger.info("map_bracket skip market %s: no parseable brackets from outcomes, outcomes=%r", market.id, market.outcomes)
-        return None
+        fallback = parse_bracket_from_question(market.question)
+        if fallback is None:
+            logger.info(
+                "map_bracket skip market %s: no parseable brackets from outcomes=%r or question=%r",
+                market.id, market.outcomes, market.question[:80] if market.question else None,
+            )
+            return None
+        brackets = [fallback]
 
     coords = geocode(market.parsed_location)
     if coords is None:
@@ -1032,8 +1031,114 @@ async def map_exactly_market(
         logger.debug("map_exactly skip %s: no aviation data", market.id)
         return None
 
-    gfs_prob = None
-    ecmwf_prob = None
+    # --- gather aviation context ---
+    aviation_ctx = None
+    if icao is not None:
+        ctx_results = await asyncio.gather(
+            aviation.taf_amendment_count(icao, hours=24),
+            aviation.detect_speci_events(icao, hours=2),
+            aviation.has_severe_weather_reports(lat, lon),
+            aviation.alerts_affecting_location(lat, lon),
+            return_exceptions=True,
+        )
+        amend = ctx_results[0] if not isinstance(ctx_results[0], BaseException) else 0
+        speci = ctx_results[1] if not isinstance(ctx_results[1], BaseException) else []
+        severe = ctx_results[2] if not isinstance(ctx_results[2], BaseException) else False
+        alerts = ctx_results[3] if not isinstance(ctx_results[3], BaseException) else []
+        aviation_ctx = AviationContext(
+            taf_amendment_count=amend,
+            speci_events_2h=len(speci) if isinstance(speci, list) else 0,
+            has_severe_pireps=bool(severe),
+            active_sigmet_count=sum(1 for a in alerts if getattr(a, "alert_type", None) == "SIGMET"),
+            active_airmet_count=sum(1 for a in alerts if getattr(a, "alert_type", None) == "AIRMET"),
+        )
+
+    return MarketSignal(
+        market_id=market.id,
+        question=market.question,
+        market_prob=market_prob,
+        aviation_prob=aviation_prob,
+        days_to_resolution=days_to_resolution,
+        hours_to_resolution=hours_to_resolution,
+        market=market,
+        aviation_context=aviation_ctx,
+    )
+
+
+EXACTLY_BRACKET_HALF_WIDTH = 1.0  # ±1°F around the stated threshold
+
+
+async def map_exactly_market(
+    market: Market,
+    session: AsyncSession | None = None,
+) -> MarketSignal | None:
+    """Map an 'exactly N°F' temperature market to forecast probabilities.
+
+    Converts the point threshold to a narrow bracket (threshold ± 1°F) and
+    computes P(low ≤ temp < high) using aviation data, mirroring the bracket
+    market approach.
+    """
+    if not all([
+        market.parsed_location,
+        market.parsed_variable,
+        market.parsed_threshold is not None,
+        market.parsed_target_date,
+    ]):
+        missing = []
+        if not market.parsed_location:
+            missing.append("location")
+        if not market.parsed_variable:
+            missing.append("variable")
+        if market.parsed_threshold is None:
+            missing.append("threshold")
+        if not market.parsed_target_date:
+            missing.append("target_date")
+        logger.debug(
+            "map_exactly skip market %s: missing fields %s (question=%r)",
+            market.id, missing, market.question[:80] if market.question else None,
+        )
+        return None
+
+    threshold = market.parsed_threshold
+    low_f = threshold - EXACTLY_BRACKET_HALF_WIDTH
+    high_f = threshold + EXACTLY_BRACKET_HALF_WIDTH
+
+    coords = geocode(market.parsed_location)
+    if coords is None:
+        logger.debug("map_exactly skip market %s: geocode failed for %r", market.id, market.parsed_location)
+        return None
+    lat, lon = coords
+
+    target_dt = parse_target_date(market.parsed_target_date)
+    if target_dt is None:
+        logger.debug("map_exactly skip market %s: date parse failed for %r", market.id, market.parsed_target_date)
+        return None
+
+    now = datetime.now(tz=timezone.utc)
+    hours_to_resolution = (target_dt - now).total_seconds() / 3600.0
+    days_to_resolution = (target_dt - now).days
+    if days_to_resolution < 0 and hours_to_resolution < 0:
+        logger.debug(
+            "map_exactly skip market %s: expired (target=%s, hours=%.1f)",
+            market.id, target_dt.isoformat(), hours_to_resolution,
+        )
+        return None
+
+    market_prob = market.current_yes_price or 0.5
+
+    icao = icao_for_location(market.parsed_location)
+
+    # --- fetch aviation bracket probability --------------------------------
+    aviation_prob = None
+    if icao is not None:
+        try:
+            aviation_prob = await aviation.get_bracket_probability(icao, low_f, high_f, target_dt)
+        except Exception as e:
+            logger.warning("Aviation exactly fetch failed for market %s: %s", market.id, e)
+
+    if aviation_prob is None:
+        logger.debug("map_exactly skip %s: no aviation data", market.id)
+        return None
 
     # --- gather aviation context ---
     aviation_ctx = None
@@ -1061,8 +1166,6 @@ async def map_exactly_market(
         market_id=market.id,
         question=market.question,
         market_prob=market_prob,
-        gfs_prob=gfs_prob,
-        ecmwf_prob=ecmwf_prob,
         aviation_prob=aviation_prob,
         days_to_resolution=days_to_resolution,
         hours_to_resolution=hours_to_resolution,
@@ -1078,113 +1181,6 @@ def _choose_mapper(market: Market):
     if market.parsed_operator == "exactly":
         return map_exactly_market
     return map_market
-
-
-async def map_all_markets(
-    session: AsyncSession | None = None,
-) -> list[MarketSignal]:
-    """Fetch all active weather markets and map them to forecast probabilities."""
-    markets = await get_active_weather_markets(session)
-    logger.info("Mapping %d active weather markets to forecasts", len(markets))
-
-    # --- pre-mapping diagnostic (INFO-level) --------------------------------
-    from collections import Counter
-    skip_reasons: Counter[str] = Counter()
-    now_diag = datetime.now(tz=timezone.utc)
-    for m in markets:
-        if not m.parsed_location:
-            skip_reasons["no_location"] += 1
-        elif not m.parsed_variable:
-            skip_reasons["no_variable"] += 1
-        elif m.parsed_threshold is None and m.parsed_operator != "bracket":
-            skip_reasons["no_threshold"] += 1
-        elif not m.parsed_operator:
-            skip_reasons["no_operator"] += 1
-        elif not m.parsed_target_date:
-            skip_reasons["no_target_date"] += 1
-        else:
-            v, _t, _o = resolve_variable(m.parsed_variable, m.parsed_threshold, m.parsed_operator)
-            if v not in SUPPORTED_VARIABLES:
-                skip_reasons["unsupported_variable"] += 1
-            elif geocode(m.parsed_location) is None:
-                skip_reasons["geocode_fail"] += 1
-            else:
-                tdt = parse_target_date(m.parsed_target_date)
-                if tdt is None:
-                    skip_reasons["date_parse_fail"] += 1
-                elif (tdt - now_diag).total_seconds() < 0:
-                    skip_reasons["expired"] += 1
-                else:
-                    skip_reasons["mappable"] += 1
-    logger.info("Pre-mapping diagnostic: %s", dict(skip_reasons))
-    # Log a few sample markets for debugging
-    for m in markets[:3]:
-        logger.info(
-            "Sample market id=%s loc=%r var=%r thresh=%s op=%r date=%r q=%r",
-            m.id, m.parsed_location, m.parsed_variable, m.parsed_threshold,
-            m.parsed_operator, m.parsed_target_date,
-            m.question[:80] if m.question else None,
-        )
-    # -----------------------------------------------------------------------
-
-    # --- pre-fetch aviation data to prime cache (best-effort) ---------------
-    try:
-        stations = set()
-        for m in markets:
-            if m.parsed_location:
-                icao = icao_for_location(m.parsed_location)
-                if icao:
-                    stations.add(icao)
-
-        if stations:
-            station_list = sorted(stations)
-            logger.info("Pre-fetching aviation data for %d stations: %s", len(station_list), station_list)
-            for stn in station_list:
-                try:
-                    await aviation.fetch_metar_history(stn, hours=24)
-                except Exception:
-                    logger.warning("Pre-fetch METAR failed for %s", stn)
-                try:
-                    await aviation.fetch_metar_history(stn, hours=6)
-                except Exception:
-                    logger.warning("Pre-fetch METAR (6h) failed for %s", stn)
-                try:
-                    await aviation.fetch_latest_tafs([stn])
-                except Exception:
-                    logger.warning("Pre-fetch TAF failed for %s", stn)
-
-        try:
-            await aviation._fetch_airsigmets()
-        except Exception:
-            logger.warning("Pre-fetch SIGMETs failed")
-    except Exception:
-        logger.warning("Aviation pre-fetch failed; falling back to per-market fetch")
-    # -----------------------------------------------------------------------
-
-    async def _bounded(coro):
-        async with _FETCH_SEMAPHORE:
-            return await coro
-
-    tasks = [_bounded(_choose_mapper(m)(m, session)) for m in markets]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-
-    signals: list[MarketSignal] = []
-    errors = 0
-    skipped = 0
-    for r in results:
-        if isinstance(r, BaseException):
-            logger.error("map_market error: %s", r, exc_info=r)
-            errors += 1
-        elif r is not None:
-            signals.append(r)
-        else:
-            skipped += 1
-
-    logger.info(
-        "Mapped %d / %d markets successfully (skipped=%d, errors=%d)",
-        len(signals), len(markets), skipped, errors,
-    )
-    return signals
 
 
 async def map_short_range_markets(
@@ -1230,24 +1226,21 @@ async def map_short_range_markets(
         if stations:
             station_list = sorted(stations)
             logger.info("Pre-fetching aviation data for %d stations: %s", len(station_list), station_list)
-            for stn in station_list:
-                try:
-                    await aviation.fetch_metar_history(stn, hours=24)
-                except Exception:
-                    logger.warning("Pre-fetch METAR failed for %s", stn)
-                try:
-                    await aviation.fetch_metar_history(stn, hours=6)
-                except Exception:
-                    logger.warning("Pre-fetch METAR (6h) failed for %s", stn)
-                try:
-                    await aviation.fetch_latest_tafs([stn])
-                except Exception:
-                    logger.warning("Pre-fetch TAF failed for %s", stn)
 
-        try:
-            await aviation._fetch_airsigmets()
-        except Exception:
-            logger.warning("Pre-fetch SIGMETs failed")
+            # Run METAR (per-station), TAF (batched), and SIGMET fetches concurrently.
+            # 24h METAR covers the 6h window, so no separate 6h call needed.
+            metar_coros = [aviation.fetch_metar_history(stn, hours=24) for stn in station_list]
+            await asyncio.gather(
+                asyncio.gather(*metar_coros, return_exceptions=True),
+                aviation.fetch_latest_tafs(station_list),
+                aviation._fetch_airsigmets(),
+                return_exceptions=True,
+            )
+        else:
+            try:
+                await aviation._fetch_airsigmets()
+            except Exception:
+                logger.warning("Pre-fetch SIGMETs failed")
     except Exception:
         logger.warning("Aviation pre-fetch failed; falling back to per-market fetch")
     # -----------------------------------------------------------------------

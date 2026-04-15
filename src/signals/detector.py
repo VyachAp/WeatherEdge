@@ -18,7 +18,7 @@ from src.config import settings
 from src.db.engine import async_session as session_factory
 from src.db.models import Signal, TradeDirection
 from src.signals.consensus import compute_calibrated_consensus
-from src.signals.mapper import map_all_markets, map_short_range_markets
+from src.signals.mapper import map_short_range_markets
 
 if TYPE_CHECKING:
     from src.db.models import Market
@@ -56,8 +56,6 @@ class ActionableSignal:
     confidence: float
     consensus_prob: float
     market_prob: float
-    gfs_prob: float | None
-    ecmwf_prob: float | None
     aviation_prob: float | None
     days_to_resolution: int
     hours_to_resolution: float
@@ -157,46 +155,20 @@ async def persist_signal(
         edge=signal.edge,
         direction=signal.direction,
         confidence=signal.confidence,
-        gfs_prob=signal.gfs_prob,
-        ecmwf_prob=signal.ecmwf_prob,
         aviation_prob=signal.aviation_prob,
     )
     session.add(row)
     return row
 
 
-# ---------------------------------------------------------------------------
-# Full pipeline
-# ---------------------------------------------------------------------------
-
-
-async def detect_signals(
-    session: AsyncSession | None = None,
-) -> list[ActionableSignal]:
-    """Run the full signal-detection pipeline.
-
-    1. Map active markets to forecast probabilities.
-    2. Compute consensus + calibration for each.
-    3. Compute edge and apply filters.
-    4. Sort by expected-value score and persist.
-    """
-    own_session = session is None
-    if own_session:
-        async with session_factory() as session:
-            ms = await map_all_markets(session)
-            return await _detect(session, ms)
-    ms = await map_all_markets(session)  # type: ignore[arg-type]
-    return await _detect(session, ms)  # type: ignore[arg-type]
-
-
 async def detect_signals_short_range(
     session: AsyncSession | None = None,
 ) -> list[ActionableSignal]:
-    """Run signal detection for short-range markets only (≤30h).
+    """Run signal detection for short-range markets (≤30h).
 
-    Uses the same pipeline as ``detect_signals`` but only processes
-    markets within 30 hours of resolution, with deduplication against
-    recently created signals.
+    Maps active markets within 30 hours of resolution, computes consensus
+    and edge, applies filters, and persists actionable signals.
+    Deduplicates against signals created in the last 60 minutes.
     """
     own_session = session is None
     if own_session:
@@ -233,10 +205,8 @@ async def _detect(
             deduped += 1
             continue
         consensus = await compute_calibrated_consensus(
-            ms.gfs_prob,
-            ms.ecmwf_prob,
+            ms.aviation_prob,
             session,
-            aviation_prob=ms.aviation_prob,
             hours_to_resolution=ms.hours_to_resolution,
             aviation_context=ms.aviation_context,
         )
@@ -271,8 +241,6 @@ async def _detect(
             confidence=consensus.confidence,
             consensus_prob=consensus.consensus_prob,
             market_prob=ms.market_prob,
-            gfs_prob=ms.gfs_prob,
-            ecmwf_prob=ms.ecmwf_prob,
             aviation_prob=ms.aviation_prob,
             days_to_resolution=ms.days_to_resolution,
             hours_to_resolution=ms.hours_to_resolution,

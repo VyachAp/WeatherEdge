@@ -19,9 +19,7 @@ from src.config import settings
 from src.db.engine import async_session, engine
 from src.db.models import Market, Signal, Trade, TradeStatus
 from src.execution.alerter import get_alerter
-from src.ingestion.ecmwf import ingest_latest_ecmwf
-from src.ingestion.gfs import ingest_latest_gefs
-from src.ingestion.polymarket import get_active_weather_markets, scan_and_ingest
+from src.ingestion.polymarket import scan_and_ingest
 from src.resolution import (
     get_current_bankroll,
     get_current_exposure,
@@ -31,8 +29,7 @@ from src.risk.drawdown import DrawdownLevel, DrawdownMonitor
 from src.risk.kelly import size_position
 from src.signals.consensus import get_calibration_coefficients
 from src.execution.polymarket_client import is_live, place_order
-from src.signals.detector import detect_signals, detect_signals_short_range
-from src.signals.mapper import geocode
+from src.signals.detector import detect_signals_short_range
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession as AsyncSessionType
@@ -126,24 +123,6 @@ async def _get_drawdown_monitor() -> DrawdownMonitor:
         async with async_session() as session:
             await _drawdown_monitor.load_state(session)
     return _drawdown_monitor
-
-
-async def _extract_locations(session: AsyncSessionType) -> list[tuple[float, float]]:
-    """Deduplicated (lat, lon) for all active weather markets."""
-    markets = await get_active_weather_markets(session)
-    seen: set[tuple[float, float]] = set()
-    locations: list[tuple[float, float]] = []
-    for m in markets:
-        if not m.parsed_location:
-            continue
-        coords = geocode(m.parsed_location)
-        if coords is None:
-            continue
-        rounded = (round(coords[0], 2), round(coords[1], 2))
-        if rounded not in seen:
-            seen.add(rounded)
-            locations.append(coords)
-    return locations
 
 
 async def _latest_signal_id(
@@ -244,46 +223,6 @@ async def _size_and_create_trades(signals: list, alerter, monitor) -> None:
         await session.commit()
 
 
-async def job_forecast_pipeline() -> None:
-    """Every 6 h — fetch forecasts, generate signals, size positions."""
-    alerter = get_alerter()
-    try:
-        # 1. Fetch forecast data
-        async with async_session() as session:
-            locations = await _extract_locations(session)
-
-        if not locations:
-            logger.warning("No locations to fetch forecasts for")
-            # Continue anyway — aviation data can still produce signals
-            # for bracket markets without NWP ensemble downloads.
-
-        # NWP ensemble downloads disabled — aviation data provides the
-        # primary edge for short-range bracket markets and doesn't
-        # require multi-GB GRIB downloads.
-        # To re-enable: uncomment the block below.
-        # if locations:
-        #     gfs_count, ecmwf_count = await asyncio.gather(
-        #         ingest_latest_gefs(locations),
-        #         ingest_latest_ecmwf(locations),
-        #     )
-        #     logger.info("Forecast ingestion: GFS=%d, ECMWF=%d", gfs_count, ecmwf_count)
-
-        # Signal detection
-        signals = await detect_signals()
-        logger.info("Detected %d actionable signals", len(signals))
-
-        if not signals:
-            return
-
-        # 3. Risk sizing and trade creation
-        monitor = await _get_drawdown_monitor()
-        await _size_and_create_trades(signals, alerter, monitor)
-
-    except Exception as exc:
-        logger.exception("Forecast pipeline failed")
-        await alerter.send_system_error(exc, "forecast pipeline")
-
-
 async def job_short_range_pipeline() -> None:
     """Every 60 min — aviation-focused pipeline for markets ≤30h out."""
     alerter = get_alerter()
@@ -355,7 +294,6 @@ async def job_startup() -> None:
     logger.info("Drawdown monitor loaded")
 
     await job_scan_markets()
-    await job_forecast_pipeline()
     await job_short_range_pipeline()
 
     try:
@@ -455,13 +393,6 @@ def setup_scheduler() -> AsyncIOScheduler:
         job_scan_markets,
         IntervalTrigger(minutes=15),
         id="scan_markets",
-        max_instances=1,
-        coalesce=True,
-    )
-    scheduler.add_job(
-        job_forecast_pipeline,
-        CronTrigger(hour="4,10,16,22", minute=30, timezone="UTC"),
-        id="forecast_pipeline",
         max_instances=1,
         coalesce=True,
     )

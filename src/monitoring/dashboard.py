@@ -178,7 +178,7 @@ def fetch_all_signals(
 ) -> pd.DataFrame:
     query = (
         "SELECT s.id, s.market_id, s.edge, s.confidence, s.model_prob, "
-        "       s.market_prob, s.gfs_prob, s.ecmwf_prob, s.direction, "
+        "       s.market_prob, s.aviation_prob, s.direction, "
         "       s.created_at, m.question, m.parsed_variable, m.parsed_location, "
         "       m.current_yes_price, m.end_date, "
         "       CASE "
@@ -219,7 +219,7 @@ def fetch_market_price_history(market_id: str) -> pd.DataFrame:
 def fetch_calibration_data() -> pd.DataFrame:
     return pd.read_sql(
         text(
-            "SELECT s.model_prob, s.gfs_prob, s.ecmwf_prob, s.direction, "
+            "SELECT s.model_prob, s.aviation_prob, s.direction, "
             "       s.created_at, m.parsed_variable, "
             "       EXTRACT(DAY FROM m.end_date - s.created_at) AS forecast_horizon, "
             "       t.status AS trade_status "
@@ -442,10 +442,9 @@ def page_signal_explorer():
     for _, row in df.iterrows():
         label = f"[{row['outcome'].upper()}] {row['question'][:80]}"
         with st.expander(label):
-            mc1, mc2, mc3 = st.columns(3)
-            mc1.metric("GFS Prob", f"{row['gfs_prob']:.1%}" if pd.notna(row["gfs_prob"]) else "N/A")
-            mc2.metric("ECMWF Prob", f"{row['ecmwf_prob']:.1%}" if pd.notna(row["ecmwf_prob"]) else "N/A")
-            mc3.metric("Consensus", f"{row['model_prob']:.1%}")
+            mc1, mc2 = st.columns(2)
+            mc1.metric("Aviation Prob", f"{row['aviation_prob']:.1%}" if pd.notna(row["aviation_prob"]) else "N/A")
+            mc2.metric("Consensus", f"{row['model_prob']:.1%}")
 
             history = fetch_market_price_history(row["market_id"])
             if not history.empty:
@@ -510,10 +509,9 @@ def page_model_calibration():
 
     prob_columns = [
         ("Consensus", "model_prob"),
-        ("GFS", "gfs_prob"),
-        ("ECMWF", "ecmwf_prob"),
+        ("Aviation", "aviation_prob"),
     ]
-    colors = {"Consensus": "#1f77b4", "GFS": "#ff7f0e", "ECMWF": "#2ca02c"}
+    colors = {"Consensus": "#1f77b4", "Aviation": "#ff7f0e"}
 
     for name, col in prob_columns:
         sub = filtered.dropna(subset=[col])
@@ -547,7 +545,7 @@ def page_model_calibration():
     filtered["week"] = pd.to_datetime(filtered["created_at"]).dt.to_period("W").dt.start_time
 
     brier_rows = []
-    for name, col in [("Consensus", "model_prob"), ("GFS", "gfs_prob"), ("ECMWF", "ecmwf_prob")]:
+    for name, col in [("Consensus", "model_prob"), ("Aviation", "aviation_prob")]:
         sub = filtered.dropna(subset=[col])
         if sub.empty:
             continue

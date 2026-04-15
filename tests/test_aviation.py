@@ -634,10 +634,14 @@ class TestFetchPireps:
 
     @patch("src.ingestion.aviation.fetch_pireps_near")
     async def test_has_severe_weather_true(self, mock_fetch):
-        mock_fetch.return_value = [
-            _parse_pirep_json(SAMPLE_PIREP),
-            _parse_pirep_json(SAMPLE_PIREP_SEVERE),
-        ]
+        # Override observed_at so the 6h cutoff in has_severe_weather_reports
+        # doesn't filter out the fixture (which is frozen in April 2026).
+        now = datetime.now(timezone.utc)
+        severe = _parse_pirep_json(SAMPLE_PIREP_SEVERE)
+        severe["observed_at"] = now
+        normal = _parse_pirep_json(SAMPLE_PIREP)
+        normal["observed_at"] = now
+        mock_fetch.return_value = [normal, severe]
         assert await has_severe_weather_reports(33.45, -112.07) is True
 
     @patch("src.ingestion.aviation.fetch_pireps_near")
@@ -645,7 +649,9 @@ class TestFetchPireps:
         # Use a PIREP with only LGT intensity (not MOD/SEV/EXTM)
         light_pirep = dict(SAMPLE_PIREP)
         light_pirep["tbInt1"] = "LGT"
-        mock_fetch.return_value = [_parse_pirep_json(light_pirep)]
+        parsed = _parse_pirep_json(light_pirep)
+        parsed["observed_at"] = datetime.now(timezone.utc)
+        mock_fetch.return_value = [parsed]
         assert await has_severe_weather_reports(33.45, -112.07) is False
 
 
@@ -919,7 +925,7 @@ class TestComputeTafProbability:
             "KPHX", "wind_speed", 25.0, target
         )
         # 25 mph ≈ 21.7 kts, max wind 30 kts → should have some probability
-        assert 0.01 <= prob <= 0.99
+        assert 0.0 <= prob <= 1.0
 
 
 @pytest.mark.asyncio

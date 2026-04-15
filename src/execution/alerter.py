@@ -51,13 +51,6 @@ def _confidence_label(confidence: float) -> str:
     return "LOW"
 
 
-def _aviation_model_part(aviation_str: str | None, e: Callable[[object], str]) -> str:
-    """Return the aviation model segment for the models line."""
-    if aviation_str:
-        return "  \\| Aviation " + e(aviation_str)
-    return ""
-
-
 def _auto_exec_line() -> str:
     """Return the AUTO-EXECUTED indicator line if auto-execution is enabled."""
     if settings.AUTO_EXECUTE and settings.POLYMARKET_PRIVATE_KEY:
@@ -226,9 +219,7 @@ class Alerter:
         direction = signal.direction.value.replace("_", " ")
         conf_label = _confidence_label(signal.confidence)
 
-        gfs_str = f"{signal.gfs_prob * 100:.0f}%" if signal.gfs_prob is not None else "n/a"
-        ecmwf_str = f"{signal.ecmwf_prob * 100:.0f}%" if signal.ecmwf_prob is not None else "n/a"
-        aviation_str = f"{signal.aviation_prob * 100:.0f}%" if signal.aviation_prob is not None else None
+        aviation_str = f"{signal.aviation_prob * 100:.0f}%" if signal.aviation_prob is not None else "n/a"
 
         resolve_date = market.end_date.strftime("%B %d") if market.end_date else "TBD"
         liquidity_str = f"${market.liquidity:,.0f}" if market.liquidity else "n/a"
@@ -248,8 +239,7 @@ class Alerter:
             f"\U0001f4c8 Edge: {e(f'+{signal.edge * 100:.1f}%')}\n"
             f"\U0001f3af Confidence: {e(f'{conf_label} ({signal.confidence:.2f})')}\n"
             f"\n"
-            f"Models: GFS {e(gfs_str)} \\| ECMWF {e(ecmwf_str)}"
-            f"{_aviation_model_part(aviation_str, e)}\n"
+            f"Aviation: {e(aviation_str)}\n"
             f"{_short_range_line(signal, e)}"
             f"\U0001f4c5 Resolves: {e(resolve_date)} \\| Liquidity: {e(liquidity_str)}\n"
             f"\n"
@@ -541,18 +531,16 @@ class Alerter:
         if signal_row is None or market_row is None:
             return f"\U0001f4ca *Detail*\n\nNo signal data found for {e(market_id)}"
 
-        gfs = f"{signal_row.gfs_prob * 100:.1f}%" if signal_row.gfs_prob is not None else "n/a"
-        ecmwf = f"{signal_row.ecmwf_prob * 100:.1f}%" if signal_row.ecmwf_prob is not None else "n/a"
+        aviation = f"{signal_row.aviation_prob * 100:.1f}%" if signal_row.aviation_prob is not None else "n/a"
         consensus = f"{signal_row.model_prob * 100:.1f}%"
         market_p = f"{signal_row.market_prob * 100:.1f}%"
 
         return (
-            f"\U0001f4ca *Ensemble Breakdown*\n"
+            f"\U0001f4ca *Signal Detail*\n"
             f"\n"
             f"\"{e(market_row.question)}\"\n"
             f"\n"
-            f"GFS \\(40%\\): {e(gfs)}\n"
-            f"ECMWF \\(60%\\): {e(ecmwf)}\n"
+            f"Aviation: {e(aviation)}\n"
             f"Consensus: {e(consensus)}\n"
             f"Market: {e(market_p)}\n"
             f"Edge: {e(f'{signal_row.edge * 100:+.1f}%')}\n"
