@@ -546,5 +546,252 @@ def test_trade(amount: float) -> None:
     asyncio.run(_test_trade())
 
 
+@main.group()
+def bet() -> None:
+    """Place and manage manual bets on Polymarket."""
+
+
+@bet.command("place")
+@click.argument("market")
+@click.option("--side", required=True, type=click.Choice(["yes", "no"], case_sensitive=False), help="Buy YES or NO.")
+@click.option("--amount", required=True, type=float, help="USDC amount to spend.")
+@click.option("--yes", "-y", "skip_confirm", is_flag=True, help="Skip confirmation prompt.")
+@click.option("--ignore-cap", is_flag=True, help="Bypass daily spend cap check.")
+def bet_place(market: str, side: str, amount: float, skip_confirm: bool, ignore_cap: bool) -> None:
+    """Place a FOK market order on any Polymarket market.
+
+    MARKET can be a Polymarket URL, slug, or condition ID.
+    """
+
+    async def _place() -> None:
+        from src.config import settings
+        from src.bet_helpers import (
+            extract_token_ids,
+            format_market_info,
+            get_clob_client,
+            get_usdc_balance,
+            resolve_market,
+        )
+
+        if not settings.POLYMARKET_PRIVATE_KEY:
+            click.echo("Error: POLYMARKET_PRIVATE_KEY not set in .env")
+            raise SystemExit(1)
+
+        # --- Resolve market ---
+        click.echo(f"Resolving market: {market}")
+        mkt = await resolve_market(market)
+        if mkt is None:
+            click.echo("Error: market not found.")
+            raise SystemExit(1)
+
+        # --- Extract token IDs ---
+        token_pair = extract_token_ids(mkt)
+        if token_pair is None:
+            click.echo("Error: market has no tradeable token IDs.")
+            raise SystemExit(1)
+
+        yes_token, no_token = token_pair
+        token_id = yes_token if side.lower() == "yes" else no_token
+
+        # --- Check USDC balance ---
+        click.echo("Checking wallet balance...")
+        usdc_e, usdc_native = await get_usdc_balance(settings.POLYMARKET_PRIVATE_KEY)
+        click.echo(f"  USDC.e:      ${usdc_e:.2f}")
+        click.echo(f"  Native USDC: ${usdc_native:.2f}")
+
+        if usdc_e < amount:
+            click.echo(f"\nError: insufficient USDC.e (${usdc_e:.2f} < ${amount:.2f}).")
+            if usdc_native >= amount:
+                click.echo("You have native USDC — swap to USDC.e on a DEX first.")
+            raise SystemExit(1)
+
+        # --- Daily spend cap ---
+        if not ignore_cap:
+            from src.db.engine import async_session
+            from src.execution.polymarket_client import get_daily_spend
+
+            async with async_session() as session:
+                daily_spend = await get_daily_spend(session)
+
+            remaining = settings.DAILY_SPEND_CAP_USD - daily_spend
+            click.echo(f"  24h spend:   ${daily_spend:.2f} / ${settings.DAILY_SPEND_CAP_USD:.2f}")
+            if daily_spend + amount > settings.DAILY_SPEND_CAP_USD:
+                click.echo(
+                    f"\nError: daily spend cap would be exceeded "
+                    f"(${daily_spend:.2f} + ${amount:.2f} > ${settings.DAILY_SPEND_CAP_USD:.2f}). "
+                    f"Use --ignore-cap to override."
+                )
+                raise SystemExit(1)
+
+        # --- Display market info ---
+        click.echo(f"\n=== Market ===")
+        click.echo(format_market_info(mkt))
+        click.echo(f"\n=== Order ===")
+        click.echo(f"  Side:   BUY {side.upper()}")
+        click.echo(f"  Amount: ${amount:.2f}")
+        click.echo(f"  Type:   FOK (Fill-or-Kill)")
+
+        # --- Confirmation ---
+        if not skip_confirm:
+            click.echo()
+            if not click.confirm("Place this order?"):
+                click.echo("Cancelled.")
+                return
+
+        # --- Place order ---
+        click.echo("\nInitialising CLOB client...")
+        client = get_clob_client()
+
+        # Validate token is tradeable
+        try:
+            tick_size = client.get_tick_size(token_id)
+            neg_risk = client.get_neg_risk(token_id)
+        except Exception as exc:
+            click.echo(f"Error: token not tradeable on CLOB ({exc})")
+            raise SystemExit(1)
+
+        click.echo(f"  Tick size: {tick_size}, Neg risk: {neg_risk}")
+
+        from py_clob_client.clob_types import MarketOrderArgs, OrderType
+        from py_clob_client.order_builder.constants import BUY
+
+        click.echo("Placing FOK market order...")
+        market_order = MarketOrderArgs(token_id=token_id, amount=amount, side=BUY)
+        signed = client.create_market_order(market_order)
+        resp = client.post_order(signed, OrderType.FOK)
+
+        # --- Display result ---
+        click.echo(f"\n=== Result ===")
+        order_id = resp.get("orderID")
+        status = resp.get("status", "unknown")
+
+        if order_id:
+            click.echo(f"  Order ID: {order_id}")
+            click.echo(f"  Status:   {status}")
+
+            if status == "matched":
+                try:
+                    order = client.get_order(order_id)
+                    trades = order.get("associate_trades", [])
+                    if trades:
+                        fill_price = float(trades[0].get("price", 0))
+                        click.echo(f"  Fill price: {fill_price:.4f}")
+                    size_matched = order.get("size_matched")
+                    if size_matched:
+                        click.echo(f"  Shares:     {float(size_matched):.2f}")
+                except Exception:
+                    click.echo("  (could not fetch fill details)")
+
+            click.echo("\nOrder placed successfully.")
+        else:
+            error_msg = resp.get("errorMsg", "unknown error")
+            click.echo(f"  Status: FAILED")
+            click.echo(f"  Error:  {error_msg}")
+            click.echo("\nThe order was not filled. This may be normal for FOK on a thin order book.")
+
+    asyncio.run(_place())
+
+
+@bet.command("info")
+@click.argument("market")
+def bet_info(market: str) -> None:
+    """Display details about a Polymarket market.
+
+    MARKET can be a Polymarket URL, slug, or condition ID.
+    """
+
+    async def _info() -> None:
+        from src.bet_helpers import (
+            extract_token_ids,
+            format_market_info,
+            resolve_market,
+        )
+
+        click.echo(f"Resolving market: {market}")
+        mkt = await resolve_market(market)
+        if mkt is None:
+            click.echo("Error: market not found.")
+            raise SystemExit(1)
+
+        click.echo(f"\n=== Market Info ===")
+        click.echo(format_market_info(mkt))
+
+        token_pair = extract_token_ids(mkt)
+        if token_pair:
+            yes_token, no_token = token_pair
+            click.echo(f"\n=== Token IDs ===")
+            click.echo(f"  YES: {yes_token}")
+            click.echo(f"  NO:  {no_token}")
+        else:
+            click.echo("\n  No tradeable token IDs found.")
+
+    asyncio.run(_info())
+
+
+@bet.command("search")
+@click.argument("query")
+@click.option("--limit", default=10, show_default=True, help="Max results to display.")
+def bet_search(query: str, limit: int) -> None:
+    """Search active Polymarket markets by keyword."""
+
+    async def _search() -> None:
+        from src.bet_helpers import search_markets
+
+        click.echo(f"Searching for: {query}")
+        results = await search_markets(query, limit=limit)
+
+        if not results:
+            click.echo("No markets found.")
+            return
+
+        click.echo(f"\n{'#':<4} {'Question':<60} {'YES':>6} {'Volume':>12} {'ID'}")
+        click.echo("-" * 110)
+
+        for i, m in enumerate(results, 1):
+            question = (m.get("question") or "")[:58]
+            outcome_prices = m.get("outcomePrices", "[]")
+            if isinstance(outcome_prices, str):
+                import json
+                try:
+                    outcome_prices = json.loads(outcome_prices)
+                except (json.JSONDecodeError, TypeError):
+                    outcome_prices = []
+
+            yes_str = f"{float(outcome_prices[0]):.0%}" if outcome_prices else "?"
+            vol = m.get("volume") or m.get("volumeNum") or 0
+            vol_str = f"${float(vol):,.0f}"
+            mid = m.get("id") or m.get("conditionId") or ""
+
+            click.echo(f"{i:<4} {question:<60} {yes_str:>6} {vol_str:>12} {mid}")
+
+    asyncio.run(_search())
+
+
+@bet.command("cancel")
+@click.argument("order_id")
+def bet_cancel(order_id: str) -> None:
+    """Cancel an open order on Polymarket."""
+
+    async def _cancel() -> None:
+        from src.config import settings
+        from src.bet_helpers import get_clob_client
+
+        if not settings.POLYMARKET_PRIVATE_KEY:
+            click.echo("Error: POLYMARKET_PRIVATE_KEY not set in .env")
+            raise SystemExit(1)
+
+        click.echo(f"Cancelling order: {order_id}")
+        client = get_clob_client()
+
+        try:
+            client.cancel(order_id)
+            click.echo("Order cancelled successfully.")
+        except Exception as exc:
+            click.echo(f"Error: failed to cancel order ({exc})")
+            raise SystemExit(1)
+
+    asyncio.run(_cancel())
+
+
 if __name__ == "__main__":
     main()

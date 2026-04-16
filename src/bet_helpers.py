@@ -1,0 +1,278 @@
+"""Helpers for the manual bet CLI commands.
+
+Handles market resolution from URLs/slugs/IDs, balance checks,
+CLOB client init, and display formatting.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from urllib.parse import urlparse
+
+import httpx
+
+from src.config import settings
+
+logger = logging.getLogger(__name__)
+
+GAMMA_BASE = "https://gamma-api.polymarket.com"
+
+
+# ---------------------------------------------------------------------------
+# Market identifier parsing
+# ---------------------------------------------------------------------------
+
+
+def parse_market_identifier(raw: str) -> str:
+    """Extract a usable identifier from a URL, slug, or condition_id.
+
+    Supports:
+      - https://polymarket.com/event/<slug>
+      - https://polymarket.com/event/<slug>/<sub-slug>
+      - bare slug string
+      - condition_id (hex string)
+    """
+    raw = raw.strip()
+    if raw.startswith("http"):
+        parsed = urlparse(raw)
+        # Path like /event/slug or /event/slug/sub-slug
+        parts = [p for p in parsed.path.split("/") if p]
+        if len(parts) >= 2:
+            return parts[-1]  # last segment
+        if parts:
+            return parts[0]
+    return raw
+
+
+# ---------------------------------------------------------------------------
+# Gamma API lookups
+# ---------------------------------------------------------------------------
+
+
+async def resolve_market(raw: str) -> dict | None:
+    """Resolve a market identifier to a Gamma API market dict.
+
+    Tries multiple lookup strategies: by id, by slug, by direct path.
+    """
+    identifier = parse_market_identifier(raw)
+
+    async with httpx.AsyncClient(timeout=15) as http:
+        # Try by numeric id
+        try:
+            resp = await http.get(
+                f"{GAMMA_BASE}/markets",
+                params={"id": identifier},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            if data:
+                return data[0] if isinstance(data, list) else data
+        except Exception:
+            pass
+
+        # Try by conditionId (0x... hex string)
+        if identifier.startswith("0x"):
+            try:
+                resp = await http.get(
+                    f"{GAMMA_BASE}/markets",
+                    params={"conditionId": identifier},
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                if data:
+                    return data[0] if isinstance(data, list) else data
+            except Exception:
+                pass
+
+        # Try by slug param
+        try:
+            resp = await http.get(
+                f"{GAMMA_BASE}/markets",
+                params={"slug": identifier},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            if data:
+                return data[0] if isinstance(data, list) else data
+        except Exception:
+            pass
+
+        # Try direct path lookup
+        try:
+            resp = await http.get(f"{GAMMA_BASE}/markets/{identifier}")
+            resp.raise_for_status()
+            data = resp.json()
+            if data:
+                return data if isinstance(data, dict) else data[0]
+        except Exception:
+            pass
+
+    return None
+
+
+async def search_markets(query: str, limit: int = 20) -> list[dict]:
+    """Search active Polymarket markets by keyword (client-side filter)."""
+    async with httpx.AsyncClient(timeout=15) as http:
+        resp = await http.get(
+            f"{GAMMA_BASE}/markets",
+            params={
+                "active": "true",
+                "limit": 100,
+                "order": "liquidity",
+                "ascending": "false",
+            },
+        )
+        resp.raise_for_status()
+        markets = resp.json()
+
+    query_lower = query.lower()
+    results = [
+        m for m in markets
+        if query_lower in (m.get("question") or "").lower()
+    ]
+    return results[:limit]
+
+
+# ---------------------------------------------------------------------------
+# Token ID extraction
+# ---------------------------------------------------------------------------
+
+
+def extract_token_ids(market: dict) -> tuple[str, str] | None:
+    """Parse clobTokenIds from a Gamma API market dict.
+
+    Returns (yes_token_id, no_token_id) or None.
+    """
+    token_ids = market.get("clobTokenIds", [])
+    if isinstance(token_ids, str):
+        token_ids = json.loads(token_ids)
+    if len(token_ids) < 2 or not token_ids[0]:
+        return None
+    return (token_ids[0], token_ids[1])
+
+
+# ---------------------------------------------------------------------------
+# USDC balance
+# ---------------------------------------------------------------------------
+
+
+async def get_usdc_balance(private_key: str) -> tuple[float, float]:
+    """Check on-chain USDC.e and native USDC balances.
+
+    Returns (usdc_e_usd, native_usdc_usd).
+    """
+    from eth_account import Account
+    from web3 import Web3
+
+    USDC_E = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+    USDC_NATIVE = "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359"
+    BAL_ABI = [
+        {
+            "inputs": [{"name": "account", "type": "address"}],
+            "name": "balanceOf",
+            "outputs": [{"name": "", "type": "uint256"}],
+            "stateMutability": "view",
+            "type": "function",
+        }
+    ]
+
+    account = Account.from_key(private_key)
+    addr = Web3.to_checksum_address(account.address)
+
+    w3 = Web3(
+        Web3.HTTPProvider(
+            "https://polygon-bor-rpc.publicnode.com",
+            request_kwargs={"timeout": 10},
+        )
+    )
+
+    usdc_e = w3.eth.contract(
+        address=Web3.to_checksum_address(USDC_E), abi=BAL_ABI
+    )
+    usdc_n = w3.eth.contract(
+        address=Web3.to_checksum_address(USDC_NATIVE), abi=BAL_ABI
+    )
+
+    usdc_e_bal = usdc_e.functions.balanceOf(addr).call() / 1e6
+    usdc_n_bal = usdc_n.functions.balanceOf(addr).call() / 1e6
+
+    return (usdc_e_bal, usdc_n_bal)
+
+
+# ---------------------------------------------------------------------------
+# CLOB client (manual mode — ignores AUTO_EXECUTE)
+# ---------------------------------------------------------------------------
+
+
+def get_clob_client():
+    """Initialise a ClobClient for manual bet placement.
+
+    Only requires POLYMARKET_PRIVATE_KEY (AUTO_EXECUTE is irrelevant).
+    """
+    from eth_account import Account
+    from py_clob_client.client import ClobClient
+
+    account = Account.from_key(settings.POLYMARKET_PRIVATE_KEY)
+    funder_address = account.address
+
+    temp_client = ClobClient(
+        settings.POLYMARKET_HOST,
+        key=settings.POLYMARKET_PRIVATE_KEY,
+        chain_id=settings.POLYMARKET_CHAIN_ID,
+    )
+    creds = temp_client.create_or_derive_api_creds()
+
+    return ClobClient(
+        settings.POLYMARKET_HOST,
+        key=settings.POLYMARKET_PRIVATE_KEY,
+        chain_id=settings.POLYMARKET_CHAIN_ID,
+        creds=creds,
+        signature_type=0,
+        funder=funder_address,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Display formatting
+# ---------------------------------------------------------------------------
+
+
+def format_market_info(market: dict) -> str:
+    """Format a Gamma API market dict for terminal display."""
+    question = market.get("question", "Unknown")
+    slug = market.get("slug", market.get("id", ""))
+
+    # Parse prices
+    outcome_prices = market.get("outcomePrices", "[]")
+    if isinstance(outcome_prices, str):
+        try:
+            outcome_prices = json.loads(outcome_prices)
+        except (json.JSONDecodeError, TypeError):
+            outcome_prices = []
+
+    yes_price = float(outcome_prices[0]) if len(outcome_prices) > 0 else None
+    no_price = float(outcome_prices[1]) if len(outcome_prices) > 1 else None
+
+    volume = market.get("volume") or market.get("volumeNum")
+    liquidity = market.get("liquidity") or market.get("liquidityNum")
+    end_date = market.get("endDate", "")
+    condition_id = market.get("conditionId", market.get("id", ""))
+
+    lines = [
+        f"  Question:  {question}",
+    ]
+    if yes_price is not None:
+        lines.append(f"  YES price: {yes_price:.2%}")
+    if no_price is not None:
+        lines.append(f"  NO price:  {no_price:.2%}")
+    if volume:
+        lines.append(f"  Volume:    ${float(volume):,.0f}")
+    if liquidity:
+        lines.append(f"  Liquidity: ${float(liquidity):,.0f}")
+    if end_date:
+        lines.append(f"  End date:  {end_date}")
+    lines.append(f"  ID:        {condition_id}")
+    lines.append(f"  URL:       https://polymarket.com/event/{slug}")
+
+    return "\n".join(lines)
