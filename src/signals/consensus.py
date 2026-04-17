@@ -64,6 +64,9 @@ def compute_consensus(
     aviation_prob: float | None = None,
     hours_to_resolution: float | None = None,
     aviation_context: object | None = None,
+    *,
+    wx_trend_rate: float | None = None,
+    metar_trend_rate: float | None = None,
 ) -> ConsensusResult:
     """Compute aviation-based probability with lead-time confidence scoring.
 
@@ -98,6 +101,14 @@ def compute_consensus(
             confidence += 0.08
         if getattr(aviation_context, "active_sigmet_count", 0) > 0:
             confidence += 0.10
+
+    # WX corroboration/contradiction adjustment
+    if wx_trend_rate is not None and metar_trend_rate is not None:
+        same_direction = (wx_trend_rate >= 0) == (metar_trend_rate >= 0)
+        if same_direction:
+            confidence += 0.05  # WX confirms METAR direction
+        else:
+            confidence -= 0.03  # WX contradicts METAR
 
     # No [0.01, 0.99] clamp: weights are always 0 or 1, so raw == aviation_prob.
     # Above/below/wind probabilities are already clamped in the aviation layer;
@@ -165,6 +176,9 @@ async def compute_calibrated_consensus(
     session: AsyncSession | None = None,
     hours_to_resolution: float | None = None,
     aviation_context: object | None = None,
+    *,
+    wx_trend_rate: float | None = None,
+    metar_trend_rate: float | None = None,
 ) -> ConsensusResult:
     """Compute consensus with optional Bayesian recalibration.
 
@@ -173,6 +187,8 @@ async def compute_calibrated_consensus(
     """
     result = compute_consensus(
         aviation_prob, hours_to_resolution, aviation_context,
+        wx_trend_rate=wx_trend_rate,
+        metar_trend_rate=metar_trend_rate,
     )
 
     if session is not None:

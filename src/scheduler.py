@@ -241,6 +241,118 @@ async def job_short_range_pipeline() -> None:
         await alerter.send_system_error(exc, "short-range pipeline")
 
 
+async def job_wx_rapid_pipeline() -> None:
+    """Every 1 min — Weather Company observation-driven rapid pipeline.
+
+    Polls airport ICAO stations for markets ≤12h out, deduplicates by
+    validTimeLocal, analyzes trends, and detects threshold crossings
+    and peak events for temporal edge trading.
+    """
+    from src.ingestion.wx import analyze_trend, detect_threshold_events, poll_stations
+    from src.signals.mapper import icao_for_location
+
+    alerter = get_alerter()
+    try:
+        async with async_session() as session:
+            # 1. Get ultra-short markets (≤12h)
+            now = datetime.now(timezone.utc)
+            cutoff = now + timedelta(hours=12)
+            stmt = select(Market).where(
+                Market.end_date.isnot(None),
+                Market.end_date <= cutoff,
+                Market.end_date > now,
+                Market.parsed_location.isnot(None),
+            )
+            result = await session.execute(stmt)
+            markets = result.scalars().all()
+
+            if not markets:
+                logger.debug("WX rapid: no ultra-short markets")
+                return
+
+            # 2. Map markets to ICAO stations
+            icao_set: set[str] = set()
+            market_icao: dict[str, str] = {}  # market_id → icao
+            market_thresholds: dict[str, list[tuple[float, str]]] = {}  # icao → [(threshold_f, operator)]
+
+            for m in markets:
+                icao = icao_for_location(m.parsed_location)
+                if not icao:
+                    continue
+                icao_set.add(icao)
+                market_icao[m.id] = icao
+
+                if m.parsed_threshold is not None and m.parsed_operator:
+                    key = icao
+                    if key not in market_thresholds:
+                        market_thresholds[key] = []
+                    market_thresholds[key].append(
+                        (m.parsed_threshold, m.parsed_operator)
+                    )
+
+            if not icao_set:
+                logger.debug("WX rapid: no ICAO stations for active markets")
+                return
+
+            # 3. Poll all stations (dedup + persist happens inside)
+            new_obs = await poll_stations(list(icao_set), session)
+            logger.debug(
+                "WX rapid: polled %d stations, %d new observations",
+                len(icao_set), len(new_obs),
+            )
+
+            # 4. Analyze trends and detect events for each station
+            all_events = []
+            for icao in icao_set:
+                thresholds = market_thresholds.get(icao, [])
+                if thresholds:
+                    events = detect_threshold_events(icao, thresholds)
+                    all_events.extend(events)
+
+                trend = analyze_trend(icao)
+                if trend is not None:
+                    logger.info(
+                        "WX trend %s: %.1f°F (max=%.1f min=%.1f) "
+                        "rate=%.1f°F/hr rising=%s falling=%s peak_done=%s",
+                        icao, trend.current_temp_f,
+                        trend.observed_max_f, trend.observed_min_f,
+                        trend.temp_rate_per_hour or 0.0,
+                        trend.is_rising, trend.is_falling,
+                        trend.peak_likely_passed,
+                    )
+
+            # 5. Log threshold events and run signal detection if needed
+            if all_events:
+                for ev in all_events:
+                    logger.info(
+                        "WX EVENT %s [%s]: %s (confidence=%.2f)",
+                        ev.station_icao, ev.event_type, ev.detail, ev.confidence,
+                    )
+
+                # Run full signal detection for affected markets
+                affected_icaos = {ev.station_icao for ev in all_events}
+                affected_market_ids = {
+                    mid for mid, icao in market_icao.items()
+                    if icao in affected_icaos
+                }
+
+                if affected_market_ids:
+                    signals = await detect_signals_short_range(session)
+                    signals = [s for s in signals if s.market_id in affected_market_ids]
+
+                    logger.info("WX rapid pipeline: %d actionable signals", len(signals))
+
+                    if signals:
+                        monitor = await _get_drawdown_monitor()
+                        await _size_and_create_trades(signals, alerter, monitor)
+
+            await session.commit()
+
+    except Exception as exc:
+        logger.exception("WX rapid pipeline failed")
+        await alerter.send_system_error(exc, "wx-rapid pipeline")
+
+
 async def job_daily_settlement() -> None:
     """Daily 22:00 UTC — resolve markets, P&L, daily summary."""
     alerter = get_alerter()
@@ -266,7 +378,24 @@ async def job_daily_settlement() -> None:
             # 3. Daily summary
             await alerter.send_daily_summary(session)
 
-            # 4. Weekly calibration check (Sundays)
+            # 4. WX observation retention cleanup
+            if settings.WX_API_KEY:
+                from sqlalchemy import delete
+
+                from src.db.models import WxObservation as WxObservationModel
+
+                wx_cutoff = datetime.now(timezone.utc) - timedelta(
+                    hours=settings.WX_RETENTION_HOURS,
+                )
+                result = await session.execute(
+                    delete(WxObservationModel).where(
+                        WxObservationModel.valid_time_utc < wx_cutoff,
+                    )
+                )
+                if result.rowcount:
+                    logger.info("WX cleanup: deleted %d old observations", result.rowcount)
+
+            # 5. Weekly calibration check (Sundays)
             if datetime.now(timezone.utc).weekday() == 6:
                 coeffs = await get_calibration_coefficients(session)
                 if coeffs is not None:
@@ -410,6 +539,15 @@ def setup_scheduler() -> AsyncIOScheduler:
         max_instances=1,
         coalesce=True,
     )
+
+    if settings.WX_API_KEY:
+        scheduler.add_job(
+            job_wx_rapid_pipeline,
+            IntervalTrigger(minutes=settings.WX_PIPELINE_INTERVAL_MINUTES),
+            id="wx_rapid_pipeline",
+            max_instances=1,
+            coalesce=True,
+        )
 
     return scheduler
 

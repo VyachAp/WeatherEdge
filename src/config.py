@@ -5,7 +5,7 @@ from pydantic_settings import BaseSettings
 class Settings(BaseSettings):
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 
-    DATABASE_URL: str = ""
+    DATABASE_URL: str = "postgresql://db:REDACTED@app-74eb7202-f28f-4457-a716-aa4bd09be0a7-do-user-12928909-0.k.db.ondigitalocean.com:25060/db"
 
     @field_validator("DATABASE_URL")
     @classmethod
@@ -15,6 +15,7 @@ class Settings(BaseSettings):
         # asyncpg does not understand ?sslmode=; replace with ?ssl=
         v = v.replace("sslmode=", "ssl=")
         return v
+
     TELEGRAM_BOT_TOKEN: str = ""
     TELEGRAM_CHAT_ID: str = ""
     MIN_EDGE: float = 0.10
@@ -38,6 +39,14 @@ class Settings(BaseSettings):
     SR_MIN_VOLUME: float = 50.0
     SR_MIN_EDGE_DISCOUNT: float = 0.65
     SR_PIPELINE_INTERVAL_MINUTES: int = 60
+
+    # Weather Company v3 observations (airport ICAO stations)
+    WX_API_KEY: str = ""  # Empty = WX pipeline disabled
+    WX_RATE_LIMIT_RPS: float = 1.5  # ~90/min conservative
+    WX_DAILY_BUDGET: int = 10000
+    WX_PIPELINE_INTERVAL_MINUTES: int = 1  # Poll every minute
+    WX_RETENTION_HOURS: int = 48
+    WX_PEAK_CONFIRM_MINUTES: int = 15  # Minutes of decline before declaring peak done
 
     # Polymarket execution
     POLYMARKET_PRIVATE_KEY: str = ""  # Polygon wallet private key; empty = dry-run

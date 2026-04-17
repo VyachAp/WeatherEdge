@@ -696,6 +696,8 @@ class MarketSignal:
     hours_to_resolution: float
     market: Market
     aviation_context: AviationContext | None = None
+    wx_temp_f: float | None = None
+    wx_trend_rate: float | None = None
 
 
 async def map_market(
@@ -818,6 +820,20 @@ async def map_market(
             active_airmet_count=sum(1 for a in alerts if getattr(a, "alert_type", None) == "AIRMET"),
         )
 
+    # --- fetch WX trend (0-12h only) -----------------------------------------
+    wx_temp_f: float | None = None
+    wx_trend_rate: float | None = None
+    if settings.WX_API_KEY and hours_to_resolution <= 12 and icao is not None:
+        from src.ingestion.wx import analyze_trend
+
+        try:
+            trend = analyze_trend(icao)
+            if trend is not None:
+                wx_temp_f = trend.current_temp_f
+                wx_trend_rate = trend.temp_rate_per_hour
+        except Exception as e:
+            logger.warning("WX trend failed for market %s: %s", market.id, e)
+
     market_prob = market.current_yes_price or 0.5
 
     return MarketSignal(
@@ -829,6 +845,8 @@ async def map_market(
         hours_to_resolution=hours_to_resolution,
         market=market,
         aviation_context=aviation_ctx,
+        wx_temp_f=wx_temp_f,
+        wx_trend_rate=wx_trend_rate,
     )
 
 

@@ -696,13 +696,16 @@ def bet_place(market: str, side: str, amount: float, skip_confirm: bool, ignore_
                         current_status = order.get("status", "unknown")
                         click.echo(f"  [{attempt + 1}/3] Status: {current_status}")
                         if current_status.lower() == "matched":
-                            trades = order.get("associate_trades", [])
-                            if trades:
-                                fill_price = float(trades[0].get("price", 0))
-                                click.echo(f"  Fill price: {fill_price:.4f}")
-                            size_matched = order.get("size_matched")
-                            if size_matched:
-                                click.echo(f"  Shares:     {float(size_matched):.2f}")
+                            try:
+                                trades = order.get("associate_trades", [])
+                                if trades:
+                                    fill_price = float(trades[0].get("price", 0))
+                                    click.echo(f"  Fill price: {fill_price:.4f}")
+                                size_matched = order.get("size_matched")
+                                if size_matched:
+                                    click.echo(f"  Shares:     {float(size_matched):.2f}")
+                            except Exception:
+                                click.echo("  (could not fetch fill details)")
                             click.echo("\nOrder filled successfully.")
                             filled = True
                             break
@@ -1072,6 +1075,312 @@ def bet_portfolio(history: bool) -> None:
         click.echo(f"  USDC.e balance: ${usdc_e:.2f}")
 
     asyncio.run(_portfolio())
+
+
+@bet.command("redeem")
+@click.option("--all", "redeem_all", is_flag=True, help="Redeem all resolved positions.")
+@click.option("--yes", "-y", "skip_confirm", is_flag=True, help="Skip confirmation prompt.")
+def bet_redeem(redeem_all: bool, skip_confirm: bool) -> None:
+    """Redeem winnings from resolved Polymarket positions on-chain."""
+
+    async def _redeem() -> None:
+        from src.config import settings
+        from src.bet_helpers import (
+            compute_positions,
+            get_clob_client,
+            get_trades_history,
+            get_usdc_balance,
+        )
+
+        if not settings.POLYMARKET_PRIVATE_KEY:
+            click.echo("Error: POLYMARKET_PRIVATE_KEY not set in .env")
+            raise SystemExit(1)
+
+        if not redeem_all:
+            click.echo("Usage: bet redeem --all")
+            click.echo("  Redeems all resolved positions with non-zero on-chain balance.")
+            raise SystemExit(1)
+
+        # --- Fetch positions from CLOB ---
+        click.echo("Connecting to Polymarket CLOB...")
+        client = get_clob_client()
+
+        click.echo("Fetching trade history...")
+        trades = get_trades_history(client)
+        if not trades:
+            click.echo("No trades found.")
+            return
+
+        positions = compute_positions(trades)
+        if not positions:
+            click.echo("No open positions found.")
+            return
+
+        click.echo(f"Found {len(positions)} position(s). Checking market resolution...")
+
+        # --- Resolve market info via Gamma API ---
+        import httpx
+        import json as _json
+
+        redeemable: list[dict] = []
+
+        async with httpx.AsyncClient(timeout=15) as http:
+            for asset_id, pos in positions.items():
+                mkt = None
+                for param_name in ["clob_token_ids", "id"]:
+                    try:
+                        resp = await http.get(
+                            "https://gamma-api.polymarket.com/markets",
+                            params={param_name: asset_id},
+                        )
+                        resp.raise_for_status()
+                        data = resp.json()
+                        if data:
+                            mkt = data[0] if isinstance(data, list) else data
+                            break
+                    except Exception:
+                        continue
+
+                if not mkt:
+                    continue
+
+                # Check if market is closed/resolved
+                closed = str(mkt.get("closed", "")).lower() == "true"
+                if not closed:
+                    continue
+
+                condition_id = mkt.get("conditionId", "")
+                if not condition_id:
+                    click.echo(f"  Skipping {mkt.get('question', asset_id[:20])}: no conditionId")
+                    continue
+
+                # Determine outcome prices
+                outcome_prices_raw = mkt.get("outcomePrices", "[]")
+                if isinstance(outcome_prices_raw, str):
+                    try:
+                        outcome_prices = _json.loads(outcome_prices_raw)
+                    except Exception:
+                        outcome_prices = []
+                else:
+                    outcome_prices = outcome_prices_raw
+
+                # Determine YES/NO side
+                clob_ids = mkt.get("clobTokenIds", [])
+                if isinstance(clob_ids, str):
+                    clob_ids = _json.loads(clob_ids)
+
+                token_side = ""
+                if len(clob_ids) >= 2:
+                    if asset_id == clob_ids[0]:
+                        token_side = "YES"
+                    elif asset_id == clob_ids[1]:
+                        token_side = "NO"
+
+                # Check neg risk
+                neg_risk = str(mkt.get("negRisk", "")).lower() == "true"
+
+                redeemable.append({
+                    "asset_id": asset_id,
+                    "question": mkt.get("question", ""),
+                    "condition_id": condition_id,
+                    "token_side": token_side,
+                    "neg_risk": neg_risk,
+                    "clob_ids": clob_ids,
+                    "outcome_prices": outcome_prices,
+                    "size": pos["size"],
+                })
+
+        if not redeemable:
+            click.echo("No resolved positions found to redeem.")
+            return
+
+        # --- Web3 setup with RPC failover ---
+        from eth_account import Account
+        from web3 import Web3
+
+        RPC_URLS = [
+            "https://polygon-bor-rpc.publicnode.com",
+            "https://rpc.ankr.com/polygon",
+            "https://polygon.drpc.org",
+            "https://polygon-rpc.com",
+        ]
+
+        CTF_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
+        USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+        NEG_RISK_ADAPTER = "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296"
+
+        CTF_REDEEM_ABI = [
+            {
+                "inputs": [
+                    {"name": "account", "type": "address"},
+                    {"name": "id", "type": "uint256"},
+                ],
+                "name": "balanceOf",
+                "outputs": [{"name": "", "type": "uint256"}],
+                "stateMutability": "view",
+                "type": "function",
+            },
+            {
+                "inputs": [
+                    {"name": "collateralToken", "type": "address"},
+                    {"name": "parentCollectionId", "type": "bytes32"},
+                    {"name": "conditionId", "type": "bytes32"},
+                    {"name": "indexSets", "type": "uint256[]"},
+                ],
+                "name": "redeemPositions",
+                "outputs": [],
+                "stateMutability": "nonpayable",
+                "type": "function",
+            },
+        ]
+
+        account = Account.from_key(settings.POLYMARKET_PRIVATE_KEY)
+        address = account.address
+
+        w3 = None
+        for rpc_url in RPC_URLS:
+            try:
+                _w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": 10}))
+                _w3.eth.get_balance(address)
+                w3 = _w3
+                click.echo(f"Connected to {rpc_url}")
+                break
+            except Exception:
+                continue
+
+        if w3 is None:
+            click.echo("Error: all Polygon RPC endpoints failed")
+            raise SystemExit(1)
+
+        bal = w3.eth.get_balance(address)
+        click.echo(f"POL balance: {w3.from_wei(bal, 'ether'):.4f} (for gas)")
+        if bal == 0:
+            click.echo("Error: wallet has no POL for gas fees")
+            raise SystemExit(1)
+
+        ctf = w3.eth.contract(
+            address=Web3.to_checksum_address(CTF_ADDRESS), abi=CTF_REDEEM_ABI
+        )
+        neg_risk_contract = w3.eth.contract(
+            address=Web3.to_checksum_address(NEG_RISK_ADAPTER), abi=CTF_REDEEM_ABI
+        )
+
+        # --- Check on-chain balances ---
+        click.echo("\nChecking on-chain token balances...")
+        to_redeem: list[dict] = []
+
+        for item in redeemable:
+            try:
+                token_balance = ctf.functions.balanceOf(
+                    address, int(item["asset_id"])
+                ).call()
+            except Exception as e:
+                click.echo(f"  Could not check balance for {item['question'][:50]}: {e}")
+                continue
+
+            if token_balance == 0:
+                click.echo(f"  {item['question'][:50]}: already redeemed (balance=0)")
+                continue
+
+            # Conditional tokens use 1e6 decimals (same as USDC)
+            balance_usdc = token_balance / 1e6
+            item["on_chain_balance"] = token_balance
+            item["balance_usdc"] = balance_usdc
+            to_redeem.append(item)
+
+        if not to_redeem:
+            click.echo("\nNo positions with non-zero on-chain balance to redeem.")
+            return
+
+        # --- Display redeemable positions ---
+        click.echo(f"\n=== Redeemable Positions ({len(to_redeem)}) ===")
+        for item in to_redeem:
+            question = item["question"] or item["asset_id"][:20]
+            side = item["token_side"] or "?"
+            neg = " [neg-risk]" if item["neg_risk"] else ""
+            click.echo(f"\n  {question}")
+            click.echo(f"    Side:        {side}")
+            click.echo(f"    On-chain:    {item['balance_usdc']:.2f} shares")
+            click.echo(f"    Neg risk:    {'Yes' if item['neg_risk'] else 'No'}")
+
+        # --- Confirmation ---
+        if not skip_confirm:
+            if not click.confirm("\nProceed with on-chain redemption?"):
+                click.echo("Aborted.")
+                return
+
+        # --- Execute redemptions ---
+        click.echo("\n=== Executing Redemptions ===")
+        gas_price = w3.eth.gas_price
+        nonce = w3.eth.get_transaction_count(address)
+        CHAIN_ID = 137
+        PARENT_COLLECTION_ID = b"\x00" * 32
+
+        def send_tx(tx_data: dict) -> dict:
+            nonlocal nonce
+            tx_data["nonce"] = nonce
+            tx_data["chainId"] = CHAIN_ID
+            tx_data["from"] = address
+            tx_data["gasPrice"] = gas_price
+            if "gas" not in tx_data:
+                tx_data["gas"] = w3.eth.estimate_gas(tx_data)
+            signed = w3.eth.account.sign_transaction(
+                tx_data, private_key=settings.POLYMARKET_PRIVATE_KEY
+            )
+            tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+            receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+            nonce += 1
+            return receipt
+
+        success_count = 0
+        for item in to_redeem:
+            question = (item["question"] or item["asset_id"][:20])[:50]
+            condition_id_hex = item["condition_id"]
+            if condition_id_hex.startswith("0x"):
+                condition_id_bytes = bytes.fromhex(condition_id_hex[2:])
+            else:
+                condition_id_bytes = bytes.fromhex(condition_id_hex)
+
+            # Determine indexSets based on token side
+            clob_ids = item["clob_ids"]
+            if len(clob_ids) >= 2 and item["asset_id"] == clob_ids[0]:
+                index_sets = [1]  # YES = outcome index 0 → 2^0 = 1
+            elif len(clob_ids) >= 2 and item["asset_id"] == clob_ids[1]:
+                index_sets = [2]  # NO = outcome index 1 → 2^1 = 2
+            else:
+                index_sets = [1, 2]  # Try both
+
+            contract = neg_risk_contract if item["neg_risk"] else ctf
+            usdc_addr = Web3.to_checksum_address(USDC_ADDRESS)
+
+            click.echo(f"\n  Redeeming: {question}...")
+            try:
+                tx = contract.functions.redeemPositions(
+                    usdc_addr,
+                    PARENT_COLLECTION_ID,
+                    condition_id_bytes,
+                    index_sets,
+                ).build_transaction({"from": address, "gasPrice": gas_price})
+                receipt = send_tx(tx)
+                status = "OK" if receipt["status"] == 1 else "FAILED"
+                tx_hash = receipt["transactionHash"].hex()[:16]
+                gas_used = receipt["gasUsed"]
+                click.echo(f"    Status: {status}  tx: {tx_hash}...  gas: {gas_used}")
+                if receipt["status"] == 1:
+                    success_count += 1
+            except Exception as e:
+                click.echo(f"    FAILED: {e}")
+                click.echo("    (Market may not be resolved on-chain yet)")
+
+        # --- Final balance ---
+        click.echo(f"\n=== Results ===")
+        click.echo(f"  Redeemed: {success_count}/{len(to_redeem)} positions")
+        usdc_e, usdc_native = await get_usdc_balance(settings.POLYMARKET_PRIVATE_KEY)
+        click.echo(f"  USDC.e balance: ${usdc_e:.2f}")
+        if usdc_native > 0:
+            click.echo(f"  Native USDC:    ${usdc_native:.2f}")
+
+    asyncio.run(_redeem())
 
 
 if __name__ == "__main__":

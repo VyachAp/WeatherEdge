@@ -1030,6 +1030,9 @@ async def compute_taf_based_probability(
     Uses METAR trend + TAF forecast with lead-time-dependent weighting.
     Threshold is in market units (Fahrenheit for temp, inches for precip,
     mph for wind).  *operator* should be ``"above"`` or ``"below"``.
+
+    When WX data is available (Weather Company v3 observations), it
+    supplements the 0-6h temperature estimate with fresher readings.
     """
     hours_out = (target_time - datetime.now(timezone.utc)).total_seconds() / 3600.0
     hours_out = max(hours_out, 0.0)
@@ -1054,7 +1057,8 @@ async def _prob_temperature(
     """Temperature exceedance probability using METAR trend + TAF TX/TN.
 
     Strategy by lead time:
-    - 0-6h:  METAR trend extrapolation (strong signal, low uncertainty)
+    - 0-6h:  METAR trend extrapolation, supplemented by WX observations
+              when available (fresher temp + tighter sigma).
     - 6-30h: TAF TX/TN forecast if available, dampened METAR trend as fallback
     """
     trend, taf_info = await asyncio.gather(
@@ -1067,15 +1071,32 @@ async def _prob_temperature(
     taf_max_f = taf_info.get("max_f")
     taf_min_f = taf_info.get("min_f")
 
+    # --- WX observation supplement for 0-6h range -------------------------
+    sigma_multiplier = 1.0
+    if hours_out <= 6 and settings.WX_API_KEY:
+        from src.ingestion.wx import analyze_trend
+
+        try:
+            wx_trend = analyze_trend(station)
+            if wx_trend is not None:
+                # Use WX current temp (fresher than METAR)
+                current_f = wx_trend.current_temp_f
+                # Use WX rate if available (per-minute resolution)
+                if wx_trend.temp_rate_per_hour is not None:
+                    rate = wx_trend.temp_rate_per_hour
+                # Tighter uncertainty with more frequent observations
+                sigma_multiplier = 0.85
+        except Exception as e:
+            logger.debug("WX supplement skipped for %s: %s", station, e)
+
     # --- Build point forecast based on lead time ---------------------------
     forecast_f = None
 
     if hours_out <= 6 and current_f is not None:
-        # Short range: METAR trend extrapolation
+        # Short range: METAR/WX trend extrapolation
         forecast_f = current_f + rate * hours_out
     elif taf_max_f is not None:
         # 6-30h: use TAF max temperature as the point forecast
-        # For "highest temperature" markets, TX is the right reference
         forecast_f = taf_max_f
     elif current_f is not None:
         # Fallback: dampened METAR trend
@@ -1093,6 +1114,8 @@ async def _prob_temperature(
     else:
         sigma = 8.0 + 0.2 * hours_out           # 12-14°F
 
+    sigma *= sigma_multiplier
+
     # TAF amendments indicate forecast instability → more uncertainty
     taf_amendments = await taf_amendment_count(station, hours=24)
     if taf_amendments > 3:
@@ -1104,10 +1127,7 @@ async def _prob_temperature(
     else:
         prob = 1.0 - _normal_cdf(z)    # P(temp > threshold)
 
-    # No [0.01, 0.99] clamp. A 0.99 ceiling against a longshot market at
-    # 0.0005 manufactures +0.9895 of fake YES edge; the same for the floor
-    # in the opposite direction. Filters downstream must handle values in
-    # [0, 1] and decide whether the underlying CDF is trustworthy.
+    # No [0.01, 0.99] clamp.
     return max(0.0, min(1.0, prob))
 
 

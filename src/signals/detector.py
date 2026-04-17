@@ -209,6 +209,7 @@ async def _detect(
             session,
             hours_to_resolution=ms.hours_to_resolution,
             aviation_context=ms.aviation_context,
+            wx_trend_rate=getattr(ms, "wx_trend_rate", None),
         )
 
         edge, direction = compute_edge(consensus.consensus_prob, ms.market_prob)

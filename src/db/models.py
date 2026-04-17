@@ -12,6 +12,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    UniqueConstraint,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, relationship
@@ -85,6 +86,7 @@ class Signal(Base):
     gfs_prob = Column(Float)  # Legacy — always NULL, drop via migration later
     ecmwf_prob = Column(Float)  # Legacy — always NULL, drop via migration later
     aviation_prob = Column(Float)
+    wx_prob = Column(Float)
     created_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
 
     market = relationship("Market", back_populates="signals")
@@ -213,6 +215,43 @@ class SynopObservation(Base):
     cloud_cover_oktas = Column(Integer)
     raw_synop = Column(Text)
     fetched_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
+
+
+class WxObservation(Base):
+    __tablename__ = "wx_observations"
+    __table_args__ = (
+        Index("ix_wx_station_valid", "station_icao", "valid_time_utc"),
+        UniqueConstraint("station_icao", "valid_time_local", name="uq_wx_station_time"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    station_icao = Column(String, nullable=False)
+    valid_time_utc = Column(DateTime(timezone=True), nullable=False)
+    valid_time_local = Column(String, nullable=False)  # Dedup key
+    temp_c = Column(Float)
+    dewpoint_c = Column(Float)
+    humidity = Column(Float)
+    wind_speed_ms = Column(Float)
+    wind_gust_ms = Column(Float)
+    wind_dir = Column(Integer)
+    pressure_hpa = Column(Float)
+    pressure_trend = Column(String)  # "Falling"/"Rising"/"Steady"
+    precip_1h_mm = Column(Float)
+    precip_6h_mm = Column(Float)
+    precip_24h_mm = Column(Float)
+    snow_1h_mm = Column(Float)
+    snow_24h_mm = Column(Float)
+    temp_max_since_7am_c = Column(Float)
+    temp_max_24h_c = Column(Float)
+    temp_min_24h_c = Column(Float)
+    cloud_cover = Column(Integer)
+    visibility_km = Column(Float)
+    uv_index = Column(Integer)
+    fetched_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
 
 
 class AviationAlert(Base):
