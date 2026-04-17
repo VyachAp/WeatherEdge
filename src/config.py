@@ -5,7 +5,7 @@ from pydantic_settings import BaseSettings
 class Settings(BaseSettings):
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 
-    DATABASE_URL: str = "postgresql://db:REDACTED@app-74eb7202-f28f-4457-a716-aa4bd09be0a7-do-user-12928909-0.k.db.ondigitalocean.com:25060/db"
+    DATABASE_URL: str = ""
 
     @field_validator("DATABASE_URL")
     @classmethod
