@@ -294,3 +294,113 @@ def format_market_info(market: dict) -> str:
     lines.append(f"  URL:       https://polymarket.com/event/{slug}")
 
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Portfolio / trade history
+# ---------------------------------------------------------------------------
+
+
+def get_trades_history(client) -> list[dict]:
+    """Fetch all trade history from the CLOB API."""
+    from py_clob_client.clob_types import TradeParams
+    return client.get_trades(TradeParams())
+
+
+def get_open_orders(client) -> list[dict]:
+    """Fetch all open orders from the CLOB API."""
+    from py_clob_client.clob_types import OpenOrderParams
+    return client.get_orders(OpenOrderParams())
+
+
+async def enrich_trades_with_markets(trades: list[dict]) -> dict[str, dict]:
+    """Fetch market info for all unique condition_ids in trades.
+
+    Returns {condition_id: market_dict}.
+    """
+    condition_ids = {t.get("market") or t.get("condition_id", "") for t in trades}
+    condition_ids.discard("")
+
+    markets: dict[str, dict] = {}
+
+    async with httpx.AsyncClient(timeout=15) as http:
+        for cid in condition_ids:
+            try:
+                resp = await http.get(
+                    f"{GAMMA_BASE}/markets",
+                    params={"clob_token_ids": cid},
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                if data:
+                    mkt = data[0] if isinstance(data, list) else data
+                    markets[cid] = mkt
+                    continue
+            except Exception:
+                pass
+
+            # Fallback: try condition_id param
+            try:
+                resp = await http.get(
+                    f"{GAMMA_BASE}/markets",
+                    params={"condition_id": cid},
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                if data:
+                    mkt = data[0] if isinstance(data, list) else data
+                    markets[cid] = mkt
+            except Exception:
+                pass
+
+    return markets
+
+
+def compute_positions(trades: list[dict]) -> dict[str, dict]:
+    """Aggregate trades into net positions by asset_id (token).
+
+    Returns {asset_id: {side, size, avg_price, cost, market}}.
+    """
+    positions: dict[str, dict] = {}
+
+    for t in trades:
+        asset_id = t.get("asset_id", "")
+        if not asset_id:
+            continue
+
+        side = t.get("side", "")
+        size = float(t.get("size", 0))
+        price = float(t.get("price", 0))
+        market = t.get("market", "")
+
+        if asset_id not in positions:
+            positions[asset_id] = {
+                "asset_id": asset_id,
+                "side": side,
+                "size": 0.0,
+                "cost": 0.0,
+                "market": market,
+            }
+
+        pos = positions[asset_id]
+        if side == "BUY":
+            pos["cost"] += size * price
+            pos["size"] += size
+        else:  # SELL
+            pos["cost"] -= size * price
+            pos["size"] -= size
+
+    # Calculate average entry price and filter out closed positions
+    active: dict[str, dict] = {}
+    for asset_id, pos in positions.items():
+        if abs(pos["size"]) < 0.001:
+            continue  # fully closed
+        if pos["size"] > 0:
+            pos["avg_price"] = pos["cost"] / pos["size"] if pos["size"] else 0
+            pos["side"] = "LONG"
+        else:
+            pos["avg_price"] = pos["cost"] / pos["size"] if pos["size"] else 0
+            pos["side"] = "SHORT"
+        active[asset_id] = pos
+
+    return active

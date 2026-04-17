@@ -793,5 +793,152 @@ def bet_cancel(order_id: str) -> None:
     asyncio.run(_cancel())
 
 
+@bet.command("portfolio")
+@click.option("--history", is_flag=True, help="Show full trade history instead of positions.")
+def bet_portfolio(history: bool) -> None:
+    """Show open positions and P&L from your Polymarket trades."""
+
+    async def _portfolio() -> None:
+        from src.config import settings
+        from src.bet_helpers import (
+            compute_positions,
+            get_clob_client,
+            get_open_orders,
+            get_trades_history,
+            get_usdc_balance,
+        )
+
+        if not settings.POLYMARKET_PRIVATE_KEY:
+            click.echo("Error: POLYMARKET_PRIVATE_KEY not set in .env")
+            raise SystemExit(1)
+
+        click.echo("Connecting to Polymarket CLOB...")
+        client = get_clob_client()
+
+        # --- Wallet balance ---
+        click.echo("Fetching wallet balance...")
+        usdc_e, usdc_native = await get_usdc_balance(settings.POLYMARKET_PRIVATE_KEY)
+        click.echo(f"\n=== Wallet ===")
+        click.echo(f"  USDC.e:      ${usdc_e:.2f}")
+        if usdc_native > 0:
+            click.echo(f"  Native USDC: ${usdc_native:.2f}")
+
+        # --- Open orders ---
+        click.echo("\nFetching open orders...")
+        open_orders = get_open_orders(client)
+        click.echo(f"\n=== Open Orders ({len(open_orders)}) ===")
+        if open_orders:
+            for o in open_orders:
+                oid = o.get("id", "?")[:12]
+                side = o.get("side", "?")
+                size = o.get("original_size", o.get("size", "?"))
+                price = o.get("price", "?")
+                status = o.get("status", "?")
+                asset = o.get("asset_id", "")[:16]
+                click.echo(f"  {oid}...  {side:<5} size={size} price={price} status={status}  token={asset}...")
+        else:
+            click.echo("  No open orders.")
+
+        # --- Trade history & positions ---
+        click.echo("\nFetching trade history...")
+        trades = get_trades_history(client)
+
+        if not trades:
+            click.echo("\n  No trades found.")
+            return
+
+        if history:
+            click.echo(f"\n=== Trade History ({len(trades)}) ===")
+            click.echo(f"  {'Time':<20} {'Side':<5} {'Size':>8} {'Price':>7} {'Market'}")
+            click.echo(f"  {'-'*70}")
+            for t in trades:
+                ts = t.get("match_time") or t.get("created_at") or t.get("timestamp", "?")
+                if isinstance(ts, str) and len(ts) > 19:
+                    ts = ts[:19]
+                side = t.get("side", "?")
+                size = float(t.get("size", 0))
+                price = float(t.get("price", 0))
+                market = t.get("market", "?")[:20]
+                click.echo(f"  {ts:<20} {side:<5} {size:>8.2f} {price:>7.4f} {market}...")
+            return
+
+        # --- Positions ---
+        positions = compute_positions(trades)
+        click.echo(f"\n=== Positions ({len(positions)}) ===")
+
+        if not positions:
+            click.echo("  No open positions (all trades fully closed).")
+            return
+
+        total_cost = 0.0
+        total_value = 0.0
+
+        for asset_id, pos in positions.items():
+            size = pos["size"]
+            avg_price = pos["avg_price"]
+            cost = abs(pos["cost"])
+            total_cost += cost
+
+            # Fetch current price for this token
+            current_price = None
+            try:
+                last = client.get_last_trade_price(asset_id)
+                if last and last.get("price"):
+                    current_price = float(last["price"])
+            except Exception:
+                pass
+
+            current_value = abs(size) * current_price if current_price else None
+            if current_value is not None:
+                total_value += current_value
+                pnl = current_value - cost
+                pnl_pct = (pnl / cost * 100) if cost else 0
+                pnl_str = f"{'+'if pnl>=0 else ''}{pnl:.2f} ({pnl_pct:+.1f}%)"
+            else:
+                pnl_str = "?"
+
+            click.echo(f"\n  Token: {asset_id[:20]}...")
+            click.echo(f"    Side:      {pos['side']}")
+            click.echo(f"    Size:      {abs(size):.2f} shares")
+            click.echo(f"    Avg entry: {avg_price:.4f}")
+            click.echo(f"    Cost:      ${cost:.2f}")
+            if current_price is not None:
+                click.echo(f"    Current:   {current_price:.4f}")
+                click.echo(f"    Value:     ${current_value:.2f}")
+            click.echo(f"    P&L:       {pnl_str}")
+
+        # --- Resolve market questions for context ---
+        click.echo(f"\n=== Summary ===")
+        click.echo(f"  Total cost:     ${total_cost:.2f}")
+        if total_value > 0:
+            click.echo(f"  Current value:  ${total_value:.2f}")
+            total_pnl = total_value - total_cost
+            click.echo(f"  Total P&L:      {'+'if total_pnl>=0 else ''}{total_pnl:.2f}")
+        click.echo(f"  USDC.e balance: ${usdc_e:.2f}")
+
+        # --- Try to show market questions ---
+        click.echo(f"\n=== Market Details ===")
+        import httpx
+        seen_markets: set[str] = set()
+        for asset_id, pos in positions.items():
+            market_id = pos.get("market", "")
+            if not market_id or market_id in seen_markets:
+                continue
+            seen_markets.add(market_id)
+            try:
+                async with httpx.AsyncClient(timeout=10) as http:
+                    resp = await http.get(
+                        f"https://gamma-api.polymarket.com/markets/{market_id}",
+                    )
+                    if resp.status_code == 200:
+                        mkt = resp.json()
+                        question = mkt.get("question", "?")
+                        click.echo(f"  {market_id[:16]}... = {question[:70]}")
+            except Exception:
+                click.echo(f"  {market_id[:16]}... = (could not resolve)")
+
+    asyncio.run(_portfolio())
+
+
 if __name__ == "__main__":
     main()
