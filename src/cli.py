@@ -682,7 +682,46 @@ def bet_place(market: str, side: str, amount: float, skip_confirm: bool, ignore_
                 except Exception:
                     click.echo("  (could not fetch fill details)")
 
-            click.echo("\nOrder placed successfully.")
+                click.echo("\nOrder filled successfully.")
+
+            elif status == "delayed":
+                import time
+
+                click.echo("\nOrder accepted but not yet filled. Polling for fill...")
+                filled = False
+                for attempt in range(3):
+                    time.sleep(2)
+                    try:
+                        order = client.get_order(order_id)
+                        current_status = order.get("status", "unknown")
+                        click.echo(f"  [{attempt + 1}/3] Status: {current_status}")
+                        if current_status == "matched":
+                            trades = order.get("associate_trades", [])
+                            if trades:
+                                fill_price = float(trades[0].get("price", 0))
+                                click.echo(f"  Fill price: {fill_price:.4f}")
+                            size_matched = order.get("size_matched")
+                            if size_matched:
+                                click.echo(f"  Shares:     {float(size_matched):.2f}")
+                            click.echo("\nOrder filled successfully.")
+                            filled = True
+                            break
+                    except Exception:
+                        click.echo(f"  [{attempt + 1}/3] (could not fetch status)")
+
+                if not filled:
+                    click.echo(f"\nOrder is still delayed (not filled).")
+                    click.echo(f"  To cancel: python -m src.cli bet cancel {order_id}")
+                    if click.confirm("Cancel this order now?"):
+                        try:
+                            client.cancel(order_id)
+                            click.echo("Order cancelled.")
+                        except Exception as exc:
+                            click.echo(f"Failed to cancel: {exc}")
+                    else:
+                        click.echo("Order left open. Check later with: python -m src.cli bet orders")
+            else:
+                click.echo(f"\nOrder placed (status: {status}).")
         else:
             error_msg = resp.get("errorMsg", "unknown error")
             click.echo(f"  Status: FAILED")
@@ -791,6 +830,55 @@ def bet_cancel(order_id: str) -> None:
             raise SystemExit(1)
 
     asyncio.run(_cancel())
+
+
+@bet.command("orders")
+@click.option("--limit", "max_orders", default=20, show_default=True, help="Max orders to display.")
+def bet_orders(max_orders: int) -> None:
+    """List recent orders with their statuses (matched, delayed, cancelled, etc.)."""
+
+    async def _orders() -> None:
+        from src.config import settings
+        from src.bet_helpers import get_clob_client
+
+        if not settings.POLYMARKET_PRIVATE_KEY:
+            click.echo("Error: POLYMARKET_PRIVATE_KEY not set in .env")
+            raise SystemExit(1)
+
+        click.echo("Fetching orders...")
+        client = get_clob_client()
+
+        from py_clob_client.clob_types import OpenOrderParams
+        orders = client.get_orders(OpenOrderParams())
+
+        if not orders:
+            click.echo("No orders found.")
+            return
+
+        # Sort by timestamp descending if available
+        orders = orders[:max_orders]
+
+        click.echo(f"\n=== Orders ({len(orders)}) ===")
+        click.echo(f"{'ID':<14} {'Status':<12} {'Side':<6} {'Size':>8} {'Price':>8} {'Matched':>8}  Token")
+        click.echo("-" * 80)
+        for o in orders:
+            oid = (o.get("id") or "?")[:12]
+            status = o.get("status", "?")
+            side = o.get("side", "?")
+            size = o.get("original_size", o.get("size", "?"))
+            price = o.get("price", "?")
+            matched = o.get("size_matched", "0")
+            asset = (o.get("asset_id") or "")[:16]
+            click.echo(f"  {oid}..  {status:<12} {side:<6} {size:>8} {price:>8} {matched:>8}  {asset}...")
+
+        # Show cancel hint for non-terminal orders
+        active = [o for o in orders if o.get("status") in ("live", "delayed")]
+        if active:
+            click.echo(f"\n{len(active)} active order(s). Cancel with:")
+            for o in active:
+                click.echo(f"  python -m src.cli bet cancel {o.get('id', '?')}")
+
+    asyncio.run(_orders())
 
 
 @bet.command("portfolio")
