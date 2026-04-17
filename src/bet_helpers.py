@@ -112,26 +112,44 @@ async def resolve_market(raw: str) -> dict | None:
 
 
 async def search_markets(query: str, limit: int = 20) -> list[dict]:
-    """Search active Polymarket markets by keyword (client-side filter)."""
-    async with httpx.AsyncClient(timeout=15) as http:
-        resp = await http.get(
-            f"{GAMMA_BASE}/markets",
-            params={
-                "active": "true",
-                "limit": 100,
-                "order": "liquidity",
-                "ascending": "false",
-            },
-        )
-        resp.raise_for_status()
-        markets = resp.json()
+    """Search active Polymarket markets by keyword.
 
+    Paginates through all active markets and filters client-side,
+    since the Gamma API has no server-side text search.
+    """
     query_lower = query.lower()
-    results = [
-        m for m in markets
-        if query_lower in (m.get("question") or "").lower()
-    ]
-    return results[:limit]
+    results: list[dict] = []
+    page_size = 100
+    offset = 0
+
+    async with httpx.AsyncClient(timeout=30) as http:
+        while len(results) < limit:
+            resp = await http.get(
+                f"{GAMMA_BASE}/markets",
+                params={
+                    "active": "true",
+                    "closed": "false",
+                    "limit": page_size,
+                    "offset": offset,
+                },
+            )
+            resp.raise_for_status()
+            batch = resp.json()
+
+            if not batch:
+                break
+
+            for m in batch:
+                if query_lower in (m.get("question") or "").lower():
+                    results.append(m)
+                    if len(results) >= limit:
+                        break
+
+            if len(batch) < page_size:
+                break
+            offset += page_size
+
+    return results
 
 
 # ---------------------------------------------------------------------------
