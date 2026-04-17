@@ -663,7 +663,7 @@ def bet_place(market: str, side: str, amount: float, skip_confirm: bool, ignore_
         # --- Display result ---
         click.echo(f"\n=== Result ===")
         order_id = resp.get("orderID")
-        status = resp.get("status", "unknown")
+        status = (resp.get("status") or "unknown").lower()
 
         if order_id:
             click.echo(f"  Order ID: {order_id}")
@@ -695,7 +695,7 @@ def bet_place(market: str, side: str, amount: float, skip_confirm: bool, ignore_
                         order = client.get_order(order_id)
                         current_status = order.get("status", "unknown")
                         click.echo(f"  [{attempt + 1}/3] Status: {current_status}")
-                        if current_status == "matched":
+                        if current_status.lower() == "matched":
                             trades = order.get("associate_trades", [])
                             if trades:
                                 fill_price = float(trades[0].get("price", 0))

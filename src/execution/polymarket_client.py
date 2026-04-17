@@ -237,7 +237,7 @@ async def place_order(
             )
 
             # Fetch fill details if matched
-            if trade.order_id and trade.exchange_status == "matched":
+            if trade.order_id and (trade.exchange_status or "").lower() == "matched":
                 await _update_fill_details(trade, client)
 
             return True
@@ -280,7 +280,7 @@ async def check_order_status(trade: Trade) -> str | None:
         status = order.get("status", "unknown")
         trade.exchange_status = status
 
-        if status == "matched" and not trade.fill_price:
+        if status.lower() == "matched" and not trade.fill_price:
             await _update_fill_details(trade, client)
 
         return status
