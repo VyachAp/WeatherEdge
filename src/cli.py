@@ -848,9 +848,27 @@ def bet_portfolio(history: bool) -> None:
             return
 
         if history:
+            # Resolve market questions for all unique asset_ids
+            import httpx
+            asset_ids = {t.get("asset_id", "") for t in trades}
+            asset_ids.discard("")
+            token_questions: dict[str, str] = {}
+            async with httpx.AsyncClient(timeout=15) as http:
+                for aid in asset_ids:
+                    try:
+                        resp = await http.get(
+                            "https://gamma-api.polymarket.com/markets",
+                            params={"clob_token_ids": aid},
+                        )
+                        resp.raise_for_status()
+                        data = resp.json()
+                        if data:
+                            mkt = data[0] if isinstance(data, list) else data
+                            token_questions[aid] = (mkt.get("question") or "?")[:50]
+                    except Exception:
+                        pass
+
             click.echo(f"\n=== Trade History ({len(trades)}) ===")
-            click.echo(f"  {'Time':<20} {'Side':<5} {'Size':>8} {'Price':>7} {'Market'}")
-            click.echo(f"  {'-'*70}")
             for t in trades:
                 ts = t.get("match_time") or t.get("created_at") or t.get("timestamp", "?")
                 if isinstance(ts, str) and len(ts) > 19:
@@ -858,8 +876,10 @@ def bet_portfolio(history: bool) -> None:
                 side = t.get("side", "?")
                 size = float(t.get("size", 0))
                 price = float(t.get("price", 0))
-                market = t.get("market", "?")[:20]
-                click.echo(f"  {ts:<20} {side:<5} {size:>8.2f} {price:>7.4f} {market}...")
+                cost = size * price
+                aid = t.get("asset_id", "")
+                question = token_questions.get(aid, aid[:20] + "...")
+                click.echo(f"  {ts}  {side:<4} {size:>7.2f} @ ${price:.4f}  (${cost:.2f})  {question}")
             return
 
         # --- Positions ---
@@ -870,6 +890,27 @@ def bet_portfolio(history: bool) -> None:
             click.echo("  No open positions (all trades fully closed).")
             return
 
+        # Resolve market questions for all positions via token_id lookup
+        import httpx
+        token_to_market: dict[str, dict] = {}
+        async with httpx.AsyncClient(timeout=15) as http:
+            for asset_id in positions:
+                # Look up market by clob_token_ids (the asset_id IS the token_id)
+                for param_name in ["clob_token_ids", "id"]:
+                    try:
+                        resp = await http.get(
+                            "https://gamma-api.polymarket.com/markets",
+                            params={param_name: asset_id},
+                        )
+                        resp.raise_for_status()
+                        data = resp.json()
+                        if data:
+                            mkt = data[0] if isinstance(data, list) else data
+                            token_to_market[asset_id] = mkt
+                            break
+                    except Exception:
+                        continue
+
         total_cost = 0.0
         total_value = 0.0
 
@@ -878,6 +919,23 @@ def bet_portfolio(history: bool) -> None:
             avg_price = pos["avg_price"]
             cost = abs(pos["cost"])
             total_cost += cost
+
+            # Resolve market question and determine YES/NO side
+            mkt = token_to_market.get(asset_id)
+            question = ""
+            token_side = ""
+            if mkt:
+                question = mkt.get("question", "")
+                # Determine if this token is YES or NO
+                import json as _json
+                clob_ids = mkt.get("clobTokenIds", [])
+                if isinstance(clob_ids, str):
+                    clob_ids = _json.loads(clob_ids)
+                if len(clob_ids) >= 2:
+                    if asset_id == clob_ids[0]:
+                        token_side = "YES"
+                    elif asset_id == clob_ids[1]:
+                        token_side = "NO"
 
             # Fetch current price for this token
             current_price = None
@@ -897,17 +955,26 @@ def bet_portfolio(history: bool) -> None:
             else:
                 pnl_str = "?"
 
-            click.echo(f"\n  Token: {asset_id[:20]}...")
-            click.echo(f"    Side:      {pos['side']}")
+            # Display
+            if question:
+                click.echo(f"\n  {question}")
+            else:
+                click.echo(f"\n  Token: {asset_id[:20]}...")
+            side_label = f"LONG {token_side}" if token_side else pos["side"]
+            click.echo(f"    Side:      {side_label}")
             click.echo(f"    Size:      {abs(size):.2f} shares")
-            click.echo(f"    Avg entry: {avg_price:.4f}")
+            click.echo(f"    Avg entry: ${avg_price:.4f}")
             click.echo(f"    Cost:      ${cost:.2f}")
             if current_price is not None:
-                click.echo(f"    Current:   {current_price:.4f}")
+                click.echo(f"    Current:   ${current_price:.4f}")
                 click.echo(f"    Value:     ${current_value:.2f}")
             click.echo(f"    P&L:       {pnl_str}")
+            if mkt:
+                slug = mkt.get("slug", "")
+                if slug:
+                    click.echo(f"    URL:       https://polymarket.com/event/{slug}")
 
-        # --- Resolve market questions for context ---
+        # --- Summary ---
         click.echo(f"\n=== Summary ===")
         click.echo(f"  Total cost:     ${total_cost:.2f}")
         if total_value > 0:
@@ -915,27 +982,6 @@ def bet_portfolio(history: bool) -> None:
             total_pnl = total_value - total_cost
             click.echo(f"  Total P&L:      {'+'if total_pnl>=0 else ''}{total_pnl:.2f}")
         click.echo(f"  USDC.e balance: ${usdc_e:.2f}")
-
-        # --- Try to show market questions ---
-        click.echo(f"\n=== Market Details ===")
-        import httpx
-        seen_markets: set[str] = set()
-        for asset_id, pos in positions.items():
-            market_id = pos.get("market", "")
-            if not market_id or market_id in seen_markets:
-                continue
-            seen_markets.add(market_id)
-            try:
-                async with httpx.AsyncClient(timeout=10) as http:
-                    resp = await http.get(
-                        f"https://gamma-api.polymarket.com/markets/{market_id}",
-                    )
-                    if resp.status_code == 200:
-                        mkt = resp.json()
-                        question = mkt.get("question", "?")
-                        click.echo(f"  {market_id[:16]}... = {question[:70]}")
-            except Exception:
-                click.echo(f"  {market_id[:16]}... = (could not resolve)")
 
     asyncio.run(_portfolio())
 
