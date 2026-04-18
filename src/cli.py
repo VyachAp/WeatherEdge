@@ -1231,7 +1231,7 @@ def bet_redeem(redeem_all: bool, skip_confirm: bool) -> None:
             {
                 "inputs": [
                     {"name": "conditionId", "type": "bytes32"},
-                    {"name": "indexSets", "type": "uint256[]"},
+                    {"name": "amounts", "type": "uint256[]"},
                 ],
                 "name": "redeemPositions",
                 "outputs": [],
@@ -1360,9 +1360,17 @@ def bet_redeem(redeem_all: bool, skip_confirm: bool) -> None:
             click.echo(f"\n  Redeeming: {question}...")
             try:
                 if item["neg_risk"]:
+                    on_chain = item["on_chain_balance"]
+                    clob_ids = item["clob_ids"]
+                    if len(clob_ids) >= 2 and item["asset_id"] == clob_ids[0]:
+                        amounts = [on_chain, 0]   # holding YES position
+                    elif len(clob_ids) >= 2 and item["asset_id"] == clob_ids[1]:
+                        amounts = [0, on_chain]   # holding NO position
+                    else:
+                        amounts = [on_chain, 0]   # fallback
                     tx = neg_risk_adapter.functions.redeemPositions(
                         condition_id_bytes,
-                        index_sets,
+                        amounts,
                     ).build_transaction({"from": address, "gasPrice": gas_price})
                 else:
                     pusd_addr = Web3.to_checksum_address(PUSD_ADDRESS)
