@@ -981,26 +981,27 @@ def bet_portfolio(history: bool) -> None:
             click.echo("  No open positions (all trades fully closed).")
             return
 
-        # Resolve market questions for all positions via token_id lookup
+        # Resolve market questions via CLOB API (condition_id from trade data)
         import httpx
         token_to_market: dict[str, dict] = {}
         async with httpx.AsyncClient(timeout=15) as http:
-            for asset_id in positions:
-                # Look up market by clob_token_ids (the asset_id IS the token_id)
-                for param_name in ["clob_token_ids", "token_id", "id"]:
+            # Deduplicate: group by condition_id to avoid repeated lookups
+            seen_conds: dict[str, dict | None] = {}
+            for asset_id, pos in positions.items():
+                cond = pos.get("market", "")
+                if not cond:
+                    continue
+                if cond not in seen_conds:
                     try:
                         resp = await http.get(
-                            "https://gamma-api.polymarket.com/markets",
-                            params={param_name: asset_id},
+                            f"https://clob.polymarket.com/markets/{cond}",
                         )
                         resp.raise_for_status()
-                        data = resp.json()
-                        if data:
-                            mkt = data[0] if isinstance(data, list) else data
-                            token_to_market[asset_id] = mkt
-                            break
+                        seen_conds[cond] = resp.json()
                     except Exception:
-                        continue
+                        seen_conds[cond] = None
+                if seen_conds[cond]:
+                    token_to_market[asset_id] = seen_conds[cond]
 
         total_cost = 0.0
         total_value = 0.0
@@ -1018,15 +1019,11 @@ def bet_portfolio(history: bool) -> None:
             if mkt:
                 question = mkt.get("question", "")
                 # Determine if this token is YES or NO
-                import json as _json
-                clob_ids = mkt.get("clobTokenIds", [])
-                if isinstance(clob_ids, str):
-                    clob_ids = _json.loads(clob_ids)
-                if len(clob_ids) >= 2:
-                    if asset_id == clob_ids[0]:
-                        token_side = "YES"
-                    elif asset_id == clob_ids[1]:
-                        token_side = "NO"
+                tokens = mkt.get("tokens", [])
+                for tok in tokens:
+                    if tok.get("token_id") == asset_id:
+                        token_side = (tok.get("outcome") or "").upper()
+                        break
 
             # Fetch current price for this token
             current_price = None
@@ -1118,85 +1115,71 @@ def bet_redeem(redeem_all: bool, skip_confirm: bool) -> None:
 
         click.echo(f"Found {len(positions)} position(s). Checking market resolution...")
 
-        # --- Resolve market info via Gamma API ---
+        # --- Resolve market info via CLOB API (reliable for neg-risk) ---
         import httpx
         import json as _json
 
         redeemable: list[dict] = []
 
         async with httpx.AsyncClient(timeout=15) as http:
+            # Group positions by condition_id (market) to avoid duplicate lookups
+            cond_to_assets: dict[str, list[tuple[str, dict]]] = {}
             for asset_id, pos in positions.items():
+                cond = pos.get("market", "")
+                if not cond:
+                    continue
+                cond_to_assets.setdefault(cond, []).append((asset_id, pos))
+
+            for cond_id, assets in cond_to_assets.items():
+                # CLOB API reliably resolves markets by condition_id
                 mkt = None
-                click.echo(f"  Looking up asset {asset_id[:30]}...")
-                for param_name in ["clob_token_ids", "token_id", "id"]:
-                    try:
-                        resp = await http.get(
-                            "https://gamma-api.polymarket.com/markets",
-                            params={param_name: asset_id},
-                        )
-                        resp.raise_for_status()
-                        data = resp.json()
-                        if data:
-                            mkt = data[0] if isinstance(data, list) else data
-                            click.echo(f"    Found via {param_name}: {mkt.get('question', '?')[:50]}")
-                            break
-                        else:
-                            click.echo(f"    {param_name}: empty response")
-                    except Exception as e:
-                        click.echo(f"    {param_name}: error {e}")
-                        continue
+                try:
+                    resp = await http.get(
+                        f"https://clob.polymarket.com/markets/{cond_id}",
+                    )
+                    resp.raise_for_status()
+                    mkt = resp.json()
+                except Exception:
+                    pass
 
                 if not mkt:
-                    click.echo(f"    SKIPPED: no market found")
                     continue
 
                 # Check if market is closed/resolved
-                closed_raw = mkt.get("closed", "")
-                closed = str(closed_raw).lower() == "true"
+                closed = mkt.get("closed") is True or str(mkt.get("closed", "")).lower() == "true"
                 if not closed:
-                    click.echo(f"    SKIPPED: not closed (closed={closed_raw!r})")
                     continue
 
-                condition_id = mkt.get("conditionId", "")
+                condition_id = mkt.get("condition_id", "") or mkt.get("conditionId", "")
                 if not condition_id:
-                    click.echo(f"  Skipping {mkt.get('question', asset_id[:20])}: no conditionId")
                     continue
 
-                # Determine outcome prices
-                outcome_prices_raw = mkt.get("outcomePrices", "[]")
-                if isinstance(outcome_prices_raw, str):
-                    try:
-                        outcome_prices = _json.loads(outcome_prices_raw)
-                    except Exception:
-                        outcome_prices = []
-                else:
-                    outcome_prices = outcome_prices_raw
+                neg_risk = mkt.get("neg_risk") is True or str(mkt.get("neg_risk", "")).lower() == "true"
 
-                # Determine YES/NO side
-                clob_ids = mkt.get("clobTokenIds", [])
-                if isinstance(clob_ids, str):
-                    clob_ids = _json.loads(clob_ids)
+                # Build token_id → outcome mapping from CLOB tokens array
+                tokens = mkt.get("tokens", [])
+                token_map: dict[str, str] = {}
+                clob_ids: list[str] = []
+                for tok in tokens:
+                    tid = tok.get("token_id", "")
+                    outcome = tok.get("outcome", "")
+                    if tid:
+                        token_map[tid] = outcome.upper()  # "Yes" → "YES"
+                        clob_ids.append(tid)
 
-                token_side = ""
-                if len(clob_ids) >= 2:
-                    if asset_id == clob_ids[0]:
-                        token_side = "YES"
-                    elif asset_id == clob_ids[1]:
-                        token_side = "NO"
+                for asset_id, pos in assets:
+                    token_side = token_map.get(asset_id, "")
 
-                # Check neg risk
-                neg_risk = str(mkt.get("negRisk", "")).lower() == "true"
-
-                redeemable.append({
-                    "asset_id": asset_id,
-                    "question": mkt.get("question", ""),
-                    "condition_id": condition_id,
-                    "token_side": token_side,
-                    "neg_risk": neg_risk,
-                    "clob_ids": clob_ids,
-                    "outcome_prices": outcome_prices,
-                    "size": pos["size"],
-                })
+                    redeemable.append({
+                        "asset_id": asset_id,
+                        "question": mkt.get("question", ""),
+                        "condition_id": condition_id,
+                        "token_side": token_side,
+                        "neg_risk": neg_risk,
+                        "clob_ids": clob_ids,
+                        "outcome_prices": [],
+                        "size": pos["size"],
+                    })
 
         if not redeemable:
             click.echo("No resolved positions found to redeem.")

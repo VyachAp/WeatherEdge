@@ -325,21 +325,20 @@ async def enrich_trades_with_markets(trades: list[dict]) -> dict[str, dict]:
 
     async with httpx.AsyncClient(timeout=15) as http:
         for cid in condition_ids:
+            # CLOB API reliably resolves by condition_id (works for neg-risk)
             try:
                 resp = await http.get(
-                    f"{GAMMA_BASE}/markets",
-                    params={"clob_token_ids": cid},
+                    f"https://clob.polymarket.com/markets/{cid}",
                 )
                 resp.raise_for_status()
-                data = resp.json()
-                if data:
-                    mkt = data[0] if isinstance(data, list) else data
+                mkt = resp.json()
+                if mkt and "condition_id" in mkt:
                     markets[cid] = mkt
                     continue
             except Exception:
                 pass
 
-            # Fallback: try condition_id param
+            # Fallback: Gamma API
             try:
                 resp = await http.get(
                     f"{GAMMA_BASE}/markets",
