@@ -16,7 +16,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import httpx
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from src.config import settings
@@ -335,7 +335,7 @@ async def poll_and_store(icao: str, session: Any) -> WxObservation | None:
     # Persist to DB
     from src.db.models import WxObservation as WxObservationModel
 
-    row = WxObservationModel(
+    values = dict(
         station_icao=obs.station_icao,
         valid_time_utc=obs.valid_time_utc,
         valid_time_local=obs.valid_time_local,
@@ -359,11 +359,13 @@ async def poll_and_store(icao: str, session: Any) -> WxObservation | None:
         visibility_km=obs.visibility_km,
         uv_index=obs.uv_index,
     )
-    session.add(row)
-    try:
-        await session.flush()
-    except IntegrityError:
-        await session.rollback()
+    stmt = (
+        pg_insert(WxObservationModel)
+        .values(**values)
+        .on_conflict_do_nothing(constraint="uq_wx_station_time")
+    )
+    result = await session.execute(stmt)
+    if result.rowcount == 0:
         logger.debug("WX dup skipped %s valid=%s", icao, obs.valid_time_local)
         return None
 

@@ -987,7 +987,7 @@ def bet_portfolio(history: bool) -> None:
         async with httpx.AsyncClient(timeout=15) as http:
             for asset_id in positions:
                 # Look up market by clob_token_ids (the asset_id IS the token_id)
-                for param_name in ["clob_token_ids", "id"]:
+                for param_name in ["clob_token_ids", "token_id", "id"]:
                     try:
                         resp = await http.get(
                             "https://gamma-api.polymarket.com/markets",
@@ -1127,7 +1127,7 @@ def bet_redeem(redeem_all: bool, skip_confirm: bool) -> None:
         async with httpx.AsyncClient(timeout=15) as http:
             for asset_id, pos in positions.items():
                 mkt = None
-                for param_name in ["clob_token_ids", "id"]:
+                for param_name in ["clob_token_ids", "token_id", "id"]:
                     try:
                         resp = await http.get(
                             "https://gamma-api.polymarket.com/markets",
