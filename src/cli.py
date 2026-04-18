@@ -1127,6 +1127,7 @@ def bet_redeem(redeem_all: bool, skip_confirm: bool) -> None:
         async with httpx.AsyncClient(timeout=15) as http:
             for asset_id, pos in positions.items():
                 mkt = None
+                click.echo(f"  Looking up asset {asset_id[:30]}...")
                 for param_name in ["clob_token_ids", "token_id", "id"]:
                     try:
                         resp = await http.get(
@@ -1137,16 +1138,23 @@ def bet_redeem(redeem_all: bool, skip_confirm: bool) -> None:
                         data = resp.json()
                         if data:
                             mkt = data[0] if isinstance(data, list) else data
+                            click.echo(f"    Found via {param_name}: {mkt.get('question', '?')[:50]}")
                             break
-                    except Exception:
+                        else:
+                            click.echo(f"    {param_name}: empty response")
+                    except Exception as e:
+                        click.echo(f"    {param_name}: error {e}")
                         continue
 
                 if not mkt:
+                    click.echo(f"    SKIPPED: no market found")
                     continue
 
                 # Check if market is closed/resolved
-                closed = str(mkt.get("closed", "")).lower() == "true"
+                closed_raw = mkt.get("closed", "")
+                closed = str(closed_raw).lower() == "true"
                 if not closed:
+                    click.echo(f"    SKIPPED: not closed (closed={closed_raw!r})")
                     continue
 
                 condition_id = mkt.get("conditionId", "")
