@@ -175,14 +175,15 @@ def extract_token_ids(market: dict) -> tuple[str, str] | None:
 # ---------------------------------------------------------------------------
 
 
-async def get_usdc_balance(private_key: str) -> tuple[float, float]:
-    """Check on-chain USDC.e and native USDC balances.
+async def get_usdc_balance(private_key: str) -> tuple[float, float, float]:
+    """Check on-chain pUSD, USDC.e, and native USDC balances.
 
-    Returns (usdc_e_usd, native_usdc_usd).
+    Returns (pusd_usd, usdc_e_usd, native_usdc_usd).
     """
     from eth_account import Account
     from web3 import Web3
 
+    PUSD = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
     USDC_E = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
     USDC_NATIVE = "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359"
     BAL_ABI = [
@@ -205,6 +206,9 @@ async def get_usdc_balance(private_key: str) -> tuple[float, float]:
         )
     )
 
+    pusd = w3.eth.contract(
+        address=Web3.to_checksum_address(PUSD), abi=BAL_ABI
+    )
     usdc_e = w3.eth.contract(
         address=Web3.to_checksum_address(USDC_E), abi=BAL_ABI
     )
@@ -212,10 +216,11 @@ async def get_usdc_balance(private_key: str) -> tuple[float, float]:
         address=Web3.to_checksum_address(USDC_NATIVE), abi=BAL_ABI
     )
 
+    pusd_bal = pusd.functions.balanceOf(addr).call() / 1e6
     usdc_e_bal = usdc_e.functions.balanceOf(addr).call() / 1e6
     usdc_n_bal = usdc_n.functions.balanceOf(addr).call() / 1e6
 
-    return (usdc_e_bal, usdc_n_bal)
+    return (pusd_bal, usdc_e_bal, usdc_n_bal)
 
 
 # ---------------------------------------------------------------------------

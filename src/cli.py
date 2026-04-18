@@ -595,7 +595,8 @@ def bet_place(market: str, side: str, amount: float, skip_confirm: bool, ignore_
 
         # --- Check USDC balance ---
         click.echo("Checking wallet balance...")
-        usdc_e, usdc_native = await get_usdc_balance(settings.POLYMARKET_PRIVATE_KEY)
+        pusd, usdc_e, usdc_native = await get_usdc_balance(settings.POLYMARKET_PRIVATE_KEY)
+        click.echo(f"  pUSD:        ${pusd:.2f}")
         click.echo(f"  USDC.e:      ${usdc_e:.2f}")
         click.echo(f"  Native USDC: ${usdc_native:.2f}")
 
@@ -908,8 +909,9 @@ def bet_portfolio(history: bool) -> None:
 
         # --- Wallet balance ---
         click.echo("Fetching wallet balance...")
-        usdc_e, usdc_native = await get_usdc_balance(settings.POLYMARKET_PRIVATE_KEY)
+        pusd, usdc_e, usdc_native = await get_usdc_balance(settings.POLYMARKET_PRIVATE_KEY)
         click.echo(f"\n=== Wallet ===")
+        click.echo(f"  pUSD:        ${pusd:.2f}")
         click.echo(f"  USDC.e:      ${usdc_e:.2f}")
         if usdc_native > 0:
             click.echo(f"  Native USDC: ${usdc_native:.2f}")
@@ -1198,7 +1200,7 @@ def bet_redeem(redeem_all: bool, skip_confirm: bool) -> None:
 
         CTF_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
         NEG_RISK_ADAPTER_ADDRESS = "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296"
-        USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+        PUSD_ADDRESS = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
 
         CTF_REDEEM_ABI = [
             {
@@ -1363,9 +1365,9 @@ def bet_redeem(redeem_all: bool, skip_confirm: bool) -> None:
                         index_sets,
                     ).build_transaction({"from": address, "gasPrice": gas_price})
                 else:
-                    usdc_addr = Web3.to_checksum_address(USDC_ADDRESS)
+                    pusd_addr = Web3.to_checksum_address(PUSD_ADDRESS)
                     tx = ctf.functions.redeemPositions(
-                        usdc_addr,
+                        pusd_addr,
                         PARENT_COLLECTION_ID,
                         condition_id_bytes,
                         index_sets,
@@ -1384,7 +1386,8 @@ def bet_redeem(redeem_all: bool, skip_confirm: bool) -> None:
         # --- Final balance ---
         click.echo(f"\n=== Results ===")
         click.echo(f"  Redeemed: {success_count}/{len(to_redeem)} positions")
-        usdc_e, usdc_native = await get_usdc_balance(settings.POLYMARKET_PRIVATE_KEY)
+        pusd, usdc_e, usdc_native = await get_usdc_balance(settings.POLYMARKET_PRIVATE_KEY)
+        click.echo(f"  pUSD balance:   ${pusd:.2f}")
         click.echo(f"  USDC.e balance: ${usdc_e:.2f}")
         if usdc_native > 0:
             click.echo(f"  Native USDC:    ${usdc_native:.2f}")
