@@ -16,6 +16,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import httpx
+from sqlalchemy.exc import IntegrityError
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from src.config import settings
@@ -359,7 +360,12 @@ async def poll_and_store(icao: str, session: Any) -> WxObservation | None:
         uv_index=obs.uv_index,
     )
     session.add(row)
-    await session.flush()
+    try:
+        await session.flush()
+    except IntegrityError:
+        await session.rollback()
+        logger.debug("WX dup skipped %s valid=%s", icao, obs.valid_time_local)
+        return None
 
     logger.debug(
         "WX new obs %s: temp=%.1f°C valid=%s",
