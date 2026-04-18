@@ -1197,8 +1197,8 @@ def bet_redeem(redeem_all: bool, skip_confirm: bool) -> None:
         ]
 
         CTF_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
+        NEG_RISK_ADAPTER_ADDRESS = "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296"
         USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
-        NEG_RISK_ADAPTER = "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296"
 
         CTF_REDEEM_ABI = [
             {
@@ -1215,6 +1215,19 @@ def bet_redeem(redeem_all: bool, skip_confirm: bool) -> None:
                 "inputs": [
                     {"name": "collateralToken", "type": "address"},
                     {"name": "parentCollectionId", "type": "bytes32"},
+                    {"name": "conditionId", "type": "bytes32"},
+                    {"name": "indexSets", "type": "uint256[]"},
+                ],
+                "name": "redeemPositions",
+                "outputs": [],
+                "stateMutability": "nonpayable",
+                "type": "function",
+            },
+        ]
+
+        NEG_RISK_ADAPTER_ABI = [
+            {
+                "inputs": [
                     {"name": "conditionId", "type": "bytes32"},
                     {"name": "indexSets", "type": "uint256[]"},
                 ],
@@ -1252,8 +1265,9 @@ def bet_redeem(redeem_all: bool, skip_confirm: bool) -> None:
         ctf = w3.eth.contract(
             address=Web3.to_checksum_address(CTF_ADDRESS), abi=CTF_REDEEM_ABI
         )
-        neg_risk_contract = w3.eth.contract(
-            address=Web3.to_checksum_address(NEG_RISK_ADAPTER), abi=CTF_REDEEM_ABI
+        neg_risk_adapter = w3.eth.contract(
+            address=Web3.to_checksum_address(NEG_RISK_ADAPTER_ADDRESS),
+            abi=NEG_RISK_ADAPTER_ABI,
         )
 
         # --- Check on-chain balances ---
@@ -1341,17 +1355,21 @@ def bet_redeem(redeem_all: bool, skip_confirm: bool) -> None:
             else:
                 index_sets = [1, 2]  # Try both
 
-            contract = neg_risk_contract if item["neg_risk"] else ctf
-            usdc_addr = Web3.to_checksum_address(USDC_ADDRESS)
-
             click.echo(f"\n  Redeeming: {question}...")
             try:
-                tx = contract.functions.redeemPositions(
-                    usdc_addr,
-                    PARENT_COLLECTION_ID,
-                    condition_id_bytes,
-                    index_sets,
-                ).build_transaction({"from": address, "gasPrice": gas_price})
+                if item["neg_risk"]:
+                    tx = neg_risk_adapter.functions.redeemPositions(
+                        condition_id_bytes,
+                        index_sets,
+                    ).build_transaction({"from": address, "gasPrice": gas_price})
+                else:
+                    usdc_addr = Web3.to_checksum_address(USDC_ADDRESS)
+                    tx = ctf.functions.redeemPositions(
+                        usdc_addr,
+                        PARENT_COLLECTION_ID,
+                        condition_id_bytes,
+                        index_sets,
+                    ).build_transaction({"from": address, "gasPrice": gas_price})
                 receipt = send_tx(tx)
                 status = "OK" if receipt["status"] == 1 else "FAILED"
                 tx_hash = receipt["transactionHash"].hex()[:16]
