@@ -537,14 +537,28 @@ class Alerter:
         station_icao: str,
         db_peak_f: float,
         wu_latest_hour: str | None,
+        peak_time_local: str | None = None,
     ) -> None:
         """Alert that WU data hasn't caught up to peak time yet."""
         e = _escape_md2
         latest = wu_latest_hour or "n/a"
 
+        # Derive current local time at the station from peak_time_local offset
+        local_now_str = "n/a"
+        if peak_time_local and "T" in peak_time_local:
+            try:
+                # Format: "2026-04-19T15:23:00-0500" or "+0800"
+                dt = datetime.fromisoformat(peak_time_local)
+                utc_now = datetime.now(timezone.utc)
+                local_now = utc_now.astimezone(dt.tzinfo)
+                local_now_str = local_now.strftime("%b %d, %-I:%M %p")
+            except (ValueError, TypeError):
+                pass
+
         text = (
             f"\\u23f3 *WU Waiting*  `{e(station_icao)}`\n"
             f"\n"
+            f"Local now: {e(local_now_str)}\n"
             f"DB Peak: {e(f'{db_peak_f:.1f}°F')}\n"
             f"WU data available up to: {e(latest)}\n"
             f"Waiting for WU UI to populate\\.\\.\\."

@@ -341,6 +341,7 @@ async def job_wx_rapid_pipeline() -> None:
                             if not sc._wu_waiting_alerted:
                                 await alerter.send_wu_waiting_alert(
                                     icao, sc.peak_temp_f, sc.wu_latest_hour,
+                                    sc.peak_time_local,
                                 )
                                 sc._wu_waiting_alerted = True
                     except Exception:
