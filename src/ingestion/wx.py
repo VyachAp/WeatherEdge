@@ -103,6 +103,17 @@ def _c_to_f(temp_c: float | None) -> float | None:
     return temp_c * 9.0 / 5.0 + 32.0
 
 
+def _f_to_c(temp_f: float | None) -> float | None:
+    if temp_f is None:
+        return None
+    return (temp_f - 32.0) * 5.0 / 9.0
+
+
+def _is_us_station(icao: str) -> bool:
+    """US ICAO codes start with K (CONUS) or P (Pacific/Alaska/Hawaii)."""
+    return len(icao) == 4 and icao[0] in ("K", "P")
+
+
 @dataclass(frozen=True)
 class WxObservation:
     """Parsed Weather Company v3 observation."""
@@ -110,6 +121,7 @@ class WxObservation:
     station_icao: str
     valid_time_utc: datetime
     valid_time_local: str  # raw string, used as dedup key
+    units: str = "m"  # "m" (metric) or "e" (imperial/English)
     temp_c: float | None = None
     dewpoint_c: float | None = None
     humidity: float | None = None
@@ -132,6 +144,8 @@ class WxObservation:
 
     @property
     def temp_f(self) -> float | None:
+        if self.units == "e":
+            return self.temp_c  # Already Fahrenheit
         return _c_to_f(self.temp_c)
 
 
@@ -222,14 +236,14 @@ def _make_client() -> httpx.AsyncClient:
     retry=retry_if_exception_type((httpx.HTTPStatusError, httpx.TransportError)),
     reraise=True,
 )
-async def _wx_get_json(client: httpx.AsyncClient, icao: str) -> dict[str, Any] | None:
+async def _wx_get_json(client: httpx.AsyncClient, icao: str, units: str = "m") -> dict[str, Any] | None:
     await _wx_limiter.acquire()
     resp = await client.get(
         _API_BASE,
         params={
             "apiKey": settings.WX_API_KEY,
             "icaoCode": icao,
-            "units": "m",
+            "units": units,
             "format": "json",
             "language": "en-US",
         },
@@ -243,7 +257,7 @@ async def _wx_get_json(client: httpx.AsyncClient, icao: str) -> dict[str, Any] |
 # ---------------------------------------------------------------------------
 
 
-def _parse_observation(icao: str, data: dict[str, Any]) -> WxObservation | None:
+def _parse_observation(icao: str, data: dict[str, Any], units: str = "m") -> WxObservation | None:
     """Parse a v3 observation JSON into WxObservation."""
     valid_utc_epoch = data.get("validTimeUtc")
     valid_local = data.get("validTimeLocal")
@@ -259,6 +273,7 @@ def _parse_observation(icao: str, data: dict[str, Any]) -> WxObservation | None:
         station_icao=icao,
         valid_time_utc=valid_dt,
         valid_time_local=valid_local,
+        units=units,
         temp_c=data.get("temperature"),
         dewpoint_c=data.get("temperatureDewPoint"),
         humidity=data.get("relativeHumidity"),
@@ -298,9 +313,11 @@ async def fetch_wx_current(icao: str) -> WxObservation | None:
     if cached is not None:
         return cached
 
+    units = "e" if _is_us_station(icao) else "m"
+
     try:
         async with _make_client() as client:
-            data = await _wx_get_json(client, icao)
+            data = await _wx_get_json(client, icao, units=units)
     except (httpx.HTTPError, _RateLimitExhausted) as exc:
         logger.warning("WX fetch failed for %s: %s", icao, exc)
         return None
@@ -311,7 +328,7 @@ async def fetch_wx_current(icao: str) -> WxObservation | None:
     if not data:
         return None
 
-    obs = _parse_observation(icao, data)
+    obs = _parse_observation(icao, data, units=units)
     if obs is None:
         return None
 
@@ -337,6 +354,7 @@ async def poll_and_store(icao: str, session: Any) -> WxObservation | None:
 
     values = dict(
         station_icao=obs.station_icao,
+        units=obs.units,
         valid_time_utc=obs.valid_time_utc,
         valid_time_local=obs.valid_time_local,
         temp_c=obs.temp_c,
@@ -410,8 +428,9 @@ def _compute_rate(history: list[WxObservation]) -> float | None:
 
     t0 = history[0].valid_time_utc
     for obs in history:
-        if obs.temp_c is not None:
-            temps_f.append(obs.temp_c * 9.0 / 5.0 + 32.0)
+        tf = obs.temp_f
+        if tf is not None:
+            temps_f.append(tf)
             times_min.append((obs.valid_time_utc - t0).total_seconds() / 60.0)
 
     if len(temps_f) < 2:
@@ -450,7 +469,7 @@ def analyze_trend(icao: str) -> TrendAnalysis | None:
     Returns None if insufficient data.
     """
     history = get_buffer_history(icao)
-    temps_f = [(obs, obs.temp_c * 9.0 / 5.0 + 32.0) for obs in history if obs.temp_c is not None]
+    temps_f = [(obs, obs.temp_f) for obs in history if obs.temp_f is not None]
 
     if len(temps_f) < 3:
         return None

@@ -226,6 +226,7 @@ class WxObservation(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     station_icao = Column(String, nullable=False)
+    units = Column(String, nullable=False, server_default="m")  # "m" (metric) or "e" (imperial)
     valid_time_utc = Column(DateTime(timezone=True), nullable=False)
     valid_time_local = Column(String, nullable=False)  # Dedup key
     temp_c = Column(Float)

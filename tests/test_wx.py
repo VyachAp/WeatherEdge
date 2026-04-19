@@ -14,6 +14,8 @@ from src.ingestion.wx import (
     _buffer_append,
     _c_to_f,
     _compute_rate,
+    _f_to_c,
+    _is_us_station,
     _observation_buffer,
     _parse_observation,
     analyze_trend,
@@ -89,6 +91,7 @@ def _make_obs(
     temp_c: float = 20.0,
     minutes_ago: int = 0,
     valid_time_local: str | None = None,
+    units: str = "m",
     **kwargs,
 ) -> WxObservation:
     """Helper to create a WxObservation with defaults."""
@@ -98,6 +101,7 @@ def _make_obs(
         station_icao=icao,
         valid_time_utc=vt,
         valid_time_local=vtl,
+        units=units,
         temp_c=temp_c,
         dewpoint_c=kwargs.get("dewpoint_c", 5.0),
         humidity=kwargs.get("humidity", 38),
@@ -137,6 +141,7 @@ class TestParsing:
         obs = _parse_observation("EDDM", SAMPLE_WX_RESPONSE)
         assert obs is not None
         assert obs.station_icao == "EDDM"
+        assert obs.units == "m"
         assert obs.temp_c == 20
         assert obs.humidity == 38
         assert obs.wind_speed_ms == 10
@@ -401,3 +406,98 @@ class TestConversion:
         assert _c_to_f(100) == 212.0
         assert _c_to_f(20) == pytest.approx(68.0)
         assert _c_to_f(None) is None
+
+    def test_f_to_c(self):
+        assert _f_to_c(32.0) == pytest.approx(0.0)
+        assert _f_to_c(212.0) == pytest.approx(100.0)
+        assert _f_to_c(68.0) == pytest.approx(20.0)
+        assert _f_to_c(None) is None
+
+
+# ===================================================================
+# US station detection
+# ===================================================================
+
+
+class TestIsUsStation:
+    def test_k_prefix_conus(self):
+        assert _is_us_station("KJFK") is True
+        assert _is_us_station("KORD") is True
+        assert _is_us_station("KLAX") is True
+
+    def test_p_prefix_pacific(self):
+        assert _is_us_station("PHNL") is True
+        assert _is_us_station("PANC") is True
+
+    def test_international_stations(self):
+        assert _is_us_station("EDDM") is False
+        assert _is_us_station("EGLL") is False
+        assert _is_us_station("LFPG") is False
+        assert _is_us_station("RKSI") is False
+
+    def test_short_codes(self):
+        assert _is_us_station("KJF") is False
+        assert _is_us_station("") is False
+
+
+# ===================================================================
+# Imperial units handling
+# ===================================================================
+
+
+class TestImperialUnits:
+    def test_temp_f_metric_converts(self):
+        obs = _make_obs(temp_c=20.0, units="m")
+        assert obs.temp_f == pytest.approx(68.0)
+
+    def test_temp_f_imperial_no_conversion(self):
+        obs = _make_obs(temp_c=68.0, units="e")  # temp_c holds °F
+        assert obs.temp_f == 68.0  # No conversion applied
+
+    def test_temp_f_none_both_units(self):
+        assert _make_obs(temp_c=None, units="m").temp_f is None
+        assert _make_obs(temp_c=None, units="e").temp_f is None
+
+    def test_parse_with_imperial_units(self):
+        obs = _parse_observation("KJFK", SAMPLE_WX_RESPONSE, units="e")
+        assert obs is not None
+        assert obs.units == "e"
+        assert obs.temp_c == 20  # Raw API value stored as-is
+
+    def test_parse_defaults_to_metric(self):
+        obs = _parse_observation("EDDM", SAMPLE_WX_RESPONSE)
+        assert obs is not None
+        assert obs.units == "m"
+
+    def test_trend_analysis_imperial(self):
+        """Trend analysis with imperial observations should not double-convert."""
+        for i in range(6):
+            _buffer_append(_make_obs(
+                icao="KJFK",
+                temp_c=65.0 + i * 1.0,  # Already in °F
+                valid_time_local=f"2026-04-17 12:{i * 5:02d}:00",
+                minutes_ago=25 - i * 5,
+                units="e",
+            ))
+
+        trend = analyze_trend("KJFK")
+        assert trend is not None
+        assert trend.is_rising is True
+        # Values should be in °F range, not double-converted
+        assert 60.0 < trend.current_temp_f < 80.0
+        assert 60.0 < trend.observed_max_f < 80.0
+
+    def test_compute_rate_imperial(self):
+        """Rate computation with imperial data should produce sensible F/hour."""
+        history = [
+            _make_obs(icao="KJFK", temp_c=65.0, minutes_ago=20, units="e"),
+            _make_obs(icao="KJFK", temp_c=66.0, minutes_ago=15, units="e"),
+            _make_obs(icao="KJFK", temp_c=67.0, minutes_ago=10, units="e"),
+            _make_obs(icao="KJFK", temp_c=68.0, minutes_ago=5, units="e"),
+            _make_obs(icao="KJFK", temp_c=69.0, minutes_ago=0, units="e"),
+        ]
+        rate = _compute_rate(history)
+        assert rate is not None
+        assert rate > 0
+        # 4°F over 20 min = 12°F/hour
+        assert rate == pytest.approx(12.0, abs=1.0)
