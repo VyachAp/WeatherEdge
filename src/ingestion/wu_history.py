@@ -81,42 +81,78 @@ def _parse_summary_table(rows_text: list[list[str]]) -> dict[str, float | None]:
 
     Each row is [label, actual, historic_avg, record] but some rows
     are section headers like 'Temperature (°F)' with no data columns.
+    Detects metric units from the header and converts to imperial.
     """
     result: dict[str, float | None] = {}
+    metric = False
     for cells in rows_text:
         if len(cells) < 2:
+            # Section header row — detect metric from "Temperature (°C)"
+            if cells and "°c" in cells[0].lower():
+                metric = True
             continue
         label = cells[0].strip().lower()
         actual = cells[1].strip() if len(cells) > 1 else ""
 
         if label.startswith("high temp"):
-            result["high_f"] = _parse_num(actual)
+            val = _parse_num(actual)
+            result["high_f"] = _c_to_f(val) if metric else val
         elif label.startswith("low temp"):
-            result["low_f"] = _parse_num(actual)
+            val = _parse_num(actual)
+            result["low_f"] = _c_to_f(val) if metric else val
         elif label.startswith("day average"):
-            result["avg_f"] = _parse_num(actual)
+            val = _parse_num(actual)
+            result["avg_f"] = _c_to_f(val) if metric else val
         elif label.startswith("precipitation") and "past" in label:
-            result["precip_in"] = _parse_num(actual)
+            val = _parse_num(actual)
+            result["precip_in"] = _mm_to_in(val) if metric else val
         elif label == "high" and "dew_point_high_f" not in result:
-            result["dew_point_high_f"] = _parse_num(actual)
+            val = _parse_num(actual)
+            result["dew_point_high_f"] = _c_to_f(val) if metric else val
         elif label == "low" and "dew_point_low_f" not in result:
-            result["dew_point_low_f"] = _parse_num(actual)
+            val = _parse_num(actual)
+            result["dew_point_low_f"] = _c_to_f(val) if metric else val
         elif label == "average" and "dew_point_avg_f" not in result:
-            result["dew_point_avg_f"] = _parse_num(actual)
+            val = _parse_num(actual)
+            result["dew_point_avg_f"] = _c_to_f(val) if metric else val
         elif label.startswith("max wind"):
-            result["wind_speed_max_mph"] = _parse_num(actual)
+            val = _parse_num(actual)
+            result["wind_speed_max_mph"] = _kmh_to_mph(val) if metric else val
         elif label.startswith("visibility"):
             result["visibility_mi"] = _parse_num(actual)
         elif label.startswith("sea level pressure"):
-            result["pressure_in"] = _parse_num(actual)
+            val = _parse_num(actual)
+            result["pressure_in"] = _hpa_to_inhg(val) if metric else val
     return result
 
 
-def _parse_hourly_row(cells: list[str]) -> WuHourlyReading | None:
+def _c_to_f(val: float | None) -> float | None:
+    """Convert Celsius to Fahrenheit."""
+    return val * 9.0 / 5.0 + 32.0 if val is not None else None
+
+
+def _kmh_to_mph(val: float | None) -> float | None:
+    """Convert km/h to mph."""
+    return val / 1.609344 if val is not None else None
+
+
+def _hpa_to_inhg(val: float | None) -> float | None:
+    """Convert hPa (mbar) to inches of mercury."""
+    return val / 33.8639 if val is not None else None
+
+
+def _mm_to_in(val: float | None) -> float | None:
+    """Convert mm to inches."""
+    return val / 25.4 if val is not None else None
+
+
+def _parse_hourly_row(cells: list[str], *, metric: bool = False) -> WuHourlyReading | None:
     """Parse a single hourly observation row.
 
     Expected columns: Time, Temp, DewPoint, Humidity, WindDir,
     WindSpeed, WindGust, Pressure, Precip, Condition.
+
+    If *metric* is True, converts °C→°F, km/h→mph, hPa→inHg, mm→in.
     """
     if len(cells) < 10:
         return None
@@ -129,16 +165,31 @@ def _parse_hourly_row(cells: list[str]) -> WuHourlyReading | None:
     if not re.match(r"\d{1,2}:\d{2}\s*[APap]", time_str):
         return None
 
+    temp = _parse_num(cells[1])
+    dew = _parse_num(cells[2])
+    wind = _parse_num(cells[5])
+    gust = _parse_num(cells[6])
+    pressure = _parse_num(cells[7])
+    precip = _parse_num(cells[8])
+
+    if metric:
+        temp = _c_to_f(temp)
+        dew = _c_to_f(dew)
+        wind = _kmh_to_mph(wind)
+        gust = _kmh_to_mph(gust)
+        pressure = _hpa_to_inhg(pressure)
+        precip = _mm_to_in(precip)
+
     return WuHourlyReading(
         time_local=time_str,
-        temp_f=_parse_num(cells[1]),
-        dew_point_f=_parse_num(cells[2]),
+        temp_f=temp,
+        dew_point_f=dew,
         humidity_pct=_parse_num(cells[3]),
         wind_dir=cells[4].strip() or None,
-        wind_mph=_parse_num(cells[5]),
-        wind_gust_mph=_parse_num(cells[6]),
-        pressure_in=_parse_num(cells[7]),
-        precip_in=_parse_num(cells[8]),
+        wind_mph=wind,
+        wind_gust_mph=gust,
+        pressure_in=pressure,
+        precip_in=precip,
         condition=cells[9].strip() or None,
     )
 
@@ -265,9 +316,28 @@ async def _scrape_page(
         summary_rows = await _extract_table_rows(tables[0])
         summary_data = _parse_summary_table(summary_rows)
 
-    # --- Parse hourly observations (second table) ---
+    # --- Parse hourly observations ---
+    # Find the hourly table by its Angular Material tbody class rather than
+    # relying on table index, which breaks when WU adds/reorders tables.
     hourly: list[WuHourlyReading] = []
-    if len(tables) >= 2:
+    hourly_tbody = await page.query_selector("tbody.mdc-data-table__content")
+    if hourly_tbody is not None:
+        # Detect metric units: check if any temperature cell contains "°C"
+        metric = False
+        temp_cell = await hourly_tbody.query_selector("td.mat-column-temperature")
+        if temp_cell:
+            temp_text = await temp_cell.inner_text()
+            if "C" in temp_text and "°" in temp_text:
+                metric = True
+                logger.debug("WU page for %s uses metric units", station_icao)
+
+        hourly_rows = await _extract_table_rows_from_tbody(hourly_tbody)
+        for row_cells in hourly_rows:
+            reading = _parse_hourly_row(row_cells, metric=metric)
+            if reading is not None:
+                hourly.append(reading)
+    elif len(tables) >= 2:
+        # Fallback to table index if the Angular Material selector fails
         hourly_rows = await _extract_table_rows(tables[1])
         for row_cells in hourly_rows:
             reading = _parse_hourly_row(row_cells)
@@ -297,6 +367,21 @@ async def _extract_table_rows(table) -> list[list[str]]:
     result: list[list[str]] = []
     for row in rows:
         cells = await row.query_selector_all("td, th")
+        cell_texts = []
+        for cell in cells:
+            text = await cell.inner_text()
+            cell_texts.append(text.strip())
+        if cell_texts:
+            result.append(cell_texts)
+    return result
+
+
+async def _extract_table_rows_from_tbody(tbody) -> list[list[str]]:
+    """Extract <tr> rows from a <tbody> element as lists of cell text."""
+    rows = await tbody.query_selector_all("tr")
+    result: list[list[str]] = []
+    for row in rows:
+        cells = await row.query_selector_all("td")
         cell_texts = []
         for cell in cells:
             text = await cell.inner_text()

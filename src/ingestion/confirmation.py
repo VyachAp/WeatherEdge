@@ -138,6 +138,13 @@ class ConfirmationTracker:
         if temp_f is None:
             return None
 
+        # Only track peaks between 10 AM and 6 PM local time
+        vtl = getattr(obs, "valid_time_local", None)
+        if vtl:
+            hm = _extract_local_hour_minute(vtl)
+            if hm is not None and (hm[0] < 10 or hm[0] >= 18):
+                return None
+
         sc = self._get_or_create(icao)
 
         # Already past monitoring — don't re-trigger
