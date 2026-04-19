@@ -18,6 +18,7 @@ from dateutil import parser as dateutil_parser
 from src.ingestion import aviation
 from src.ingestion.aviation import get_realtime_probability
 from src.ingestion.polymarket import get_active_weather_markets
+from src.config import settings
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -955,8 +956,6 @@ async def map_bracket_market(
         logger.debug("map_bracket skip %s: no aviation data", market.id)
         return None
 
-    gfs_prob = None
-    ecmwf_prob = None
 
     # --- gather aviation context ---
     aviation_ctx = None
@@ -984,8 +983,6 @@ async def map_bracket_market(
         market_id=market.id,
         question=market.question,
         market_prob=market_prob,
-        gfs_prob=gfs_prob,
-        ecmwf_prob=ecmwf_prob,
         aviation_prob=aviation_prob,
         days_to_resolution=days_to_resolution,
         hours_to_resolution=hours_to_resolution,
