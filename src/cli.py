@@ -126,6 +126,125 @@ def status() -> None:
     asyncio.run(_status())
 
 
+@main.command("verify-wu")
+@click.argument("station")
+@click.argument("date_str")
+def verify_wu(station: str, date_str: str) -> None:
+    """Compare Weather Underground history against WX API observations.
+
+    STATION is an ICAO code (e.g. KAUS, KLAX).
+    DATE_STR is a date like 2026-04-18.
+
+    Example: python -m src.cli verify-wu KAUS 2026-04-18
+    """
+
+    async def _verify() -> None:
+        from datetime import date as _date
+
+        from src.ingestion.wu_history import close_browser, fetch_wu_history
+
+        target = _date.fromisoformat(date_str)
+        icao = station.upper()
+
+        click.echo(f"Scraping Weather Underground history for {icao} on {target} ...")
+        wu = await fetch_wu_history(icao, target)
+        await close_browser()
+
+        if wu is None:
+            click.echo("Error: could not fetch WU history page.")
+            raise SystemExit(1)
+
+        # --- Daily summary ---
+        click.echo(f"\n=== WU Daily Summary ({icao} {target}) ===")
+        click.echo(f"  High:       {wu.high_f}°F" if wu.high_f is not None else "  High:       --")
+        click.echo(f"  Low:        {wu.low_f}°F" if wu.low_f is not None else "  Low:        --")
+        click.echo(f"  Average:    {wu.avg_f}°F" if wu.avg_f is not None else "  Average:    --")
+        click.echo(f"  Precip:     {wu.precip_in} in" if wu.precip_in is not None else "  Precip:     --")
+        click.echo(f"  Dew Pt Hi:  {wu.dew_point_high_f}°F" if wu.dew_point_high_f is not None else "  Dew Pt Hi:  --")
+        click.echo(f"  Dew Pt Lo:  {wu.dew_point_low_f}°F" if wu.dew_point_low_f is not None else "  Dew Pt Lo:  --")
+        click.echo(f"  Max Wind:   {wu.wind_speed_max_mph} mph" if wu.wind_speed_max_mph is not None else "  Max Wind:   --")
+        click.echo(f"  Pressure:   {wu.pressure_in} in" if wu.pressure_in is not None else "  Pressure:   --")
+
+        # --- Compare against DB observations ---
+        try:
+            from sqlalchemy import and_, func, select
+
+            from src.db.engine import async_session
+            from src.db.models import WxObservation as WxObs
+
+            async with async_session() as session:
+                # Find max/min temp for the station on the target date
+                row = (
+                    await session.execute(
+                        select(
+                            func.max(WxObs.temp_c).label("max_c"),
+                            func.min(WxObs.temp_c).label("min_c"),
+                            func.count().label("n"),
+                        ).where(
+                            and_(
+                                WxObs.station_icao == icao,
+                                func.date(WxObs.valid_time_utc) == target,
+                            )
+                        )
+                    )
+                ).one()
+
+                n = row.n
+                if n > 0:
+                    from src.ingestion.wx import _c_to_f
+
+                    api_high = _c_to_f(row.max_c)
+                    api_low = _c_to_f(row.min_c)
+
+                    from src.ingestion.wu_history import compare_wu_vs_wx
+
+                    comp = compare_wu_vs_wx(wu, api_high, api_low)
+
+                    click.echo(f"\n=== WU vs WX API ({n} observations in DB) ===")
+                    click.echo(f"  {'':15} {'WU':>8} {'API':>8} {'Delta':>8}")
+                    click.echo(f"  {'High (°F)':<15} {_fmt(comp['high_f_wu']):>8} {_fmt(comp['high_f_api']):>8} {_fmt_delta(comp['high_f_delta']):>8}")
+                    click.echo(f"  {'Low (°F)':<15} {_fmt(comp['low_f_wu']):>8} {_fmt(comp['low_f_api']):>8} {_fmt_delta(comp['low_f_delta']):>8}")
+                else:
+                    click.echo(f"\n  No WX API observations in DB for {icao} on {target}.")
+        except Exception as exc:
+            click.echo(f"\n  Could not query DB for comparison: {exc}")
+
+        # --- Hourly readings ---
+        if wu.hourly:
+            click.echo(f"\n=== WU Hourly Observations ({len(wu.hourly)} readings) ===")
+            click.echo(f"  {'Time':<10} {'Temp':>6} {'Dew':>6} {'Hum':>5} {'Wind':>5} {'Spd':>5} {'Gust':>5} {'Press':>7} {'Precip':>7}  Condition")
+            click.echo("  " + "-" * 85)
+            for h in wu.hourly:
+                click.echo(
+                    f"  {h.time_local:<10}"
+                    f" {_fmt(h.temp_f):>6}"
+                    f" {_fmt(h.dew_point_f):>6}"
+                    f" {_fmt(h.humidity_pct):>5}"
+                    f" {(h.wind_dir or ''):>5}"
+                    f" {_fmt(h.wind_mph):>5}"
+                    f" {_fmt(h.wind_gust_mph):>5}"
+                    f" {_fmt(h.pressure_in):>7}"
+                    f" {_fmt(h.precip_in):>7}"
+                    f"  {h.condition or ''}"
+                )
+
+    asyncio.run(_verify())
+
+
+def _fmt(v: float | None) -> str:
+    if v is None:
+        return "--"
+    if v == int(v):
+        return str(int(v))
+    return f"{v:.1f}"
+
+
+def _fmt_delta(v: float | None) -> str:
+    if v is None:
+        return "--"
+    return f"{v:+.1f}"
+
+
 @main.command("paper-trade")
 @click.option("--days", default=30, show_default=True, help="Simulation period in days.")
 def paper_trade(days: int) -> None:

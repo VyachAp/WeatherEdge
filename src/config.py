@@ -48,6 +48,10 @@ class Settings(BaseSettings):
     WX_RETENTION_HOURS: int = 48
     WX_PEAK_CONFIRM_MINUTES: int = 15  # Minutes of decline before declaring peak done
 
+    # Weather Underground scraping
+    WU_SCRAPE_DELAY_SECONDS: float = 3.0
+    WU_SCRAPE_TIMEOUT_MS: int = 15000
+
     # Polymarket execution
     POLYMARKET_PRIVATE_KEY: str = ""  # Polygon wallet private key; empty = dry-run
     POLYMARKET_HOST: str = "https://clob.polymarket.com"
