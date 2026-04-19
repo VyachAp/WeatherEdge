@@ -245,6 +245,28 @@ def _fmt_delta(v: float | None) -> str:
     return f"{v:+.1f}"
 
 
+@main.command("confirm-status")
+def confirm_status() -> None:
+    """Show current WU confirmation pipeline state for all tracked stations."""
+    from src.ingestion.confirmation import get_confirmation_tracker
+
+    tracker = get_confirmation_tracker()
+    stations = tracker.all_stations()
+
+    if not stations:
+        click.echo("No stations being tracked.")
+        return
+
+    for sc in stations:
+        wu = f"wu_high={sc.wu_high_f:.1f}°F" if sc.wu_high_f is not None else "wu_high=--"
+        delta = f"delta={sc.db_vs_wu_delta:+.1f}°F" if sc.db_vs_wu_delta is not None else "delta=--"
+        click.echo(
+            f"  {sc.icao}: state={sc.state.value}  peak={sc.peak_temp_f:.1f}°F  "
+            f"drops={sc.consecutive_drops}  {wu}  {delta}  "
+            f"scrapes={sc.wu_scrape_count}"
+        )
+
+
 @main.command("paper-trade")
 @click.option("--days", default=30, show_default=True, help="Simulation period in days.")
 def paper_trade(days: int) -> None:

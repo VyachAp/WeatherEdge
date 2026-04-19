@@ -485,6 +485,72 @@ class Alerter:
 
         await self._enqueue("\n".join(lines))
 
+    # -- Alert: WU_CONFIRMATION ------------------------------------------------
+
+    async def send_confirmation_alert(
+        self,
+        station_icao: str,
+        db_peak_f: float,
+        wu_high_f: float | None,
+        delta: float | None,
+        markets: list,
+    ) -> None:
+        """Alert when WU-confirmed temperature is available with market matches."""
+        e = _escape_md2
+
+        wu_str = f"{wu_high_f:.1f}°F" if wu_high_f is not None else "pending"
+        delta_str = f"Delta: {e(f'{delta:+.1f}°F')}" if delta is not None else ""
+
+        mismatch = ""
+        if delta is not None and delta > 1.0:
+            mismatch = (
+                f"\n\\u26a0\\ufe0f *MISMATCH*: DB peak higher than WU by "
+                f"{e(f'{delta:.1f}')}\\u00b0F"
+            )
+
+        lines = [
+            f"\\u2705 *WU Confirmation*  `{e(station_icao)}`",
+            "",
+            f"DB Peak: {e(f'{db_peak_f:.1f}°F')}",
+            f"WU High: {e(wu_str)}",
+            delta_str,
+            mismatch,
+        ]
+
+        if markets:
+            lines.append("")
+            lines.append("*Matching Markets:*")
+            for mm in markets[:5]:
+                m = getattr(mm, "market", mm)
+                q = (getattr(m, "question", None) or "?")[:55]
+                yes_price = getattr(m, "current_yes_price", None)
+                yes = f"{yes_price:.0%}" if yes_price else "?"
+                dist = getattr(mm, "distance_to_threshold", None)
+                dist_str = f", dist: {e(f'{dist:+.1f}°F')}" if dist is not None else ""
+                lines.append(f"  {e(q)}")
+                lines.append(f"    YES: {yes}{dist_str}")
+
+        await self._enqueue("\n".join(lines))
+
+    async def send_wu_waiting_alert(
+        self,
+        station_icao: str,
+        db_peak_f: float,
+        wu_latest_hour: str | None,
+    ) -> None:
+        """Alert that WU data hasn't caught up to peak time yet."""
+        e = _escape_md2
+        latest = wu_latest_hour or "n/a"
+
+        text = (
+            f"\\u23f3 *WU Waiting*  `{e(station_icao)}`\n"
+            f"\n"
+            f"DB Peak: {e(f'{db_peak_f:.1f}°F')}\n"
+            f"WU data available up to: {e(latest)}\n"
+            f"Waiting for WU UI to populate\\.\\.\\."
+        )
+        await self._enqueue(text)
+
     # -- Callback handler -----------------------------------------------------
 
     async def _handle_callback(
