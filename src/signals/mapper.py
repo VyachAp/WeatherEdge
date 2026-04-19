@@ -545,6 +545,26 @@ def icao_for_location(location: str) -> str | None:
     return None
 
 
+# ---------------------------------------------------------------------------
+# Reverse lookup: ICAO → city names
+# ---------------------------------------------------------------------------
+
+_ICAO_TO_CITIES: dict[str, list[str]] | None = None
+
+
+def cities_for_icao(icao: str) -> list[str]:
+    """Return all city names that map to the given ICAO station code.
+
+    Lazily inverts the CITY_ICAO dict on first call.
+    """
+    global _ICAO_TO_CITIES
+    if _ICAO_TO_CITIES is None:
+        _ICAO_TO_CITIES = {}
+        for city, code in CITY_ICAO.items():
+            _ICAO_TO_CITIES.setdefault(code, []).append(city)
+    return _ICAO_TO_CITIES.get(icao.upper(), [])
+
+
 def geocode(location: str) -> tuple[float, float] | None:
     """Resolve a location name to (lat, lon) via static lookup.
 

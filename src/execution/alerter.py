@@ -451,6 +451,40 @@ class Alerter:
         )
         await self._enqueue(text)
 
+    # -- Alert: MARKET_DISCOVERY ----------------------------------------------
+
+    async def send_market_discovery(
+        self,
+        station_icao: str,
+        current_temp_f: float,
+        markets: list,
+    ) -> None:
+        """Alert when backward resolution discovers markets near current obs."""
+        if not markets:
+            return
+
+        e = _escape_md2
+        lines = [
+            f"\U0001f50d *Market Discovery*  `{e(station_icao)}`  {current_temp_f:.1f}F",
+            "",
+        ]
+
+        for m in markets[:5]:
+            q = (m.question or "?")[:60]
+            yes = f"{m.current_yes_price:.0%}" if m.current_yes_price else "?"
+            thresh = f"{m.parsed_threshold:.0f}F" if m.parsed_threshold is not None else "?"
+            dist = ""
+            if m.parsed_threshold is not None:
+                d = current_temp_f - m.parsed_threshold
+                dist = f", {d:+.1f}F"
+            lines.append(f"  {e(q)}")
+            lines.append(f"    YES: {yes}  thresh: {thresh}{dist}")
+
+        if len(markets) > 5:
+            lines.append(f"\n_\\+{len(markets) - 5} more_")
+
+        await self._enqueue("\n".join(lines))
+
     # -- Callback handler -----------------------------------------------------
 
     async def _handle_callback(

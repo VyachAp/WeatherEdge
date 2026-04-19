@@ -810,6 +810,101 @@ def bet_search(query: str, limit: int) -> None:
     asyncio.run(_search())
 
 
+@bet.command("find")
+@click.option("--city", default=None, help="City name (e.g. Phoenix, Austin).")
+@click.option("--station", default=None, help="ICAO station code (e.g. KPHX, KAUS).")
+@click.option("--date", "date_str", default=None, help="Date filter (e.g. 'April 19').")
+@click.option("--variable", default=None, help="Weather variable (temperature, precipitation, wind_speed).")
+@click.option("--hours", default=72.0, show_default=True, help="Look-ahead window in hours.")
+def bet_find(city: str | None, station: str | None, date_str: str | None, variable: str | None, hours: float) -> None:
+    """Find Polymarket markets matching weather location/station (DB lookup).
+
+    Much faster than 'bet search' — queries the local markets database
+    populated by the 15-minute scanner instead of paginating the Gamma API.
+
+    Examples:
+      bet find --city Phoenix
+      bet find --city Austin --date "April 19"
+      bet find --station KPHX
+      bet find --city Denver --variable temperature
+    """
+
+    async def _find() -> None:
+        from src.db.engine import async_session
+        from src.signals.reverse_lookup import (
+            find_markets_for_city,
+            find_markets_for_observation,
+            find_markets_for_station,
+        )
+
+        if not city and not station:
+            click.echo("Error: provide --city or --station")
+            raise SystemExit(1)
+
+        async with async_session() as session:
+            if station:
+                from src.ingestion.wx import get_buffer_history
+                from src.signals.mapper import cities_for_icao
+
+                city_names = cities_for_icao(station)
+                click.echo(f"Station {station} -> cities: {', '.join(c.title() for c in city_names) or 'none'}")
+
+                # Try observation-enriched lookup
+                buf = get_buffer_history(station, count=1)
+                if buf:
+                    obs = buf[-1]
+                    current_f = obs.temp_f
+                    click.echo(f"Current observation: {current_f:.1f}F")
+                    matches = await find_markets_for_observation(
+                        session, station, current_f, hours_ahead=hours,
+                    )
+                    if not matches:
+                        click.echo("No markets found.")
+                        return
+
+                    click.echo(f"\n{'#':<4} {'Question':<52} {'YES':>5} {'Thresh':>7} {'Dist':>6} {'Dir':>11} {'Liq':>10}")
+                    click.echo("-" * 100)
+
+                    for i, mm in enumerate(matches, 1):
+                        m = mm.market
+                        q = (m.question or "")[:50]
+                        yes_str = f"{m.current_yes_price:.0%}" if m.current_yes_price else "?"
+                        thresh = f"{m.parsed_threshold:.0f}F" if m.parsed_threshold is not None else "?"
+                        dist = f"{mm.distance_to_threshold:+.1f}" if mm.distance_to_threshold is not None else "?"
+                        liq = f"${m.liquidity:,.0f}" if m.liquidity else "?"
+                        click.echo(f"{i:<4} {q:<52} {yes_str:>5} {thresh:>7} {dist:>6} {mm.direction:>11} {liq:>10}")
+                    return
+
+                # No observation buffer — plain station lookup
+                markets = await find_markets_for_station(
+                    session, station, variable=variable, hours_ahead=hours,
+                )
+            else:
+                click.echo(f"Looking up markets for: {city}")
+                markets = await find_markets_for_city(
+                    session, city, variable=variable, date_str=date_str,
+                )
+
+            if not markets:
+                click.echo("No markets found.")
+                return
+
+            click.echo(f"\n{'#':<4} {'Question':<52} {'YES':>5} {'Var':>14} {'Thresh':>7} {'Op':>8} {'Date':>12} {'Liq':>10}")
+            click.echo("-" * 116)
+
+            for i, m in enumerate(markets, 1):
+                q = (m.question or "")[:50]
+                yes_str = f"{m.current_yes_price:.0%}" if m.current_yes_price else "?"
+                var = (m.parsed_variable or "?")[:12]
+                thresh = f"{m.parsed_threshold:.0f}F" if m.parsed_threshold is not None else "?"
+                op = (m.parsed_operator or "?")[:6]
+                date = (m.parsed_target_date or "?")[:10]
+                liq = f"${m.liquidity:,.0f}" if m.liquidity else "?"
+                click.echo(f"{i:<4} {q:<52} {yes_str:>5} {var:>14} {thresh:>7} {op:>8} {date:>12} {liq:>10}")
+
+    asyncio.run(_find())
+
+
 @bet.command("cancel")
 @click.argument("order_id")
 def bet_cancel(order_id: str) -> None:

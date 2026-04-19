@@ -346,6 +346,24 @@ async def job_wx_rapid_pipeline() -> None:
                         monitor = await _get_drawdown_monitor()
                         await _size_and_create_trades(signals, alerter, monitor)
 
+                # Backward resolution: discover additional markets beyond 12h
+                from src.signals.reverse_lookup import find_markets_for_event
+
+                for ev in all_events:
+                    extra = await find_markets_for_event(
+                        session, ev.station_icao, ev.temp_f, hours_ahead=48.0,
+                    )
+                    extra_ids = {m.id for m in extra} - affected_market_ids
+                    if extra_ids:
+                        logger.info(
+                            "WX backward resolution: %s found %d additional market(s) "
+                            "beyond 12h window",
+                            ev.station_icao, len(extra_ids),
+                        )
+                        await alerter.send_market_discovery(
+                            ev.station_icao, ev.temp_f, extra,
+                        )
+
             await session.commit()
 
     except Exception as exc:
