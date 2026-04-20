@@ -336,7 +336,7 @@ async def job_unified_pipeline() -> None:
 
                     # Orderbook depth at market YES price
                     mkt_depth = 0.0
-                    token_ids = get_token_ids(market.id)
+                    token_ids = await get_token_ids(market.id)
                     if token_ids and market.current_yes_price:
                         mkt_depth = get_orderbook_depth(token_ids[0], market.current_yes_price)
 
