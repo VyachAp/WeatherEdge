@@ -194,7 +194,7 @@ async def aggregate_state(
     if cycle_minutes:
         logger.debug("%s METAR cycle: %s", icao, cycle_minutes)
 
-    return WeatherState(
+    state = WeatherState(
         station_icao=icao,
         current_max_f=current_max_f,
         metar_trend_rate=metar_trend_rate,
@@ -207,6 +207,13 @@ async def aggregate_state(
         cloud_rise_magnitude=cloud_mag,
         routine_count_today=routine_count,
     )
+    logger.info(
+        "[%s] state: max=%.0f°F, trend=%+.1f°F/hr, forecast_peak=%.0f°F in %.1fh, "
+        "solar_declining=%s, cloud_rising=%s, routine_count=%d",
+        icao, current_max_f, metar_trend_rate, forecast_peak_f, hours_until_peak,
+        is_solar_declining, is_cloud_rising, routine_count,
+    )
+    return state
 
 
 async def _safe_fetch_metar(icao: str) -> list[dict[str, Any]] | None:

@@ -82,6 +82,13 @@ def compute_edges(
             reject_reason=reason,
         ))
 
+    if edges:
+        parts = []
+        for e in edges:
+            tag = "PASS" if e.passes else (e.reject_reason or "FAIL")
+            parts.append(f"{e.bucket_value}→{e.edge:+.3f}(ours={e.our_probability:.2f},mkt={e.market_price:.2f},{tag})")
+        logger.info("edges: %s", " | ".join(parts))
+
     return edges
 
 

@@ -278,6 +278,12 @@ async def job_unified_pipeline() -> None:
                     if coords:
                         city_coords[icao] = coords
 
+            city_summary = ", ".join(f"{k}:{len(v)}" for k, v in sorted(city_markets.items(), key=lambda x: -len(x[1]))[:8])
+            logger.info(
+                "Unified pipeline: %d markets across %d cities (%s)",
+                sum(len(v) for v in city_markets.values()), len(city_markets), city_summary,
+            )
+
             # ---- Phase 1: concurrent weather state aggregation ----
             sem = asyncio.Semaphore(_UNIFIED_CONCURRENCY)
 
@@ -370,7 +376,16 @@ async def job_unified_pipeline() -> None:
                         )
 
                         adjusted_stake = pos.stake_usd * dd_state.size_multiplier
+                        logger.info(
+                            "[%s] sizing bucket=%d: kelly_stake=$%.2f, dd_mult=%.2f, adjusted=$%.2f, bankroll=$%.0f, exposure=$%.0f",
+                            icao, edge.bucket_value, pos.stake_usd, dd_state.size_multiplier,
+                            adjusted_stake, bankroll, exposure,
+                        )
                         if adjusted_stake < settings.MIN_STAKE_USD:
+                            logger.info(
+                                "[%s] skip bucket=%d: adjusted_stake=$%.2f < min $%.2f",
+                                icao, edge.bucket_value, adjusted_stake, settings.MIN_STAKE_USD,
+                            )
                             continue
 
                         from src.db.models import Signal, TradeDirection
