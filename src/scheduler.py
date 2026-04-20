@@ -332,37 +332,63 @@ async def job_unified_pipeline() -> None:
             for icao, state in city_states.items():
               try:
                 for market in city_markets[icao]:
-                    buckets = _extract_buckets(market)
-                    if not buckets:
-                        continue
-
-                    dist = compute_distribution(state, buckets)
-                    market_prices = _extract_market_prices(market, buckets)
-
-                    # Orderbook depths
-                    depths: dict[int, float] = {}
-                    token_ids = get_token_ids(market.id)
-                    if token_ids:
-                        for b in buckets:
-                            price = market_prices.get(b, 0)
-                            if price > 0:
-                                depths[b] = get_orderbook_depth(token_ids[0], price)
-
                     end_time = market.end_date or datetime.now(timezone.utc) + timedelta(hours=24)
-                    edges = compute_edges(
-                        dist, market_prices, state.routine_count_today, end_time, depths
-                    )
 
-                    passing = [e for e in edges if e.passes]
-                    logger.info(
-                        "Unified pipeline [%s/%s]: dist=%s, passing_edges=%d/%d, reasoning=%s",
-                        icao,
-                        market.id[:12],
-                        {k: f"{v:.3f}" for k, v in dist.probabilities.items() if v > 0.01},
-                        len(passing),
-                        len(edges),
-                        dist.reasoning,
-                    )
+                    # Orderbook depth at market YES price
+                    mkt_depth = 0.0
+                    token_ids = get_token_ids(market.id)
+                    if token_ids and market.current_yes_price:
+                        mkt_depth = get_orderbook_depth(token_ids[0], market.current_yes_price)
+
+                    if _is_binary_market(market):
+                        # --- Binary threshold market ---
+                        buckets = _make_binary_buckets(market, state)
+                        dist = compute_distribution(state, buckets)
+                        edge_result = _binary_market_edge(
+                            dist, market, end_time,
+                            state.routine_count_today, mkt_depth,
+                        )
+                        if edge_result is None:
+                            continue
+
+                        op_symbol = {"above": "≥", "at_least": "≥", "below": "<", "at_most": "≤", "exactly": "="}.get(market.parsed_operator, "?")
+                        tag = "PASS" if edge_result.passes else edge_result.reject_reason
+                        logger.info(
+                            "[%s] binary %s%d°F: P(YES)=%.3f, mkt=%.3f, edge=%+.3f %s | %s",
+                            icao, op_symbol, int(market.parsed_threshold),
+                            edge_result.our_probability, edge_result.market_price,
+                            edge_result.edge, tag, dist.reasoning,
+                        )
+
+                        edges = [edge_result]
+                        passing = [edge_result] if edge_result.passes else []
+                        depths = {int(market.parsed_threshold): mkt_depth}
+                    else:
+                        # --- Bracket market ---
+                        buckets = _extract_bracket_buckets(market)
+                        if not buckets:
+                            continue
+
+                        dist = compute_distribution(state, buckets)
+                        market_prices = _extract_market_prices(market, buckets)
+
+                        depths: dict[int, float] = {}
+                        if token_ids:
+                            for b in buckets:
+                                price = market_prices.get(b, 0)
+                                if price > 0:
+                                    depths[b] = get_orderbook_depth(token_ids[0], price)
+
+                        edges = compute_edges(
+                            dist, market_prices, state.routine_count_today, end_time, depths
+                        )
+                        passing = [e for e in edges if e.passes]
+                        logger.info(
+                            "Unified pipeline [%s/%s]: dist=%s, passing_edges=%d/%d, reasoning=%s",
+                            icao, market.id[:12],
+                            {k: f"{v:.3f}" for k, v in dist.probabilities.items() if v > 0.01},
+                            len(passing), len(edges), dist.reasoning,
+                        )
 
                     dd_state = monitor.check(bankroll)
                     for edge in passing:
@@ -438,14 +464,76 @@ async def job_unified_pipeline() -> None:
         await alerter.send_system_error(exc, "unified pipeline")
 
 
-def _extract_buckets(market) -> list[int]:
-    """Extract temperature bucket values from a market's outcomes."""
+def _is_binary_market(market) -> bool:
+    """True if market is a binary threshold market (not a bracket)."""
+    return (
+        market.parsed_threshold is not None
+        and market.parsed_operator is not None
+        and market.parsed_operator != "bracket"
+    )
+
+
+def _make_binary_buckets(market, state) -> list[int]:
+    """Generate integer temperature range for distribution over a binary market."""
+    from src.signals.state_aggregator import WeatherState
+
+    threshold = int(market.parsed_threshold)
+    low = int(state.current_max_f) - 1
+    high = max(threshold, int(state.forecast_peak_f)) + 10
+    return list(range(low, high + 1))
+
+
+def _binary_market_edge(dist, market, end_time, routine_count, depth):
+    """Collapse distribution into cumulative probability for a binary market.
+
+    Returns a BucketEdge or None if the market can't be evaluated.
+    """
+    from src.signals.edge_calculator import BucketEdge, _check_filters
+
+    threshold = int(market.parsed_threshold)
+    op = market.parsed_operator
+    price = market.current_yes_price or 0.0
+
+    # Cumulative probability based on operator
+    if op in ("above", "at_least"):
+        our_prob = sum(p for b, p in dist.probabilities.items() if b >= threshold)
+    elif op in ("below", "at_most"):
+        our_prob = sum(p for b, p in dist.probabilities.items() if b < threshold)
+    elif op == "exactly":
+        our_prob = dist.probabilities.get(threshold, 0.0)
+    else:
+        return None
+
+    our_prob = round(our_prob, 4)
+    edge = round(our_prob - price, 4)
+
+    now = datetime.now(timezone.utc)
+    minutes_to_close = (end_time - now).total_seconds() / 60.0
+
+    reason = _check_filters(
+        edge=edge, prob=our_prob, price=price,
+        routine_count=routine_count,
+        minutes_to_close=minutes_to_close,
+        depth=depth,
+    )
+
+    return BucketEdge(
+        bucket_value=threshold,
+        our_probability=our_prob,
+        market_price=price,
+        edge=edge,
+        passes=reason is None,
+        reject_reason=reason,
+    )
+
+
+def _extract_bracket_buckets(market) -> list[int]:
+    """Extract temperature bucket values from a bracket market's outcomes."""
     import re
     buckets: list[int] = []
     outcomes = market.outcomes or []
     for outcome in outcomes:
         if isinstance(outcome, str):
-            # Try to extract temperature number
             match = re.search(r"(\d+)", outcome)
             if match:
                 buckets.append(int(match.group(1)))
@@ -458,16 +546,9 @@ def _extract_buckets(market) -> list[int]:
 
 
 def _extract_market_prices(market, buckets: list[int]) -> dict[int, float]:
-    """Map bucket values to current YES prices."""
-    # For simple above/below markets, use current_yes_price for the threshold bucket
-    if market.current_yes_price and len(buckets) == 1:
-        return {buckets[0]: market.current_yes_price}
-
-    # For bracket markets with outcomes, try to match prices to buckets
+    """Map bucket values to current YES prices for bracket markets."""
     prices: dict[int, float] = {}
     if market.current_yes_price and buckets:
-        # Distribute price evenly as fallback; real implementation
-        # should fetch per-outcome prices from snapshots/CLOB
         prices[buckets[0]] = market.current_yes_price
     return prices
 
