@@ -118,7 +118,7 @@ def _make_client() -> httpx.AsyncClient:
             "User-Agent": settings.AWC_USER_AGENT,
             "Accept-Encoding": "gzip",
         },
-        timeout=30,
+        timeout=15,
     )
 
 

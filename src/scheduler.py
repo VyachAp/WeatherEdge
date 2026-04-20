@@ -223,18 +223,27 @@ async def _size_and_create_trades(signals: list, alerter, monitor) -> None:
         await session.commit()
 
 
+_UNIFIED_CONCURRENCY = 8  # Max concurrent city aggregations
+
+
 async def job_unified_pipeline() -> None:
     """Every 5 min — unified METAR + Open-Meteo + market pipeline.
 
     Replaces job_short_range_pipeline and job_wx_rapid_pipeline when
     UNIFIED_PIPELINE_ENABLED is True.
+
+    Performance design:
+      Phase 1 — fetch all weather states concurrently (bounded semaphore).
+                Each city's METAR + Open-Meteo calls run in parallel.
+      Phase 2 — evaluate edges and execute trades sequentially
+                (bankroll/exposure tracking requires serial execution).
     """
     alerter = get_alerter()
     try:
         from src.ingestion.polymarket import get_active_weather_markets
         from src.ingestion.station_bias import is_bias_runaway
         from src.risk.circuit_breakers import check_circuit_breakers
-        from src.signals.state_aggregator import aggregate_state
+        from src.signals.state_aggregator import WeatherState, aggregate_state
         from src.signals.probability_engine import compute_distribution
         from src.signals.edge_calculator import compute_edges
         from src.signals.mapper import icao_for_location, geocode
@@ -253,53 +262,78 @@ async def job_unified_pipeline() -> None:
                 logger.debug("Unified pipeline: no active markets")
                 return
 
-            # 3. Group markets by city/ICAO
+            # 3. Group markets by city/ICAO and resolve coordinates
             city_markets: dict[str, list] = {}
+            city_coords: dict[str, tuple[float, float]] = {}
             for m in markets:
                 loc = m.parsed_location
                 if not loc:
                     continue
                 icao = icao_for_location(loc)
-                if icao:
-                    city_markets.setdefault(icao, []).append(m)
+                if not icao:
+                    continue
+                city_markets.setdefault(icao, []).append(m)
+                if icao not in city_coords:
+                    coords = geocode(loc)
+                    if coords:
+                        city_coords[icao] = coords
 
+            # ---- Phase 1: concurrent weather state aggregation ----
+            sem = asyncio.Semaphore(_UNIFIED_CONCURRENCY)
+
+            async def _aggregate_one(icao: str) -> tuple[str, WeatherState | None]:
+                if icao not in city_coords:
+                    return icao, None
+                try:
+                    if await is_bias_runaway(session, icao):
+                        logger.warning("Skipping %s: bias runaway", icao)
+                        return icao, None
+                except Exception:
+                    logger.warning("Bias check failed for %s, proceeding", icao, exc_info=True)
+                lat, lon = city_coords[icao]
+                async with sem:
+                    try:
+                        state = await aggregate_state(session, icao, lat, lon)
+                    except Exception:
+                        logger.warning("Unified pipeline: aggregate failed for %s", icao, exc_info=True)
+                        state = None
+                return icao, state
+
+            agg_results = await asyncio.gather(
+                *[_aggregate_one(icao) for icao in city_markets],
+            )
+
+            city_states: dict[str, WeatherState] = {}
+            skipped_cities = 0
+            for icao, state in agg_results:
+                if state is not None:
+                    city_states[icao] = state
+                else:
+                    skipped_cities += 1
+
+            logger.info(
+                "Unified pipeline phase 1: %d/%d cities aggregated (%.0f%% success)",
+                len(city_states), len(city_markets),
+                100 * len(city_states) / max(1, len(city_markets)),
+            )
+
+            # ---- Phase 2: sequential edge evaluation and trading ----
             monitor = await _get_drawdown_monitor()
             bankroll = await get_current_bankroll(session)
             exposure = await get_current_exposure(session)
             total_trades = 0
 
-            # 4. Per city: aggregate → distribute → edge → trade
-            for icao, city_market_list in city_markets.items():
-                # Bias runaway check
-                if await is_bias_runaway(session, icao):
-                    logger.warning("Skipping %s: bias runaway", icao)
-                    continue
-
-                # Get coordinates for Open-Meteo
-                loc = city_market_list[0].parsed_location
-                coords = geocode(loc) if loc else None
-                if coords is None:
-                    continue
-                lat, lon = coords
-
-                # Aggregate state
-                state = await aggregate_state(session, icao, lat, lon)
-                if state is None:
-                    continue
-
-                # For each market at this station
-                for market in city_market_list:
-                    # Determine buckets from market (bracket markets have multiple outcomes)
+            for icao, state in city_states.items():
+              try:
+                for market in city_markets[icao]:
                     buckets = _extract_buckets(market)
                     if not buckets:
                         continue
 
                     dist = compute_distribution(state, buckets)
-
-                    # Get market prices per bucket
                     market_prices = _extract_market_prices(market, buckets)
 
-                    # Get orderbook depths
+                    # Orderbook depths
                     depths: dict[int, float] = {}
                     token_ids = get_token_ids(market.id)
                     if token_ids:
@@ -308,13 +342,11 @@ async def job_unified_pipeline() -> None:
                             if price > 0:
                                 depths[b] = get_orderbook_depth(token_ids[0], price)
 
-                    # Compute edges
                     end_time = market.end_date or datetime.now(timezone.utc) + timedelta(hours=24)
                     edges = compute_edges(
                         dist, market_prices, state.routine_count_today, end_time, depths
                     )
 
-                    # Log full decision tick
                     passing = [e for e in edges if e.passes]
                     logger.info(
                         "Unified pipeline [%s/%s]: dist=%s, passing_edges=%d/%d, reasoning=%s",
@@ -326,7 +358,6 @@ async def job_unified_pipeline() -> None:
                         dist.reasoning,
                     )
 
-                    # Size and trade passing edges
                     dd_state = monitor.check(bankroll)
                     for edge in passing:
                         pos = size_position(
@@ -342,7 +373,6 @@ async def job_unified_pipeline() -> None:
                         if adjusted_stake < settings.MIN_STAKE_USD:
                             continue
 
-                        # Persist signal
                         from src.db.models import Signal, TradeDirection
                         sig_row = Signal(
                             market_id=market.id,
@@ -378,7 +408,14 @@ async def job_unified_pipeline() -> None:
                                 f"Market: {market.question[:60]}",
                             )
 
+              except Exception:
+                skipped_cities += 1
+                logger.warning("Unified pipeline: error evaluating %s, skipping", icao, exc_info=True)
+                continue
+
             await session.commit()
+            if skipped_cities:
+                logger.warning("Unified pipeline: %d/%d cities skipped due to errors", skipped_cities, len(city_markets))
             logger.info("Unified pipeline complete: %d trades placed", total_trades)
 
     except Exception as exc:
