@@ -39,6 +39,8 @@ def size_position(
     market_prob: float,
     current_exposure: float = 0.0,
     kelly_fraction: float | None = None,
+    max_position_usd: float | None = None,
+    orderbook_depth: float | None = None,
 ) -> PositionSize:
     """Compute stake using fractional Kelly criterion with hard caps.
 
@@ -54,6 +56,10 @@ def size_position(
         Sum of ``stake_usd`` across all open positions.
     kelly_fraction:
         Fraction of full Kelly to use (default from settings).
+    max_position_usd:
+        Hard USD cap per position (default from settings.MAX_POSITION_USD).
+    orderbook_depth:
+        Visible orderbook depth in USD. Position capped at 20% of depth.
     """
     if kelly_fraction is None:
         kelly_fraction = settings.KELLY_FRACTION
@@ -94,6 +100,21 @@ def size_position(
         stake = max_remaining
         capped = True
         reasons.append("total exposure cap")
+
+    # --- Hard USD cap ---
+    usd_cap = max_position_usd if max_position_usd is not None else settings.MAX_POSITION_USD
+    if stake > usd_cap:
+        stake = usd_cap
+        capped = True
+        reasons.append(f"max position ${usd_cap:.0f}")
+
+    # --- Orderbook depth cap (max 20% of visible depth) ---
+    if orderbook_depth is not None and orderbook_depth > 0:
+        depth_cap = orderbook_depth * settings.DEPTH_POSITION_CAP_PCT
+        if stake > depth_cap:
+            stake = depth_cap
+            capped = True
+            reasons.append(f"depth cap ({settings.DEPTH_POSITION_CAP_PCT:.0%} of ${orderbook_depth:.0f})")
 
     # --- Minimum viable trade ---
     if 0 < stake < MIN_TRADE_USD:

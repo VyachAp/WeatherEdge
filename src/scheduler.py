@@ -223,6 +223,203 @@ async def _size_and_create_trades(signals: list, alerter, monitor) -> None:
         await session.commit()
 
 
+async def job_unified_pipeline() -> None:
+    """Every 5 min — unified METAR + Open-Meteo + market pipeline.
+
+    Replaces job_short_range_pipeline and job_wx_rapid_pipeline when
+    UNIFIED_PIPELINE_ENABLED is True.
+    """
+    alerter = get_alerter()
+    try:
+        from src.ingestion.polymarket import get_active_weather_markets
+        from src.ingestion.station_bias import is_bias_runaway
+        from src.risk.circuit_breakers import check_circuit_breakers
+        from src.signals.state_aggregator import aggregate_state
+        from src.signals.probability_engine import compute_distribution
+        from src.signals.edge_calculator import compute_edges
+        from src.signals.mapper import icao_for_location, geocode
+        from src.execution.polymarket_client import get_orderbook_depth, get_token_ids
+
+        async with async_session() as session:
+            # 1. Circuit breaker check
+            cb = await check_circuit_breakers(session)
+            if not cb.can_trade:
+                logger.info("Circuit breaker active: %s", cb.reason)
+                return
+
+            # 2. Get active temperature markets
+            markets = await get_active_weather_markets(session)
+            if not markets:
+                logger.debug("Unified pipeline: no active markets")
+                return
+
+            # 3. Group markets by city/ICAO
+            city_markets: dict[str, list] = {}
+            for m in markets:
+                loc = m.parsed_location
+                if not loc:
+                    continue
+                icao = icao_for_location(loc)
+                if icao:
+                    city_markets.setdefault(icao, []).append(m)
+
+            monitor = await _get_drawdown_monitor()
+            bankroll = await get_current_bankroll(session)
+            exposure = await get_current_exposure(session)
+            total_trades = 0
+
+            # 4. Per city: aggregate → distribute → edge → trade
+            for icao, city_market_list in city_markets.items():
+                # Bias runaway check
+                if await is_bias_runaway(session, icao):
+                    logger.warning("Skipping %s: bias runaway", icao)
+                    continue
+
+                # Get coordinates for Open-Meteo
+                loc = city_market_list[0].parsed_location
+                coords = geocode(loc) if loc else None
+                if coords is None:
+                    continue
+                lat, lon = coords
+
+                # Aggregate state
+                state = await aggregate_state(session, icao, lat, lon)
+                if state is None:
+                    continue
+
+                # For each market at this station
+                for market in city_market_list:
+                    # Determine buckets from market (bracket markets have multiple outcomes)
+                    buckets = _extract_buckets(market)
+                    if not buckets:
+                        continue
+
+                    dist = compute_distribution(state, buckets)
+
+                    # Get market prices per bucket
+                    market_prices = _extract_market_prices(market, buckets)
+
+                    # Get orderbook depths
+                    depths: dict[int, float] = {}
+                    token_ids = get_token_ids(market.id)
+                    if token_ids:
+                        for b in buckets:
+                            price = market_prices.get(b, 0)
+                            if price > 0:
+                                depths[b] = get_orderbook_depth(token_ids[0], price)
+
+                    # Compute edges
+                    end_time = market.end_date or datetime.now(timezone.utc) + timedelta(hours=24)
+                    edges = compute_edges(
+                        dist, market_prices, state.routine_count_today, end_time, depths
+                    )
+
+                    # Log full decision tick
+                    passing = [e for e in edges if e.passes]
+                    logger.info(
+                        "Unified pipeline [%s/%s]: dist=%s, passing_edges=%d/%d, reasoning=%s",
+                        icao,
+                        market.id[:12],
+                        {k: f"{v:.3f}" for k, v in dist.probabilities.items() if v > 0.01},
+                        len(passing),
+                        len(edges),
+                        dist.reasoning,
+                    )
+
+                    # Size and trade passing edges
+                    dd_state = monitor.check(bankroll)
+                    for edge in passing:
+                        pos = size_position(
+                            bankroll=bankroll,
+                            model_prob=edge.our_probability,
+                            market_prob=edge.market_price,
+                            current_exposure=exposure,
+                            max_position_usd=settings.MAX_POSITION_USD,
+                            orderbook_depth=depths.get(edge.bucket_value),
+                        )
+
+                        adjusted_stake = pos.stake_usd * dd_state.size_multiplier
+                        if adjusted_stake < settings.MIN_STAKE_USD:
+                            continue
+
+                        # Persist signal
+                        from src.db.models import Signal, TradeDirection
+                        sig_row = Signal(
+                            market_id=market.id,
+                            model_prob=edge.our_probability,
+                            market_prob=edge.market_price,
+                            edge=edge.edge,
+                            direction=TradeDirection.BUY_YES,
+                            confidence=edge.our_probability,
+                        )
+                        session.add(sig_row)
+                        await session.flush()
+
+                        trade = Trade(
+                            signal_id=sig_row.id,
+                            market_id=market.id,
+                            direction=TradeDirection.BUY_YES,
+                            stake_usd=adjusted_stake,
+                            entry_price=edge.market_price,
+                            status=TradeStatus.PENDING,
+                        )
+                        session.add(trade)
+                        await session.flush()
+
+                        order_ok = await place_order(trade, session)
+                        if order_ok:
+                            trade.status = TradeStatus.OPEN
+                            exposure += adjusted_stake
+                            total_trades += 1
+                            await alerter._enqueue(
+                                f"\U0001f4b0 *Unified trade* [{icao}]\n"
+                                f"Bucket: {edge.bucket_value}°F | Edge: {edge.edge:.3f}\n"
+                                f"Stake: ${adjusted_stake:.2f} | Price: {edge.market_price:.2f}\n"
+                                f"Market: {market.question[:60]}",
+                            )
+
+            await session.commit()
+            logger.info("Unified pipeline complete: %d trades placed", total_trades)
+
+    except Exception as exc:
+        logger.exception("Unified pipeline failed")
+        await alerter.send_system_error(exc, "unified pipeline")
+
+
+def _extract_buckets(market) -> list[int]:
+    """Extract temperature bucket values from a market's outcomes."""
+    import re
+    buckets: list[int] = []
+    outcomes = market.outcomes or []
+    for outcome in outcomes:
+        if isinstance(outcome, str):
+            # Try to extract temperature number
+            match = re.search(r"(\d+)", outcome)
+            if match:
+                buckets.append(int(match.group(1)))
+        elif isinstance(outcome, dict):
+            val = outcome.get("value") or outcome.get("title", "")
+            match = re.search(r"(\d+)", str(val))
+            if match:
+                buckets.append(int(match.group(1)))
+    return sorted(set(buckets))
+
+
+def _extract_market_prices(market, buckets: list[int]) -> dict[int, float]:
+    """Map bucket values to current YES prices."""
+    # For simple above/below markets, use current_yes_price for the threshold bucket
+    if market.current_yes_price and len(buckets) == 1:
+        return {buckets[0]: market.current_yes_price}
+
+    # For bracket markets with outcomes, try to match prices to buckets
+    prices: dict[int, float] = {}
+    if market.current_yes_price and buckets:
+        # Distribute price evenly as fallback; real implementation
+        # should fetch per-outcome prices from snapshots/CLOB
+        prices[buckets[0]] = market.current_yes_price
+    return prices
+
+
 async def job_short_range_pipeline() -> None:
     """Every 60 min — aviation-focused pipeline for markets ≤30h out."""
     alerter = get_alerter()
@@ -461,7 +658,50 @@ async def job_daily_settlement() -> None:
                 if result.rowcount:
                     logger.info("WX cleanup: deleted %d old observations", result.rowcount)
 
-            # 5. Weekly calibration check (Sundays)
+            # 5. Station bias recording (unified pipeline)
+            if settings.UNIFIED_PIPELINE_ENABLED:
+                try:
+                    from src.ingestion.station_bias import record_daily_outcome
+                    from src.ingestion.aviation import get_routine_daily_max
+                    from src.ingestion.openmeteo import fetch_forecast
+                    from src.signals.mapper import icao_for_location, geocode, CITY_ICAO
+
+                    # Collect bias for each station that had active markets today
+                    seen_icaos: set[str] = set()
+                    stmt_markets = select(Market).where(
+                        Market.parsed_location.isnot(None),
+                        Market.parsed_variable == "temperature",
+                    )
+                    market_result = await session.execute(stmt_markets)
+                    for mkt in market_result.scalars():
+                        icao = icao_for_location(mkt.parsed_location) if mkt.parsed_location else None
+                        if not icao or icao in seen_icaos:
+                            continue
+                        seen_icaos.add(icao)
+
+                        max_f, count = await get_routine_daily_max(icao)
+                        if max_f is None or count < 3:
+                            continue
+
+                        coords = geocode(mkt.parsed_location) if mkt.parsed_location else None
+                        if not coords:
+                            continue
+
+                        forecast = await fetch_forecast(coords[0], coords[1])
+                        if forecast is None:
+                            continue
+
+                        max_c = (max_f - 32.0) * 5.0 / 9.0
+                        await record_daily_outcome(
+                            session, icao,
+                            datetime.now(timezone.utc),
+                            max_c, forecast.peak_temp_c,
+                        )
+                    logger.info("Station bias recorded for %d stations", len(seen_icaos))
+                except Exception:
+                    logger.exception("Station bias recording failed (non-fatal)")
+
+            # 6. Weekly calibration check (Sundays)
             if datetime.now(timezone.utc).weekday() == 6:
                 coeffs = await get_calibration_coefficients(session)
                 if coeffs is not None:
@@ -598,22 +838,35 @@ def setup_scheduler() -> AsyncIOScheduler:
         max_instances=1,
         coalesce=True,
     )
-    scheduler.add_job(
-        job_short_range_pipeline,
-        IntervalTrigger(minutes=settings.SR_PIPELINE_INTERVAL_MINUTES),
-        id="short_range_pipeline",
-        max_instances=1,
-        coalesce=True,
-    )
-
-    if settings.WX_API_KEY:
+    if settings.UNIFIED_PIPELINE_ENABLED:
         scheduler.add_job(
-            job_wx_rapid_pipeline,
-            IntervalTrigger(minutes=settings.WX_PIPELINE_INTERVAL_MINUTES),
-            id="wx_rapid_pipeline",
+            job_unified_pipeline,
+            IntervalTrigger(minutes=settings.UNIFIED_PIPELINE_INTERVAL_MINUTES),
+            id="unified_pipeline",
             max_instances=1,
             coalesce=True,
         )
+        logger.info(
+            "Unified pipeline enabled (every %dm); legacy pipelines disabled",
+            settings.UNIFIED_PIPELINE_INTERVAL_MINUTES,
+        )
+    else:
+        scheduler.add_job(
+            job_short_range_pipeline,
+            IntervalTrigger(minutes=settings.SR_PIPELINE_INTERVAL_MINUTES),
+            id="short_range_pipeline",
+            max_instances=1,
+            coalesce=True,
+        )
+
+        if settings.WX_API_KEY:
+            scheduler.add_job(
+                job_wx_rapid_pipeline,
+                IntervalTrigger(minutes=settings.WX_PIPELINE_INTERVAL_MINUTES),
+                id="wx_rapid_pipeline",
+                max_instances=1,
+                coalesce=True,
+            )
 
     return scheduler
 

@@ -66,5 +66,32 @@ class Settings(BaseSettings):
     DAILY_SPEND_CAP_USD: float = 200.0  # Max total spend per 24h
     MIN_STAKE_USD: float = 5.0  # Skip orders below this amount
 
+    # Unified pipeline (replaces short_range + wx_rapid when enabled)
+    UNIFIED_PIPELINE_ENABLED: bool = False
+    UNIFIED_PIPELINE_INTERVAL_MINUTES: int = 5
+
+    # Redesigned trade filters (used by unified pipeline)
+    MIN_PROBABILITY: float = 0.60
+    MIN_ENTRY_PRICE: float = 0.40
+    MAX_ENTRY_PRICE: float = 0.97
+    MIN_DEPTH_USD: float = 50.0
+    MIN_ROUTINE_COUNT: int = 3
+    MARKET_CLOSE_BUFFER_MINUTES: int = 30
+    MAX_POSITION_USD: float = 200.0
+    DEPTH_POSITION_CAP_PCT: float = 0.20
+
+    # Station bias tracking
+    DEFAULT_STATION_BIAS_C: float = 1.0
+    STATION_BIAS_WINDOW_DAYS: int = 30
+    STATION_BIAS_MAX_C: float = 3.0
+
+    # Circuit breakers
+    DAILY_LOSS_STOP_USD: float = 200.0
+    CONSECUTIVE_LOSS_PAUSE_COUNT: int = 3
+    CONSECUTIVE_LOSS_PAUSE_HOURS: int = 2
+
+    # Open-Meteo forecast
+    OPENMETEO_RATE_LIMIT_RPS: float = 2.0
+
 
 settings = Settings()

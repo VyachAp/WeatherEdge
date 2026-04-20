@@ -87,6 +87,52 @@ class TestSizePosition:
         if not half.capped and not full.capped:
             assert full.stake_usd == pytest.approx(half.stake_usd * 2, rel=0.01)
 
+    def test_max_position_usd_cap(self):
+        """Explicit USD cap limits the position."""
+        pos = size_position(
+            10_000,
+            model_prob=0.99,
+            market_prob=0.10,
+            max_position_usd=100.0,
+        )
+        assert pos.stake_usd <= 100.0
+        assert pos.capped is True
+        assert "max position" in pos.reason
+
+    def test_orderbook_depth_cap(self):
+        """Position capped at 20% of visible orderbook depth."""
+        pos = size_position(
+            10_000,
+            model_prob=0.99,
+            market_prob=0.10,
+            orderbook_depth=200.0,
+        )
+        # 20% of 200 = 40
+        assert pos.stake_usd <= 40.0
+        assert pos.capped is True
+        assert "depth cap" in pos.reason
+
+    def test_no_depth_cap_when_none(self):
+        """No depth cap applied when orderbook_depth is None."""
+        pos = size_position(
+            1000,
+            model_prob=0.7,
+            market_prob=0.5,
+            orderbook_depth=None,
+        )
+        # Should behave same as before — no depth cap in reason
+        assert "depth" not in pos.reason
+
+    def test_depth_cap_not_applied_when_depth_is_large(self):
+        """Large depth doesn't constrain the position."""
+        pos = size_position(
+            1000,
+            model_prob=0.7,
+            market_prob=0.5,
+            orderbook_depth=100_000.0,
+        )
+        assert "depth" not in pos.reason
+
 
 # ===================================================================
 # drawdown.py – drawdown monitor

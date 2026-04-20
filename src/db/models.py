@@ -255,6 +255,24 @@ class WxObservation(Base):
     )
 
 
+class StationBias(Base):
+    """Daily record of observed vs forecast temperature bias per station."""
+
+    __tablename__ = "station_biases"
+    __table_args__ = (
+        Index("ix_station_bias_icao_date", "station_icao", "date"),
+        UniqueConstraint("station_icao", "date", name="uq_station_bias_day"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    station_icao = Column(String, nullable=False)
+    date = Column(DateTime(timezone=True), nullable=False)
+    observed_max_c = Column(Float, nullable=False)
+    forecast_peak_c = Column(Float, nullable=False)
+    bias_c = Column(Float, nullable=False)  # observed - forecast
+    created_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
+
+
 class AviationAlert(Base):
     __tablename__ = "aviation_alerts"
 

@@ -303,3 +303,33 @@ async def cancel_order(trade: Trade) -> bool:
     except Exception:
         logger.exception("Failed to cancel order %s", trade.order_id)
         return False
+
+
+# ---------------------------------------------------------------------------
+# Orderbook depth
+# ---------------------------------------------------------------------------
+
+
+def get_orderbook_depth(token_id: str, price: float) -> float:
+    """Return total USD depth at or better than *price* on the buy side.
+
+    Uses the CLOB client's ``get_order_book`` method. Returns 0.0 if the
+    client is unavailable or the query fails.
+    """
+    client = _get_client()
+    if client is None:
+        return 0.0
+
+    try:
+        book = client.get_order_book(token_id)
+        bids = book.get("bids", [])
+        depth = 0.0
+        for bid in bids:
+            bid_price = float(bid.get("price", 0))
+            bid_size = float(bid.get("size", 0))
+            if bid_price >= price:
+                depth += bid_price * bid_size
+        return depth
+    except Exception:
+        logger.warning("Could not fetch orderbook for token %s", token_id)
+        return 0.0

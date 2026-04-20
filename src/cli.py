@@ -324,6 +324,59 @@ def paper_trade(days: int) -> None:
     asyncio.run(_paper_trade())
 
 
+@main.command("backtest-v2")
+@click.option("--days", default=30, show_default=True, help="Days of history to backtest.")
+@click.option("--stations", default="", help="Comma-separated ICAO codes (default: all stations with data).")
+def backtest_v2(days: int, stations: str) -> None:
+    """Backtest the distribution probability engine against historical outcomes."""
+
+    async def _backtest() -> None:
+        from src.risk.simulate import simulate_distribution_pipeline
+
+        if stations:
+            station_list = [s.strip().upper() for s in stations.split(",")]
+        else:
+            # Discover stations from DB
+            from sqlalchemy import select, distinct
+            from src.db.engine import async_session
+            from src.db.models import MetarObservation
+
+            async with async_session() as session:
+                result = await session.execute(
+                    select(distinct(MetarObservation.station_icao))
+                )
+                station_list = [row[0] for row in result.all() if row[0]]
+
+        if not station_list:
+            click.echo("No stations found. Provide --stations or ensure METAR data exists.")
+            return
+
+        click.echo(f"Backtesting {len(station_list)} stations over {days} days...")
+        result = await simulate_distribution_pipeline(station_list, days_back=days)
+
+        click.echo(f"\n=== Distribution Backtest Results ===")
+        click.echo(f"  Days evaluated:     {result.num_days}")
+        click.echo(f"  Calibration error:  {result.calibration_error:.4f}")
+        click.echo(f"  Brier score:        {result.brier_score:.6f}")
+
+        if result.per_bucket:
+            click.echo(f"\n  Per-bucket calibration (top 10 by count):")
+            top = sorted(result.per_bucket, key=lambda b: b.count, reverse=True)[:10]
+            for b in top:
+                click.echo(
+                    f"    {b.bucket_value:3d}°F: predicted={b.predicted_avg:.3f} "
+                    f"actual={b.actual_rate:.3f} (n={b.count})"
+                )
+
+        threshold = 0.03
+        if result.calibration_error <= threshold:
+            click.echo(f"\n  PASS: calibration error {result.calibration_error:.4f} <= {threshold}")
+        else:
+            click.echo(f"\n  FAIL: calibration error {result.calibration_error:.4f} > {threshold}")
+
+    asyncio.run(_backtest())
+
+
 @main.command()
 def migrate() -> None:
     """Run pending database migrations (adds missing columns)."""

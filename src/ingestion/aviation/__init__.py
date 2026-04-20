@@ -343,15 +343,77 @@ async def get_current_temp(station: str) -> float | None:
     return metars[0].get("temp_f")
 
 
+async def get_routine_daily_max(
+    station: str,
+    hours: int = 24,
+) -> tuple[float | None, int]:
+    """Return (max_temp_f, routine_count) from routine-only METARs for the current UTC day.
+
+    Filters out SPECI reports before computing daily max. The routine_count
+    is used by the MIN_ROUTINE_COUNT circuit breaker.
+    """
+    history = await fetch_metar_history(station, hours=hours)
+
+    now_utc = datetime.now(timezone.utc)
+    today_start = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    routine_temps: list[float] = []
+    for m in history:
+        if m.get("is_speci"):
+            continue
+        obs_at = m.get("observed_at")
+        if obs_at is not None and isinstance(obs_at, datetime) and obs_at >= today_start:
+            temp_f = m.get("temp_f")
+            if temp_f is not None:
+                routine_temps.append(temp_f)
+
+    if not routine_temps:
+        return None, 0
+    return max(routine_temps), len(routine_temps)
+
+
+def detect_metar_cycle(observations: list[dict[str, Any]]) -> list[int]:
+    """Auto-detect METAR publication minutes from recent routine observations.
+
+    Examines the minute-of-hour across the provided routine METARs and returns
+    the most common publication minutes (e.g., [20, 50] or [0, 30]).
+    Expects at least 4 observations for meaningful detection.
+    """
+    minutes: list[int] = []
+    for m in observations:
+        if m.get("is_speci"):
+            continue
+        obs_at = m.get("observed_at")
+        if obs_at is not None and isinstance(obs_at, datetime):
+            minutes.append(obs_at.minute)
+
+    if len(minutes) < 4:
+        return []
+
+    # Cluster minutes by rounding to nearest 5
+    from collections import Counter
+    rounded = [((m + 2) // 5) * 5 % 60 for m in minutes]
+    counts = Counter(rounded)
+    # Return minutes that appear at least twice, sorted
+    return sorted(m for m, c in counts.items() if c >= 2)
+
+
 async def get_temp_trend(
     station: str,
     hours: int = 6,
+    *,
+    routine_only: bool = False,
 ) -> dict[str, Any]:
     """Compute temperature trend from recent METAR observations.
 
-    Returns dict with: current, min, max, trend_direction, rate_of_change_per_hour.
+    When routine_only=True, SPECI reports are excluded from the calculation.
+    Returns dict with: current, min, max, trend_direction, rate_of_change_per_hour,
+    dewpoint_rate (°F/hr).
     """
     history = await fetch_metar_history(station, hours=hours)
+
+    if routine_only:
+        history = [m for m in history if not m.get("is_speci")]
 
     temps = [
         (m["observed_at"], m["temp_f"])
@@ -405,12 +467,38 @@ async def get_temp_trend(
     else:
         direction = "steady"
 
+    # Dewpoint trend (same linear regression approach)
+    if routine_only:
+        filtered_history = [m for m in history if not m.get("is_speci")]
+    else:
+        filtered_history = history
+    dewpoints = [
+        (m["observed_at"], m["dewpoint_f"])
+        for m in filtered_history
+        if m.get("dewpoint_f") is not None and m.get("observed_at") is not None
+    ]
+    dewpoint_rate = 0.0
+    if len(dewpoints) >= 2:
+        dewpoints.sort(key=lambda dp: dp[0])
+        dp_t0 = dewpoints[0][0]
+        dp_x = [(dp[0] - dp_t0).total_seconds() / 3600.0 for dp in dewpoints]
+        dp_y = [dp[1] for dp in dewpoints]
+        dp_n = len(dp_x)
+        dp_sum_x = sum(dp_x)
+        dp_sum_y = sum(dp_y)
+        dp_sum_xy = sum(xi * yi for xi, yi in zip(dp_x, dp_y))
+        dp_sum_x2 = sum(xi * xi for xi in dp_x)
+        dp_denom = dp_n * dp_sum_x2 - dp_sum_x * dp_sum_x
+        if dp_denom != 0:
+            dewpoint_rate = round((dp_n * dp_sum_xy - dp_sum_x * dp_sum_y) / dp_denom, 2)
+
     return {
         "current": current,
         "min": min(temp_values),
         "max": max(temp_values),
         "trend_direction": direction,
         "rate_of_change_per_hour": round(slope, 2),
+        "dewpoint_rate": dewpoint_rate,
     }
 
 

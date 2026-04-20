@@ -150,3 +150,156 @@ def _sharpe(returns: list[float], n_trades: int) -> float:
     if std == 0:
         return 0.0
     return mean / std * math.sqrt(n_trades)
+
+
+# ---------------------------------------------------------------------------
+# Distribution pipeline backtest (V2)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class CalibrationBucket:
+    """Calibration stats for a single temperature bucket."""
+
+    bucket_value: int
+    predicted_avg: float
+    actual_rate: float
+    count: int
+
+
+@dataclass
+class DistributionSimResult:
+    """Result of the distribution pipeline backtest."""
+
+    calibration_error: float  # Mean absolute error across buckets
+    brier_score: float
+    num_days: int
+    per_bucket: list[CalibrationBucket]
+
+
+async def simulate_distribution_pipeline(
+    stations: list[str],
+    days_back: int = 30,
+) -> DistributionSimResult:
+    """Backtest the probability engine against historical METAR outcomes.
+
+    For each station and each historical day:
+      1. Reconstruct a WeatherState from stored routine METARs
+      2. Run compute_distribution() with typical temperature buckets
+      3. Compare predicted probabilities to the actual daily max outcome
+
+    Returns calibration metrics.
+    """
+    from datetime import datetime, timedelta, timezone
+    from src.db.engine import async_session
+    from src.db.models import MetarObservation
+    from src.signals.probability_engine import compute_distribution
+    from src.signals.state_aggregator import WeatherState
+    from sqlalchemy import select, func
+
+    # Collect predicted vs actual across all days/stations
+    predictions: list[tuple[int, float, bool]] = []  # (bucket, predicted_prob, was_actual)
+    num_days = 0
+
+    async with async_session() as session:
+        for icao in stations:
+            # Get date range with data
+            for day_offset in range(days_back, 0, -1):
+                day = datetime.now(timezone.utc) - timedelta(days=day_offset)
+                day_start = day.replace(hour=0, minute=0, second=0, microsecond=0)
+                day_end = day_start + timedelta(days=1)
+
+                # Get routine METARs for this day
+                stmt = (
+                    select(MetarObservation)
+                    .where(
+                        MetarObservation.station_icao == icao,
+                        MetarObservation.observed_at >= day_start,
+                        MetarObservation.observed_at < day_end,
+                        MetarObservation.is_speci == False,
+                        MetarObservation.temp_f.isnot(None),
+                    )
+                    .order_by(MetarObservation.observed_at)
+                )
+                result = await session.execute(stmt)
+                metars = result.scalars().all()
+
+                if len(metars) < 3:
+                    continue
+
+                # Actual daily max from routine METARs
+                actual_max = max(m.temp_f for m in metars)
+                actual_bucket = int(round(actual_max))
+
+                # Simulate mid-day state (use first half of METARs)
+                mid_count = len(metars) // 2
+                mid_metars = metars[:mid_count] if mid_count >= 2 else metars[:2]
+                mid_max = max(m.temp_f for m in mid_metars)
+
+                # Build a simplified WeatherState
+                temps = [m.temp_f for m in mid_metars]
+                if len(temps) >= 2:
+                    rate = (temps[-1] - temps[0]) / max(1, len(temps) - 1)
+                else:
+                    rate = 0.0
+
+                state = WeatherState(
+                    station_icao=icao,
+                    current_max_f=mid_max,
+                    metar_trend_rate=rate,
+                    dewpoint_trend_rate=0.0,
+                    forecast_peak_f=mid_max + 2.0,  # Simple estimate
+                    hours_until_peak=3.0,
+                    solar_declining=False,
+                    solar_decline_magnitude=0.0,
+                    cloud_rising=False,
+                    cloud_rise_magnitude=0.0,
+                    routine_count_today=mid_count,
+                )
+
+                # Generate buckets around expected range
+                center = int(mid_max)
+                buckets = list(range(center - 5, center + 10))
+
+                dist = compute_distribution(state, buckets)
+
+                for bucket, prob in dist.probabilities.items():
+                    was_actual = bucket == actual_bucket
+                    predictions.append((bucket, prob, was_actual))
+
+                num_days += 1
+
+    # Compute calibration metrics
+    if not predictions:
+        return DistributionSimResult(
+            calibration_error=0.0, brier_score=0.0, num_days=0, per_bucket=[]
+        )
+
+    # Brier score
+    brier = sum((p - (1.0 if a else 0.0)) ** 2 for _, p, a in predictions) / len(predictions)
+
+    # Per-bucket calibration
+    from collections import defaultdict
+    bucket_preds: dict[int, list[tuple[float, bool]]] = defaultdict(list)
+    for bucket, prob, actual in predictions:
+        bucket_preds[bucket].append((prob, actual))
+
+    per_bucket: list[CalibrationBucket] = []
+    total_error = 0.0
+    n_buckets = 0
+    for b in sorted(bucket_preds):
+        items = bucket_preds[b]
+        pred_avg = sum(p for p, _ in items) / len(items)
+        actual_rate = sum(1 for _, a in items if a) / len(items)
+        per_bucket.append(CalibrationBucket(b, round(pred_avg, 4), round(actual_rate, 4), len(items)))
+        total_error += abs(pred_avg - actual_rate)
+        n_buckets += 1
+
+    cal_error = total_error / n_buckets if n_buckets > 0 else 0.0
+
+    return DistributionSimResult(
+        calibration_error=round(cal_error, 4),
+        brier_score=round(brier, 6),
+        num_days=num_days,
+        per_bucket=per_bucket,
+    )
