@@ -7,6 +7,7 @@ Runs in dry-run mode when POLYMARKET_PRIVATE_KEY is not configured.
 from __future__ import annotations
 
 import logging
+import time as _time
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
 
@@ -306,30 +307,83 @@ async def cancel_order(trade: Trade) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Orderbook depth
+# Orderbook depth – cache, throttle, helpers
+# ---------------------------------------------------------------------------
+
+_orderbook_cache: dict[str, tuple[float, dict]] = {}
+_ORDERBOOK_TTL = 30.0  # seconds
+
+_last_clob_request: float = 0.0
+_CLOB_MIN_INTERVAL: float = 0.15  # ~6-7 req/s max
+
+_OB_MAX_RETRIES = 2
+_OB_RETRY_BACKOFF = (0.5, 1.5)
+
+
+def _get_cached_orderbook(token_id: str) -> dict | None:
+    entry = _orderbook_cache.get(token_id)
+    if entry is None:
+        return None
+    ts, book = entry
+    if _time.monotonic() - ts > _ORDERBOOK_TTL:
+        del _orderbook_cache[token_id]
+        return None
+    return book
+
+
+def _throttle_clob() -> None:
+    global _last_clob_request  # noqa: PLW0603
+    now = _time.monotonic()
+    elapsed = now - _last_clob_request
+    if elapsed < _CLOB_MIN_INTERVAL:
+        _time.sleep(_CLOB_MIN_INTERVAL - elapsed)
+    _last_clob_request = _time.monotonic()
+
+
+def _compute_depth(book: dict, price: float) -> float:
+    bids = book.get("bids", [])
+    depth = 0.0
+    for bid in bids:
+        bid_price = float(bid.get("price", 0))
+        bid_size = float(bid.get("size", 0))
+        if bid_price >= price:
+            depth += bid_price * bid_size
+    return depth
+
+
+# ---------------------------------------------------------------------------
+# Orderbook depth – public API
 # ---------------------------------------------------------------------------
 
 
 def get_orderbook_depth(token_id: str, price: float) -> float:
     """Return total USD depth at or better than *price* on the buy side.
 
-    Uses the CLOB client's ``get_order_book`` method. Returns 0.0 if the
-    client is unavailable or the query fails.
+    Uses the CLOB client's ``get_order_book`` method with a 30-second TTL
+    cache, inter-request throttling, and retry with backoff.  Returns 0.0
+    if the client is unavailable or all attempts fail.
     """
     client = _get_client()
     if client is None:
         return 0.0
 
-    try:
-        book = client.get_order_book(token_id)
-        bids = book.get("bids", [])
-        depth = 0.0
-        for bid in bids:
-            bid_price = float(bid.get("price", 0))
-            bid_size = float(bid.get("size", 0))
-            if bid_price >= price:
-                depth += bid_price * bid_size
-        return depth
-    except Exception:
-        logger.warning("Could not fetch orderbook for token %s", token_id)
-        return 0.0
+    cached = _get_cached_orderbook(token_id)
+    if cached is not None:
+        return _compute_depth(cached, price)
+
+    for attempt in range(_OB_MAX_RETRIES + 1):
+        _throttle_clob()
+        try:
+            book = client.get_order_book(token_id)
+            _orderbook_cache[token_id] = (_time.monotonic(), book)
+            return _compute_depth(book, price)
+        except Exception as exc:
+            if attempt < _OB_MAX_RETRIES:
+                _time.sleep(_OB_RETRY_BACKOFF[attempt])
+            else:
+                logger.warning(
+                    "Could not fetch orderbook for token %s after %d attempts: %s",
+                    token_id, _OB_MAX_RETRIES + 1, exc,
+                )
+                return 0.0
+    return 0.0
