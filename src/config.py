@@ -48,16 +48,6 @@ class Settings(BaseSettings):
     WX_RETENTION_HOURS: int = 48
     WX_PEAK_CONFIRM_MINUTES: int = 15  # Minutes of decline before declaring peak done
 
-    # Weather Underground scraping
-    WU_SCRAPE_DELAY_SECONDS: float = 3.0
-    WU_SCRAPE_TIMEOUT_MS: int = 15000
-
-    # WU confirmation pipeline
-    WU_CONFIRM_ENABLED: bool = True
-    WU_CONFIRM_DROP_F: float = 1.0  # Min drop from peak to count as decrease
-    WU_CONFIRM_RETRY_MINUTES: int = 15  # Re-scrape interval for WU_WAITING
-    WU_CONFIRM_MAX_SCRAPES: int = 8  # Max WU scrapes per station per day
-
     # Polymarket execution
     POLYMARKET_PRIVATE_KEY: str = ""  # Polygon wallet private key; empty = dry-run
     POLYMARKET_HOST: str = "https://clob.polymarket.com"

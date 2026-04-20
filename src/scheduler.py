@@ -550,54 +550,6 @@ async def job_wx_rapid_pipeline() -> None:
                 len(icao_set), len(new_obs),
             )
 
-            # 3b. Confirmation pipeline
-            if settings.WU_CONFIRM_ENABLED:
-                from src.ingestion.confirmation import (
-                    ConfirmationState,
-                    get_confirmation_tracker,
-                )
-
-                tracker = get_confirmation_tracker()
-
-                # Feed new observations to the tracker
-                stations_to_scrape: list[str] = []
-                for icao, obs in new_obs.items():
-                    new_state = tracker.on_new_observation(icao, obs)
-                    if new_state == ConfirmationState.DECREASE_DETECTED:
-                        stations_to_scrape.append(icao)
-
-                # Add stations waiting for WU data retry
-                stations_to_scrape.extend(tracker.get_stations_needing_wu_retry())
-
-                # Scrape WU sequentially (rate limited)
-                for icao in stations_to_scrape:
-                    try:
-                        wu_state = await tracker.check_wu_confirmation(icao)
-                        sc = tracker.get(icao)
-                        if sc is None:
-                            continue
-                        if wu_state == ConfirmationState.WU_CONFIRMED:
-                            matches = await tracker.match_markets(icao, session)
-                            await alerter.send_confirmation_alert(
-                                icao,
-                                sc.peak_temp_f,
-                                sc.wu_high_f,
-                                sc.db_vs_wu_delta,
-                                matches,
-                            )
-                            sc.state = ConfirmationState.ALERTED
-                        elif wu_state == ConfirmationState.WU_WAITING:
-                            if not sc._wu_waiting_alerted:
-                                await alerter.send_wu_waiting_alert(
-                                    icao, sc.peak_temp_f, sc.wu_latest_hour,
-                                    sc.peak_time_local,
-                                )
-                                sc._wu_waiting_alerted = True
-                    except Exception:
-                        logger.exception(
-                            "Confirmation pipeline error for %s", icao,
-                        )
-
             # 4. Analyze trends and detect events for each station
             all_events = []
             for icao in icao_set:

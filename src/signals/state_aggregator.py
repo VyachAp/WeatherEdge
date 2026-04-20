@@ -177,7 +177,8 @@ async def aggregate_state(
             bias_c = 1.0
         adjusted_peak_c = forecast.peak_temp_c + bias_c
         forecast_peak_f = _c_to_f(adjusted_peak_c)
-        hours_until_peak = max(0.0, forecast.peak_hour_utc - current_hour)
+        peak_dt = now_utc.replace(hour=forecast.peak_hour_utc, minute=0, second=0, microsecond=0)
+        hours_until_peak = max(0.0, (peak_dt - now_utc).total_seconds() / 3600.0)
 
         is_solar_declining, solar_mag = check_solar(forecast, current_hour)
         is_cloud_rising, cloud_mag = check_cloud(forecast, current_hour)
