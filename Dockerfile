@@ -24,9 +24,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=builder /install /usr/local
 
-# Install Playwright Chromium + its OS dependencies
-RUN playwright install --with-deps chromium
-
 RUN useradd --create-home --uid 1000 appuser
 
 WORKDIR /app
