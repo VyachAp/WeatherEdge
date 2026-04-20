@@ -135,98 +135,14 @@ _p(
     {"variable": "temperature"},
 )
 
-# 3 — Precipitation / rainfall amount
-#     "Will rainfall in Houston exceed 5 inches on September 12?"
-_p(
-    r"(?:rainfall|precipitation|rain)\s+in\s+" + _L + r"\s+(?P<operator>exceed|surpass|reach|go above|top)\s+(?P<threshold>\d+(?:\.\d+)?)\s*(?:inches|in\b|mm)",
-    {"variable": "precipitation"},
-)
-
-# 4 — Snowfall amount
-#     "Will snowfall in Denver exceed 12 inches in January 2026?"
-_p(
-    r"snowfall\s+in\s+" + _L + r"\s+(?P<operator>exceed|surpass|reach|top)\s+(?P<threshold>\d+(?:\.\d+)?)\s*(?:inches|in\b|cm)",
-    {"variable": "snowfall"},
-)
-
-# 5 — Hurricane landfall
-#     "Will a hurricane make landfall in Florida in 2026?"
-_p(
-    r"(?:a\s+)?(?:hurricane|tropical storm|cyclone)\s+(?:make\s+)?landfall\s+in\s+" + _L + r"(?:\s+in\s+(?P<date>\d{4}))?\s*\??",
-    {"variable": "hurricane_landfall", "operator": "occurs"},
-)
-
-# 6 — Named hurricane category
-#     "Will Hurricane Milton reach Category 5?"
-_p(
-    r"hurricane\s+(?P<name>[A-Z]\w+)\s+(?:reach|become|intensify to|hit)\s+(?:a\s+)?category\s+(?P<threshold>[1-5])",
-    {"variable": "hurricane_category", "operator": "at_least"},
-)
-
-# 7 — Heat wave / consecutive days above threshold
-#     "Will Chicago have 5 consecutive days above 95°F in July?"
-_p(
-    _L + r"\s+have\s+(?P<days>\d+)\s+consecutive\s+days\s+(?P<operator>above|below)\s+(?P<threshold>-?\d+(?:\.\d+)?)\s*°?\s*(?P<unit>[FC])",
-    {"variable": "heat_wave"},
-)
-
-# 8 — Freeze / frost
-#     "Will there be a freeze in Atlanta before November 15, 2026?"
-_p(
-    r"(?:a\s+)?(?:freeze|frost|freezing temperatures?)\s+in\s+" + _L + r"(?:\s+(?:before|by|after)\s+(?P<date>[\w\s,]+))?\s*\??",
-    {"variable": "freeze", "operator": "occurs", "threshold": "32"},
-)
-
-# 9 — Drought declaration
-#     "Will a drought be declared in California in 2026?"
-_p(
-    r"(?:a\s+)?drought\s+(?:be\s+)?(?:declared|announced)\s+in\s+" + _L + r"(?:\s+in\s+(?P<date>[\w\s,]+))?\s*\??",
-    {"variable": "drought", "operator": "occurs"},
-)
-
-# 10 — Tornado count
-#      "Will there be more than 20 tornadoes in Oklahoma in April 2026?"
-_p(
-    r"(?:more than|at least|fewer than|over|under)\s+(?P<threshold>\d+)\s+tornado(?:e?s)?\s+in\s+" + _L + r"(?:\s+in\s+(?P<date>[\w\s,]+))?\s*\??",
-    {"variable": "tornado_count"},
-)
-
-# 11 — Wildfire acreage
-#      "Will wildfires burn more than 500,000 acres in California in 2026?"
-_p(
-    r"wildfire[s]?\s+burn\s+(?:more than|over|at least)\s+(?P<threshold>[\d,]+)\s+acres\s+in\s+" + _L + r"(?:\s+in\s+(?P<date>[\w\s,]+))?\s*\??",
-    {"variable": "wildfire_acreage", "operator": "above"},
-)
-
-# 12 — Flood event
-#      "Will there be major flooding in Houston in 2026?"
-_p(
-    r"(?:major\s+)?flood(?:ing)?\s+in\s+" + _L + r"(?:\s+in\s+(?P<date>[\w\s,]+))?\s*\??",
-    {"variable": "flood", "operator": "occurs"},
-)
-
-# 13 — Wind speed threshold
-#      "Will wind speeds in Miami exceed 100 mph during hurricane season?"
-_p(
-    r"wind\s+(?:speeds?|gusts?)\s+in\s+" + _L + r"\s+(?P<operator>exceed|surpass|reach|top)\s+(?P<threshold>\d+(?:\.\d+)?)\s*(?:mph|km/h|knots)",
-    {"variable": "wind_speed"},
-)
-
-# 14 — Generic "above/below X" with degrees
-#      "Will it be above 110°F in Death Valley on August 1?"
+# 3 — Generic "above/below X" with degrees
+#     "Will it be above 110°F in Death Valley on August 1?"
 _p(
     r"(?:be|go|get|stay)\s+(?P<operator>above|below)\s+(?P<threshold>-?\d+(?:\.\d+)?)\s*°\s*(?P<unit>[FC])\s+in\s+" + _L,
     {"variable": "temperature"},
 )
 
-# 15 — Record-breaking phrasing
-#      "Will 2026 be the hottest year on record in the US?"
-_p(
-    r"(?P<date>\d{4})\s+be\s+the\s+(?P<superlative>hottest|coldest|wettest|driest|warmest|snowiest)\s+(?:year|month|season|summer|winter)\s+(?:on record\s+)?in\s+(?:the\s+)?" + _L,
-    {"variable": "record", "operator": "record_breaking"},
-)
-
-# 16a — Single-value high/low temperature market (Yes/No)
+# 4a — Single-value high/low temperature market (Yes/No)
 #       "Will the highest temperature in Paris be 22°C on April 11?"
 #       "Will the highest temperature in Paris be 28°C or higher on April 11?"
 #       "Will the lowest temperature in Seoul be 5°C or lower on April 12?"
@@ -238,7 +154,7 @@ _p(
     {"variable": "temperature", "operator": "exactly"},
 )
 
-# 16b — Bracket temperature market (daily high/low)
+# 4b — Bracket temperature market (daily high/low)
 #       "Highest temperature in Austin on April 8?"
 #       "Lowest temperature in Seoul on April 12?"
 _p(
@@ -249,7 +165,7 @@ _p(
 
 # Operator normalization map
 _OP_MAP = {
-    "exceed": "above", "surpass": "above", "go above": "above", "top": "above",
+    "exceed": "above", "surpass": "above", "go above": "above",
     "reach": "at_least", "hit": "at_least",
     "drop below": "below", "fall below": "below", "go below": "below",
     "at or above": "at_least", "at or below": "at_most",

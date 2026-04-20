@@ -24,7 +24,6 @@ from src.signals.mapper import (
     geocode,
     normalize_operator,
     parse_target_date,
-    resolve_variable,
 )
 
 
@@ -75,10 +74,7 @@ class TestNormalizeOperator:
     def test_at_most_maps_to_below(self):
         assert normalize_operator("at_most") == "below"
 
-    def test_occurs_maps_to_below(self):
-        assert normalize_operator("occurs") == "below"
-
-    def test_record_breaking_returns_none(self):
+    def test_unknown_operator_returns_none(self):
         assert normalize_operator("record_breaking") is None
 
 
@@ -136,13 +132,6 @@ class TestConvertThreshold:
         # 100°F = 310.928K
         assert pytest.approx(convert_threshold(100.0, "temperature"), abs=0.1) == 310.93
 
-    def test_precipitation_inches_to_mm(self):
-        # 1 inch = 25.4 mm
-        assert pytest.approx(convert_threshold(1.0, "precipitation"), abs=0.01) == 25.4
-
-    def test_wind_speed_mph_to_ms(self):
-        # 60 mph ≈ 26.82 m/s
-        assert pytest.approx(convert_threshold(60.0, "wind_speed"), abs=0.1) == 26.82
 
 
 # ===================================================================
@@ -198,7 +187,7 @@ class TestMapMarket:
     async def test_unsupported_variable_returns_none(self):
         from src.signals.mapper import map_market
 
-        market = _make_market(parsed_variable="hurricane_landfall")
+        market = _make_market(parsed_variable="precipitation")
         result = await map_market(market)
         assert result is None
 
@@ -377,7 +366,7 @@ class TestDetectSignalsE2E:
         )
         unsupported_market = _make_market(
             id="unsup_003",
-            parsed_variable="hurricane_landfall",
+            parsed_variable="precipitation",
         )
 
         mock_markets.return_value = [good_market, small_edge_market, unsupported_market]
@@ -556,41 +545,6 @@ class TestDetectSignalsAviationE2E:
         assert session.add.called
         call_args = session.add.call_args[0][0]
         assert call_args.aviation_prob == 0.75
-
-
-# ===================================================================
-# Variable alias resolution
-# ===================================================================
-
-
-class TestResolveVariable:
-    def test_snowfall_maps_to_precipitation(self):
-        var, thresh, op = resolve_variable("snowfall", 6.0, "above")
-        assert var == "precipitation"
-        assert thresh == 6.0
-        assert op == "above"
-
-    def test_freeze_maps_to_temperature_below_32(self):
-        var, thresh, op = resolve_variable("freeze", None, "occurs")
-        assert var == "temperature"
-        assert thresh == 32.0
-        assert op == "below"
-
-    def test_heat_wave_maps_to_temperature_above(self):
-        var, thresh, op = resolve_variable("heat_wave", 100.0, "at_least")
-        assert var == "temperature"
-        assert thresh == 100.0
-        assert op == "above"
-
-    def test_known_variable_unchanged(self):
-        var, thresh, op = resolve_variable("temperature", 90.0, "above")
-        assert var == "temperature"
-        assert thresh == 90.0
-        assert op == "above"
-
-    def test_unknown_variable_unchanged(self):
-        var, thresh, op = resolve_variable("hurricane_landfall", None, "occurs")
-        assert var == "hurricane_landfall"
 
 
 # ===================================================================

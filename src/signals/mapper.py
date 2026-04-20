@@ -593,45 +593,9 @@ OPERATOR_MAP: dict[str, str] = {
     "below": "below",
     "at_least": "above",
     "at_most": "below",
-    "occurs": "below",  # freeze/frost events → temperature below threshold
 }
 
-SUPPORTED_VARIABLES: set[str] = {"temperature", "precipitation", "wind_speed"}
-
-# Aliases map unsupported market variables to NWP-compatible ones.
-VARIABLE_ALIASES: dict[str, dict] = {
-    "snowfall": {
-        "nwp_variable": "precipitation",
-    },
-    "freeze": {
-        "nwp_variable": "temperature",
-        "threshold_override": 32.0,  # always 32°F
-        "operator_override": "below",
-    },
-    "heat_wave": {
-        "nwp_variable": "temperature",
-        "operator_override": "above",
-    },
-}
-
-
-def resolve_variable(
-    variable: str,
-    threshold: float | None,
-    operator: str | None,
-) -> tuple[str, float | None, str | None]:
-    """Resolve market variable to NWP-compatible variable via aliases.
-
-    Returns (resolved_variable, resolved_threshold, resolved_operator).
-    """
-    alias = VARIABLE_ALIASES.get(variable)
-    if alias is None:
-        return variable, threshold, operator
-    return (
-        alias["nwp_variable"],
-        alias.get("threshold_override", threshold),
-        alias.get("operator_override", operator),
-    )
+SUPPORTED_VARIABLES: set[str] = {"temperature"}
 
 
 def normalize_operator(op: str) -> str | None:
@@ -648,15 +612,9 @@ def convert_threshold(value: float, variable: str) -> float:
     """Convert a market threshold from imperial to SI units.
 
     - temperature: °F → K
-    - precipitation: inches → kg/m² (≈ mm)
-    - wind_speed: mph → m/s
     """
     if variable == "temperature":
         return (value - 32.0) * 5.0 / 9.0 + 273.15
-    if variable == "precipitation":
-        return value * 25.4
-    if variable == "wind_speed":
-        return value / 2.237
     return value
 
 
@@ -755,12 +713,9 @@ async def map_market(
         )
         return None
 
-    # Resolve variable aliases (snowfall→precipitation, freeze→temperature, etc.)
-    variable, threshold, operator_raw = resolve_variable(
-        market.parsed_variable,
-        market.parsed_threshold,
-        market.parsed_operator,
-    )
+    variable = market.parsed_variable
+    threshold = market.parsed_threshold
+    operator_raw = market.parsed_operator
 
     if variable not in SUPPORTED_VARIABLES:
         logger.debug(

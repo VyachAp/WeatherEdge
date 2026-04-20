@@ -1226,19 +1226,16 @@ async def get_realtime_probability(market: Any) -> float | None:
     Returns None if aviation data cannot contribute (unsupported variable,
     unknown location, or target beyond 30-hour TAF range).
     """
-    from src.signals.mapper import icao_for_location, normalize_operator, parse_target_date, resolve_variable
+    from src.signals.mapper import icao_for_location, normalize_operator, parse_target_date
 
     if not market.parsed_variable:
         return None
 
-    # Resolve variable aliases (e.g., snowfall→precipitation, freeze→temperature)
-    variable, threshold, operator_raw = resolve_variable(
-        market.parsed_variable,
-        market.parsed_threshold,
-        market.parsed_operator,
-    )
+    variable = market.parsed_variable
+    threshold = market.parsed_threshold
+    operator_raw = market.parsed_operator
 
-    if variable not in ("temperature", "precipitation", "wind_speed"):
+    if variable != "temperature":
         return None
 
     if not market.parsed_location:

@@ -38,147 +38,6 @@ SAMPLE_TEMP_MARKET = {
     "closed": False,
 }
 
-SAMPLE_HURRICANE_MARKET = {
-    "id": "0xabc2",
-    "question": "Will a hurricane make landfall in Florida in 2026?",
-    "slug": "hurricane-landfall-florida-2026",
-    "outcomes": ["Yes", "No"],
-    "outcomePrices": ["0.42", "0.58"],
-    "volume": "300000",
-    "liquidity": "92000",
-    "endDate": "2026-12-01T00:00:00Z",
-    "resolutionSource": "NHC",
-    "tags": [{"label": "weather"}],
-    "active": True,
-    "closed": False,
-}
-
-SAMPLE_SNOW_MARKET = {
-    "id": "0xabc3",
-    "question": "Will snowfall in Denver exceed 12 inches in January 2026?",
-    "slug": "denver-snow-12in-jan-2026",
-    "outcomes": ["Yes", "No"],
-    "outcomePrices": ["0.55", "0.45"],
-    "volume": "80000",
-    "liquidity": "31000",
-    "endDate": "2026-02-01T00:00:00Z",
-    "tags": [{"label": "weather"}],
-    "active": True,
-    "closed": False,
-}
-
-SAMPLE_RAIN_MARKET = {
-    "id": "0xabc4",
-    "question": "Will rainfall in Houston exceed 5 inches on September 12?",
-    "slug": "houston-rain-5in-sep",
-    "outcomes": ["Yes", "No"],
-    "outcomePrices": ["0.20", "0.80"],
-    "volume": "50000",
-    "liquidity": "19000",
-    "endDate": "2026-09-13T00:00:00Z",
-    "tags": [],
-    "active": True,
-    "closed": False,
-}
-
-SAMPLE_HEATWAVE_MARKET = {
-    "id": "0xabc5",
-    "question": "Will Chicago have 5 consecutive days above 95°F in July?",
-    "slug": "chicago-heatwave-jul",
-    "outcomes": ["Yes", "No"],
-    "outcomePrices": ["0.15", "0.85"],
-    "volume": "35000",
-    "liquidity": "12000",
-    "endDate": "2026-08-01T00:00:00Z",
-    "tags": [{"label": "climate"}],
-    "active": True,
-    "closed": False,
-}
-
-SAMPLE_TORNADO_MARKET = {
-    "id": "0xabc6",
-    "question": "Will there be more than 20 tornadoes in Oklahoma in April 2026?",
-    "slug": "oklahoma-tornadoes-apr-2026",
-    "outcomes": ["Yes", "No"],
-    "outcomePrices": ["0.30", "0.70"],
-    "volume": "60000",
-    "liquidity": "22000",
-    "endDate": "2026-05-01T00:00:00Z",
-    "tags": [{"label": "weather"}],
-    "active": True,
-    "closed": False,
-}
-
-SAMPLE_FREEZE_MARKET = {
-    "id": "0xabc7",
-    "question": "Will there be a freeze in Atlanta before November 15, 2026?",
-    "slug": "atlanta-freeze-nov-2026",
-    "outcomes": ["Yes", "No"],
-    "outcomePrices": ["0.25", "0.75"],
-    "volume": "40000",
-    "liquidity": "15000",
-    "endDate": "2026-11-16T00:00:00Z",
-    "tags": [],
-    "active": True,
-    "closed": False,
-}
-
-SAMPLE_DROUGHT_MARKET = {
-    "id": "0xabc8",
-    "question": "Will a drought be declared in California in 2026?",
-    "slug": "california-drought-2026",
-    "outcomes": ["Yes", "No"],
-    "outcomePrices": ["0.50", "0.50"],
-    "volume": "200000",
-    "liquidity": "75000",
-    "endDate": "2027-01-01T00:00:00Z",
-    "tags": [{"label": "climate"}],
-    "active": True,
-    "closed": False,
-}
-
-SAMPLE_WILDFIRE_MARKET = {
-    "id": "0xabc9",
-    "question": "Will wildfires burn more than 500,000 acres in California in 2026?",
-    "slug": "california-wildfire-500k-2026",
-    "outcomes": ["Yes", "No"],
-    "outcomePrices": ["0.40", "0.60"],
-    "volume": "150000",
-    "liquidity": "55000",
-    "endDate": "2027-01-01T00:00:00Z",
-    "tags": [{"label": "weather"}],
-    "active": True,
-    "closed": False,
-}
-
-SAMPLE_WIND_MARKET = {
-    "id": "0xabc10",
-    "question": "Will wind speeds in Miami exceed 100 mph during hurricane season?",
-    "slug": "miami-wind-100mph",
-    "outcomes": ["Yes", "No"],
-    "outcomePrices": ["0.22", "0.78"],
-    "volume": "70000",
-    "liquidity": "26000",
-    "endDate": "2026-12-01T00:00:00Z",
-    "tags": [{"label": "weather"}],
-    "active": True,
-    "closed": False,
-}
-
-SAMPLE_RECORD_MARKET = {
-    "id": "0xabc11",
-    "question": "Will 2026 be the hottest year on record in the US?",
-    "slug": "2026-hottest-year-us",
-    "outcomes": ["Yes", "No"],
-    "outcomePrices": ["0.60", "0.40"],
-    "volume": "500000",
-    "liquidity": "180000",
-    "endDate": "2027-02-01T00:00:00Z",
-    "tags": [{"label": "climate"}],
-    "active": True,
-    "closed": False,
-}
-
 SAMPLE_HIGH_RECORD_MARKET = {
     "id": "0xabc12",
     "question": "Will New York City record a high above 100°F in July 2026?",
@@ -188,20 +47,6 @@ SAMPLE_HIGH_RECORD_MARKET = {
     "volume": "90000",
     "liquidity": "33000",
     "endDate": "2026-08-01T00:00:00Z",
-    "tags": [{"label": "weather"}],
-    "active": True,
-    "closed": False,
-}
-
-SAMPLE_HURRICANE_CATEGORY_MARKET = {
-    "id": "0xabc13",
-    "question": "Will Hurricane Milton reach Category 5?",
-    "slug": "hurricane-milton-cat5",
-    "outcomes": ["Yes", "No"],
-    "outcomePrices": ["0.08", "0.92"],
-    "volume": "250000",
-    "liquidity": "95000",
-    "endDate": "2026-11-30T00:00:00Z",
     "tags": [{"label": "weather"}],
     "active": True,
     "closed": False,
@@ -237,18 +82,7 @@ SAMPLE_NON_WEATHER_MARKET = {
 
 ALL_WEATHER_SAMPLES = [
     SAMPLE_TEMP_MARKET,
-    SAMPLE_HURRICANE_MARKET,
-    SAMPLE_SNOW_MARKET,
-    SAMPLE_RAIN_MARKET,
-    SAMPLE_HEATWAVE_MARKET,
-    SAMPLE_TORNADO_MARKET,
-    SAMPLE_FREEZE_MARKET,
-    SAMPLE_DROUGHT_MARKET,
-    SAMPLE_WILDFIRE_MARKET,
-    SAMPLE_WIND_MARKET,
-    SAMPLE_RECORD_MARKET,
     SAMPLE_HIGH_RECORD_MARKET,
-    SAMPLE_HURRICANE_CATEGORY_MARKET,
     SAMPLE_GENERIC_ABOVE_MARKET,
 ]
 
@@ -304,90 +138,12 @@ class TestParseQuestion:
         assert p.threshold == 100.0
         assert p.operator == "above"
 
-    def test_precipitation(self):
-        p = parse_question(SAMPLE_RAIN_MARKET["question"])
-        assert p.matched
-        assert p.variable == "precipitation"
-        assert p.location == "Houston"
-        assert p.threshold == 5.0
-        assert p.operator == "above"
-
-    def test_snowfall(self):
-        p = parse_question(SAMPLE_SNOW_MARKET["question"])
-        assert p.matched
-        assert p.variable == "snowfall"
-        assert p.location == "Denver"
-        assert p.threshold == 12.0
-
-    def test_hurricane_landfall(self):
-        p = parse_question(SAMPLE_HURRICANE_MARKET["question"])
-        assert p.matched
-        assert p.variable == "hurricane_landfall"
-        assert p.location == "Florida"
-        assert p.operator == "occurs"
-
-    def test_hurricane_category(self):
-        p = parse_question(SAMPLE_HURRICANE_CATEGORY_MARKET["question"])
-        assert p.matched
-        assert p.variable == "hurricane_category"
-        assert p.threshold == 5.0
-
-    def test_heat_wave(self):
-        p = parse_question(SAMPLE_HEATWAVE_MARKET["question"])
-        assert p.matched
-        assert p.variable == "heat_wave"
-        assert p.location == "Chicago"
-        assert p.threshold == 95.0
-        assert p.operator == "above"
-
-    def test_freeze(self):
-        p = parse_question(SAMPLE_FREEZE_MARKET["question"])
-        assert p.matched
-        assert p.variable == "freeze"
-        assert p.location == "Atlanta"
-        assert p.operator == "occurs"
-
-    def test_drought(self):
-        p = parse_question(SAMPLE_DROUGHT_MARKET["question"])
-        assert p.matched
-        assert p.variable == "drought"
-        assert p.location == "California"
-        assert p.operator == "occurs"
-
-    def test_tornado_count(self):
-        p = parse_question(SAMPLE_TORNADO_MARKET["question"])
-        assert p.matched
-        assert p.variable == "tornado_count"
-        assert p.location == "Oklahoma"
-        assert p.threshold == 20.0
-
-    def test_wildfire_acreage(self):
-        p = parse_question(SAMPLE_WILDFIRE_MARKET["question"])
-        assert p.matched
-        assert p.variable == "wildfire_acreage"
-        assert p.location == "California"
-        assert p.threshold == 500000.0
-        assert p.operator == "above"
-
-    def test_wind_speed(self):
-        p = parse_question(SAMPLE_WIND_MARKET["question"])
-        assert p.matched
-        assert p.variable == "wind_speed"
-        assert p.location == "Miami"
-        assert p.threshold == 100.0
-
     def test_generic_above(self):
         p = parse_question(SAMPLE_GENERIC_ABOVE_MARKET["question"])
         assert p.matched
         assert p.variable == "temperature"
         assert p.threshold == 110.0
         assert p.operator == "above"
-
-    def test_record_breaking(self):
-        p = parse_question(SAMPLE_RECORD_MARKET["question"])
-        assert p.matched
-        assert p.variable == "record"
-        assert "US" in p.location
 
     def test_no_match_fallback(self):
         p = parse_question("Something completely unrelated to weather patterns")
