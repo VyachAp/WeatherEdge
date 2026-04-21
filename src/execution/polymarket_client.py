@@ -310,7 +310,7 @@ async def cancel_order(trade: Trade) -> bool:
 # Orderbook depth – cache, throttle, helpers
 # ---------------------------------------------------------------------------
 
-_orderbook_cache: dict[str, tuple[float, dict]] = {}
+_orderbook_cache: dict[str, tuple[float, object]] = {}
 _ORDERBOOK_TTL = 30.0  # seconds
 
 _last_clob_request: float = 0.0
@@ -320,7 +320,7 @@ _OB_MAX_RETRIES = 2
 _OB_RETRY_BACKOFF = (0.5, 1.5)
 
 
-def _get_cached_orderbook(token_id: str) -> dict | None:
+def _get_cached_orderbook(token_id: str) -> object | None:
     entry = _orderbook_cache.get(token_id)
     if entry is None:
         return None
@@ -340,12 +340,12 @@ def _throttle_clob() -> None:
     _last_clob_request = _time.monotonic()
 
 
-def _compute_depth(book: dict, price: float) -> float:
-    bids = book.get("bids", [])
+def _compute_depth(book: object, price: float) -> float:
+    bids = book.bids if hasattr(book, "bids") else book.get("bids", [])  # type: ignore[union-attr]
     depth = 0.0
-    for bid in bids:
-        bid_price = float(bid.get("price", 0))
-        bid_size = float(bid.get("size", 0))
+    for bid in bids or []:
+        bid_price = float(bid.price if hasattr(bid, "price") else bid.get("price", 0))
+        bid_size = float(bid.size if hasattr(bid, "size") else bid.get("size", 0))
         if bid_price >= price:
             depth += bid_price * bid_size
     return depth
