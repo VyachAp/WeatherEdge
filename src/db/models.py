@@ -174,6 +174,12 @@ class ForecastExceedanceAlert(Base):
     forecast_temp_f = Column(Float, nullable=False)
     delta_f = Column(Float, nullable=False)
     forecast_hour_utc = Column(Integer, nullable=False)
+    current_max_f = Column(Float)
+    forecast_peak_f = Column(Float)
+    projected_max_f = Column(Float)
+    metar_trend_rate = Column(Float)
+    peak_passed = Column(Boolean)
+    alerted = Column(Boolean)
     alerted_at = Column(
         DateTime(timezone=True),
         nullable=False,
