@@ -8,7 +8,6 @@ import logging
 import re
 import traceback
 from datetime import datetime, time, timezone
-from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -26,8 +25,6 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
     from src.risk.drawdown import DrawdownState
-    from src.risk.kelly import PositionSize
-    from src.signals.detector import ActionableSignal
 
 logger = logging.getLogger(__name__)
 
@@ -51,24 +48,6 @@ def _confidence_label(confidence: float) -> str:
     return "LOW"
 
 
-def _auto_exec_line() -> str:
-    """Return the AUTO-EXECUTED indicator line if auto-execution is enabled."""
-    if settings.AUTO_EXECUTE and settings.POLYMARKET_PRIVATE_KEY:
-        return "\\u2705 *AUTO\\-EXECUTED*\n"
-    return ""
-
-
-def _short_range_line(signal: object, e: Callable[[object], str]) -> str:
-    """Build an optional short-range indicator line for aviation-enhanced signals."""
-    aviation_prob = getattr(signal, "aviation_prob", None)
-    hours = getattr(signal, "hours_to_resolution", None)
-    if aviation_prob is None or hours is None:
-        return ""
-    if hours <= 6:
-        return f"\u2708\ufe0f Short\\-range \\({e(f'{hours:.0f}h')}\\) \\u2014 aviation\\-enhanced\n"
-    if hours <= 12:
-        return f"\u2708\ufe0f Near\\-term \\({e(f'{hours:.0f}h')}\\) \\u2014 aviation\\-enhanced\n"
-    return f"\u2708\ufe0f Aviation data \\({e(f'{hours:.0f}h')}\\) available\n"
 
 
 # ---------------------------------------------------------------------------
@@ -206,69 +185,6 @@ class Alerter:
             await asyncio.sleep(0.05)  # ~20 msg/sec headroom
 
     # -- Alert: NEW_SIGNAL ----------------------------------------------------
-
-    async def send_signal_alert(
-        self,
-        signal: ActionableSignal,
-        position: PositionSize,
-        drawdown: DrawdownState,
-        market: Market,
-    ) -> None:
-        """Send a new-signal alert with inline action buttons."""
-        e = _escape_md2
-        direction = signal.direction.value.replace("_", " ")
-        conf_label = _confidence_label(signal.confidence)
-
-        aviation_str = f"{signal.aviation_prob * 100:.0f}%" if signal.aviation_prob is not None else "n/a"
-
-        resolve_date = market.end_date.strftime("%B %d") if market.end_date else "TBD"
-        liquidity_str = f"${market.liquidity:,.0f}" if market.liquidity else "n/a"
-
-        kelly_raw = f"{signal.edge / (1.0 / signal.market_prob - 1.0) * 100:.1f}" if signal.market_prob > 0 else "0"
-        capped_note = f" → capped at {settings.MAX_POSITION_PCT:.0%}" if position.capped else ""
-
-        slug = market.slug or market.id
-        url = f"https://polymarket.com/event/{slug}"
-
-        text = (
-            f"\U0001f321\ufe0f *{e(direction)}* — \"{e(signal.question)}\"\n"
-            f"\n"
-            f"\U0001f4b0 Stake: {e(f'${position.stake_usd:,.0f}')}\n"
-            f"\U0001f4ca Market: {e(f'{signal.market_prob * 100:.0f}%')} \\| "
-            f"Model: {e(f'{signal.consensus_prob * 100:.0f}%')}\n"
-            f"\U0001f4c8 Edge: {e(f'+{signal.edge * 100:.1f}%')}\n"
-            f"\U0001f3af Confidence: {e(f'{conf_label} ({signal.confidence:.2f})')}\n"
-            f"\n"
-            f"Aviation: {e(aviation_str)}\n"
-            f"{_short_range_line(signal, e)}"
-            f"\U0001f4c5 Resolves: {e(resolve_date)} \\| Liquidity: {e(liquidity_str)}\n"
-            f"\n"
-            f"Kelly: {e(f'{kelly_raw}%')}{e(capped_note)} "
-            f"\\({e(f'${position.stake_usd:,.2f}')}\\)\n"
-            f"Bankroll: {e(f'${drawdown.current:,.0f}')} \\| "
-            f"Drawdown: {e(f'{drawdown.drawdown_pct * 100:.1f}%')}\n"
-            f"\n"
-            f"{_auto_exec_line()}"
-            f"[Open on Polymarket]({e(url)})"
-        )
-
-        if settings.AUTO_EXECUTE and settings.POLYMARKET_PRIVATE_KEY:
-            # Auto mode: no execute button, just details
-            keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton("\U0001f4ca Details", callback_data=f"detail:{signal.market_id[:56]}")],
-            ])
-        else:
-            keyboard = InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton("\u2705 Execute", callback_data=f"exec:{signal.market_id[:56]}"),
-                    InlineKeyboardButton("\u23ed Skip", callback_data=f"skip:{signal.market_id[:56]}"),
-                ],
-                [
-                    InlineKeyboardButton("\U0001f4ca Details", callback_data=f"detail:{signal.market_id[:56]}"),
-                ],
-            ])
-
-        await self._enqueue(text, keyboard)
 
     # -- Alert: POSITION_UPDATE -----------------------------------------------
 

@@ -149,7 +149,7 @@ _p(
 _p(
     r"(?P<hilo>highest|lowest|high|low)\s+temperature\s+in\s+" + _L +
     r"\s+be\s+(?P<threshold>-?\d+(?:\.\d+)?)\s*°?\s*(?P<unit>[FC])?"
-    r"(?:\s+or\s+(?P<operator>higher|lower))?"
+    r"(?:\s+or\s+(?P<or_dir>higher|lower|above|below|more|less))?"
     r"(?:\s+on\s+(?P<date>[\w\s,]+))?\s*\??",
     {"variable": "temperature", "operator": "exactly"},
 )
@@ -333,7 +333,14 @@ def parse_question(question: str) -> ParsedQuestion:
             if loc_match:
                 location = loc_match.group(0).strip()
 
-        raw_op = groups.get("operator") or defaults.get("operator")
+        # "or_dir" comes from pattern 4a: "be X°C or higher/lower/above/below"
+        or_dir = groups.get("or_dir")
+        if or_dir:
+            _OR_DIR_MAP = {"higher": "at_least", "above": "at_least", "more": "at_least",
+                           "lower": "at_most", "below": "at_most", "less": "at_most"}
+            raw_op = _OR_DIR_MAP.get(or_dir.lower(), or_dir)
+        else:
+            raw_op = groups.get("operator") or defaults.get("operator")
         operator = _normalize_operator(raw_op)
 
         threshold_str = groups.get("threshold", defaults.get("threshold"))
@@ -362,7 +369,7 @@ def parse_question(question: str) -> ParsedQuestion:
             raw=question,
             pattern_index=pat_idx,
             extras={k: v for k, v in groups.items()
-                    if k not in ("location", "variable", "threshold", "operator", "date")
+                    if k not in ("location", "variable", "threshold", "operator", "date", "or_dir")
                     and v is not None},
         )
 

@@ -112,7 +112,7 @@ class TestDepthFilter:
     def test_insufficient_depth(self):
         dist = _make_dist({80: 0.80})
         prices = {80: 0.50}
-        depths = {80: 30.0}  # Below $50
+        depths = {80: 5.0}  # Below MIN_DEPTH_USD
         end = datetime.now(timezone.utc) + timedelta(hours=5)
 
         edges = compute_edges(dist, prices, routine_count=5, market_end_time=end, orderbook_depths=depths)

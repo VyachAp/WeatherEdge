@@ -29,7 +29,6 @@ from src.risk.drawdown import DrawdownLevel, DrawdownMonitor
 from src.risk.kelly import size_position
 from src.signals.consensus import get_calibration_coefficients
 from src.execution.polymarket_client import is_live, place_order
-from src.signals.detector import detect_signals_short_range
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession as AsyncSessionType
@@ -125,20 +124,6 @@ async def _get_drawdown_monitor() -> DrawdownMonitor:
     return _drawdown_monitor
 
 
-async def _latest_signal_id(
-    session: AsyncSessionType,
-    market_id: str,
-) -> int | None:
-    """Return the most recently created Signal id for a market."""
-    result = await session.execute(
-        select(Signal.id)
-        .where(Signal.market_id == market_id)
-        .order_by(Signal.created_at.desc())
-        .limit(1)
-    )
-    return result.scalar_one_or_none()
-
-
 # ---------------------------------------------------------------------------
 # Scheduled jobs
 # ---------------------------------------------------------------------------
@@ -154,83 +139,13 @@ async def job_scan_markets() -> None:
         await get_alerter().send_system_error(exc, "market scan")
 
 
-async def _size_and_create_trades(signals: list, alerter, monitor) -> None:
-    """Shared logic: size positions, create trades, send alerts."""
-    async with async_session() as session:
-        bankroll = await get_current_bankroll(session)
-        exposure = await get_current_exposure(session)
-        dd_state = monitor.check(bankroll)
-
-        for sig in signals:
-            position = size_position(
-                bankroll=bankroll,
-                model_prob=sig.consensus_prob,
-                market_prob=sig.market_prob,
-                current_exposure=exposure,
-            )
-
-            # Apply drawdown multiplier
-            adjusted_stake = position.stake_usd * dd_state.size_multiplier
-            if adjusted_stake < 5.0:
-                logger.info(
-                    "Skipping signal on %s: stake $%.2f after drawdown multiplier",
-                    sig.market_id,
-                    adjusted_stake,
-                )
-                continue
-
-            position.stake_usd = adjusted_stake
-
-            # Look up the Signal DB row for the FK
-            signal_id = await _latest_signal_id(session, sig.market_id)
-            if signal_id is None:
-                logger.warning("No Signal row found for market %s", sig.market_id)
-                continue
-
-            # Create trade
-            trade = Trade(
-                signal_id=signal_id,
-                market_id=sig.market_id,
-                direction=sig.direction,
-                stake_usd=position.stake_usd,
-                entry_price=sig.market_prob,
-                status=TradeStatus.PENDING,
-            )
-            session.add(trade)
-            await session.flush()  # assign trade.id before execution
-
-            # Execute order on Polymarket
-            order_ok = await place_order(trade, session)
-            if order_ok:
-                trade.status = TradeStatus.OPEN
-                exposure += position.stake_usd
-            else:
-                logger.warning(
-                    "Order failed for market %s (status: %s); trade stays PENDING",
-                    sig.market_id,
-                    trade.exchange_status,
-                )
-                continue
-
-            # Fetch Market row for the alert
-            market = await session.get(Market, sig.market_id)
-
-            await alerter.send_signal_alert(sig, position, dd_state, market)
-
-        if dd_state.level in (DrawdownLevel.CAUTION, DrawdownLevel.PAUSED):
-            await alerter.send_drawdown_warning(dd_state)
-
-        await session.commit()
-
-
 _UNIFIED_CONCURRENCY = 8  # Max concurrent city aggregations
 
 
 async def job_unified_pipeline() -> None:
     """Every 5 min — unified METAR + Open-Meteo + market pipeline.
 
-    Replaces job_short_range_pipeline and job_wx_rapid_pipeline when
-    UNIFIED_PIPELINE_ENABLED is True.
+    Runs every UNIFIED_PIPELINE_INTERVAL_MINUTES.
 
     Performance design:
       Phase 1 — fetch all weather states concurrently (bounded semaphore).
@@ -553,154 +468,6 @@ def _extract_market_prices(market, buckets: list[int]) -> dict[int, float]:
     return prices
 
 
-async def job_short_range_pipeline() -> None:
-    """Every 60 min — aviation-focused pipeline for markets ≤30h out."""
-    alerter = get_alerter()
-    try:
-        signals = await detect_signals_short_range()
-        logger.info("Short-range pipeline: %d actionable signals", len(signals))
-
-        if not signals:
-            return
-
-        monitor = await _get_drawdown_monitor()
-        await _size_and_create_trades(signals, alerter, monitor)
-
-    except Exception as exc:
-        logger.exception("Short-range pipeline failed")
-        await alerter.send_system_error(exc, "short-range pipeline")
-
-
-async def job_wx_rapid_pipeline() -> None:
-    """Every 1 min — Weather Company observation-driven rapid pipeline.
-
-    Polls airport ICAO stations for markets ≤12h out, deduplicates by
-    validTimeLocal, analyzes trends, and detects threshold crossings
-    and peak events for temporal edge trading.
-    """
-    from src.ingestion.wx import analyze_trend, detect_threshold_events, poll_stations
-    from src.signals.mapper import icao_for_location
-
-    alerter = get_alerter()
-    try:
-        async with async_session() as session:
-            # 1. Get ultra-short markets (≤12h)
-            now = datetime.now(timezone.utc)
-            cutoff = now + timedelta(hours=12)
-            stmt = select(Market).where(
-                Market.end_date.isnot(None),
-                Market.end_date <= cutoff,
-                Market.end_date > now,
-                Market.parsed_location.isnot(None),
-            )
-            result = await session.execute(stmt)
-            markets = result.scalars().all()
-
-            if not markets:
-                logger.debug("WX rapid: no ultra-short markets")
-                return
-
-            # 2. Map markets to ICAO stations
-            icao_set: set[str] = set()
-            market_icao: dict[str, str] = {}  # market_id → icao
-            market_thresholds: dict[str, list[tuple[float, str]]] = {}  # icao → [(threshold_f, operator)]
-
-            for m in markets:
-                icao = icao_for_location(m.parsed_location)
-                if not icao:
-                    continue
-                icao_set.add(icao)
-                market_icao[m.id] = icao
-
-                if m.parsed_threshold is not None and m.parsed_operator:
-                    key = icao
-                    if key not in market_thresholds:
-                        market_thresholds[key] = []
-                    market_thresholds[key].append(
-                        (m.parsed_threshold, m.parsed_operator)
-                    )
-
-            if not icao_set:
-                logger.debug("WX rapid: no ICAO stations for active markets")
-                return
-
-            # 3. Poll all stations (dedup + persist happens inside)
-            new_obs = await poll_stations(list(icao_set), session)
-            logger.debug(
-                "WX rapid: polled %d stations, %d new observations",
-                len(icao_set), len(new_obs),
-            )
-
-            # 4. Analyze trends and detect events for each station
-            all_events = []
-            for icao in icao_set:
-                thresholds = market_thresholds.get(icao, [])
-                if thresholds:
-                    events = detect_threshold_events(icao, thresholds)
-                    all_events.extend(events)
-
-                trend = analyze_trend(icao)
-                if trend is not None:
-                    logger.info(
-                        "WX trend %s: %.1f°F (max=%.1f min=%.1f) "
-                        "rate=%.1f°F/hr rising=%s falling=%s peak_done=%s",
-                        icao, trend.current_temp_f,
-                        trend.observed_max_f, trend.observed_min_f,
-                        trend.temp_rate_per_hour or 0.0,
-                        trend.is_rising, trend.is_falling,
-                        trend.peak_likely_passed,
-                    )
-
-            # 5. Log threshold events and run signal detection if needed
-            if all_events:
-                for ev in all_events:
-                    logger.info(
-                        "WX EVENT %s [%s]: %s (confidence=%.2f)",
-                        ev.station_icao, ev.event_type, ev.detail, ev.confidence,
-                    )
-
-                # Run full signal detection for affected markets
-                affected_icaos = {ev.station_icao for ev in all_events}
-                affected_market_ids = {
-                    mid for mid, icao in market_icao.items()
-                    if icao in affected_icaos
-                }
-
-                if affected_market_ids:
-                    signals = await detect_signals_short_range(session)
-                    signals = [s for s in signals if s.market_id in affected_market_ids]
-
-                    logger.info("WX rapid pipeline: %d actionable signals", len(signals))
-
-                    if signals:
-                        monitor = await _get_drawdown_monitor()
-                        await _size_and_create_trades(signals, alerter, monitor)
-
-                # Backward resolution: discover additional markets beyond 12h
-                from src.signals.reverse_lookup import find_markets_for_event
-
-                for ev in all_events:
-                    extra = await find_markets_for_event(
-                        session, ev.station_icao, ev.temp_f, hours_ahead=48.0,
-                    )
-                    extra_ids = {m.id for m in extra} - affected_market_ids
-                    if extra_ids:
-                        logger.info(
-                            "WX backward resolution: %s found %d additional market(s) "
-                            "beyond 12h window",
-                            ev.station_icao, len(extra_ids),
-                        )
-                        await alerter.send_market_discovery(
-                            ev.station_icao, ev.temp_f, extra,
-                        )
-
-            await session.commit()
-
-    except Exception as exc:
-        logger.exception("WX rapid pipeline failed")
-        await alerter.send_system_error(exc, "wx-rapid pipeline")
-
-
 async def job_daily_settlement() -> None:
     """Daily 22:00 UTC — resolve markets, P&L, daily summary."""
     alerter = get_alerter()
@@ -743,48 +510,46 @@ async def job_daily_settlement() -> None:
                 if result.rowcount:
                     logger.info("WX cleanup: deleted %d old observations", result.rowcount)
 
-            # 5. Station bias recording (unified pipeline)
-            if settings.UNIFIED_PIPELINE_ENABLED:
-                try:
-                    from src.ingestion.station_bias import record_daily_outcome
-                    from src.ingestion.aviation import get_routine_daily_max
-                    from src.ingestion.openmeteo import fetch_forecast
-                    from src.signals.mapper import icao_for_location, geocode, CITY_ICAO
+            # 5. Station bias recording
+            try:
+                from src.ingestion.station_bias import record_daily_outcome
+                from src.ingestion.aviation import get_routine_daily_max
+                from src.ingestion.openmeteo import fetch_forecast
+                from src.signals.mapper import icao_for_location, geocode, CITY_ICAO
 
-                    # Collect bias for each station that had active markets today
-                    seen_icaos: set[str] = set()
-                    stmt_markets = select(Market).where(
-                        Market.parsed_location.isnot(None),
-                        Market.parsed_variable == "temperature",
+                seen_icaos: set[str] = set()
+                stmt_markets = select(Market).where(
+                    Market.parsed_location.isnot(None),
+                    Market.parsed_variable == "temperature",
+                )
+                market_result = await session.execute(stmt_markets)
+                for mkt in market_result.scalars():
+                    icao = icao_for_location(mkt.parsed_location) if mkt.parsed_location else None
+                    if not icao or icao in seen_icaos:
+                        continue
+                    seen_icaos.add(icao)
+
+                    max_f, count = await get_routine_daily_max(icao)
+                    if max_f is None or count < 3:
+                        continue
+
+                    coords = geocode(mkt.parsed_location) if mkt.parsed_location else None
+                    if not coords:
+                        continue
+
+                    forecast = await fetch_forecast(coords[0], coords[1])
+                    if forecast is None:
+                        continue
+
+                    max_c = (max_f - 32.0) * 5.0 / 9.0
+                    await record_daily_outcome(
+                        session, icao,
+                        datetime.now(timezone.utc),
+                        max_c, forecast.peak_temp_c,
                     )
-                    market_result = await session.execute(stmt_markets)
-                    for mkt in market_result.scalars():
-                        icao = icao_for_location(mkt.parsed_location) if mkt.parsed_location else None
-                        if not icao or icao in seen_icaos:
-                            continue
-                        seen_icaos.add(icao)
-
-                        max_f, count = await get_routine_daily_max(icao)
-                        if max_f is None or count < 3:
-                            continue
-
-                        coords = geocode(mkt.parsed_location) if mkt.parsed_location else None
-                        if not coords:
-                            continue
-
-                        forecast = await fetch_forecast(coords[0], coords[1])
-                        if forecast is None:
-                            continue
-
-                        max_c = (max_f - 32.0) * 5.0 / 9.0
-                        await record_daily_outcome(
-                            session, icao,
-                            datetime.now(timezone.utc),
-                            max_c, forecast.peak_temp_c,
-                        )
-                    logger.info("Station bias recorded for %d stations", len(seen_icaos))
-                except Exception:
-                    logger.exception("Station bias recording failed (non-fatal)")
+                logger.info("Station bias recorded for %d stations", len(seen_icaos))
+            except Exception:
+                logger.exception("Station bias recording failed (non-fatal)")
 
             # 6. Weekly calibration check (Sundays)
             if datetime.now(timezone.utc).weekday() == 6:
@@ -814,7 +579,6 @@ async def job_startup() -> None:
     logger.info("Drawdown monitor loaded")
 
     await job_scan_markets()
-    await job_short_range_pipeline()
 
     try:
         async with async_session() as session:
@@ -923,35 +687,17 @@ def setup_scheduler() -> AsyncIOScheduler:
         max_instances=1,
         coalesce=True,
     )
-    if settings.UNIFIED_PIPELINE_ENABLED:
-        scheduler.add_job(
-            job_unified_pipeline,
-            IntervalTrigger(minutes=settings.UNIFIED_PIPELINE_INTERVAL_MINUTES),
-            id="unified_pipeline",
-            max_instances=1,
-            coalesce=True,
-        )
-        logger.info(
-            "Unified pipeline enabled (every %dm); legacy pipelines disabled",
-            settings.UNIFIED_PIPELINE_INTERVAL_MINUTES,
-        )
-    else:
-        scheduler.add_job(
-            job_short_range_pipeline,
-            IntervalTrigger(minutes=settings.SR_PIPELINE_INTERVAL_MINUTES),
-            id="short_range_pipeline",
-            max_instances=1,
-            coalesce=True,
-        )
-
-        if settings.WX_API_KEY:
-            scheduler.add_job(
-                job_wx_rapid_pipeline,
-                IntervalTrigger(minutes=settings.WX_PIPELINE_INTERVAL_MINUTES),
-                id="wx_rapid_pipeline",
-                max_instances=1,
-                coalesce=True,
-            )
+    scheduler.add_job(
+        job_unified_pipeline,
+        IntervalTrigger(minutes=settings.UNIFIED_PIPELINE_INTERVAL_MINUTES),
+        id="unified_pipeline",
+        max_instances=1,
+        coalesce=True,
+    )
+    logger.info(
+        "Unified pipeline enabled (every %dm)",
+        settings.UNIFIED_PIPELINE_INTERVAL_MINUTES,
+    )
 
     return scheduler
 

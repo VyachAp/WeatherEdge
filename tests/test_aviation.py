@@ -11,14 +11,12 @@ import pytest
 from src.ingestion.aviation import (
     _c_to_f,
     _find_taf_period,
-    _normal_cdf,
     _parse_airsigmet_json,
     _parse_metar_json,
     _parse_pirep_json,
     _parse_taf_json,
     _point_in_polygon,
     clear_aviation_cache,
-    compute_taf_based_probability,
     detect_speci_events,
     fetch_active_airmets,
     fetch_active_sigmets,
@@ -28,7 +26,6 @@ from src.ingestion.aviation import (
     fetch_pireps_near,
     get_aviation_weather_picture,
     get_current_temp,
-    get_realtime_probability,
     get_taf_precip_probability,
     get_taf_temperature_forecast,
     get_temp_trend,
@@ -842,165 +839,8 @@ class TestTafAmendmentCount:
 
 
 # ---------------------------------------------------------------------------
-# Composite probability function tests
+# Rate limiting tests (moved up after removing legacy probability tests)
 # ---------------------------------------------------------------------------
-
-
-class TestNormalCdf:
-    def test_zero(self):
-        assert _normal_cdf(0.0) == pytest.approx(0.5, abs=0.001)
-
-    def test_large_positive(self):
-        assert _normal_cdf(5.0) == pytest.approx(1.0, abs=0.001)
-
-    def test_large_negative(self):
-        assert _normal_cdf(-5.0) == pytest.approx(0.0, abs=0.001)
-
-    def test_one_sigma(self):
-        # P(Z < 1) ≈ 0.8413
-        assert _normal_cdf(1.0) == pytest.approx(0.8413, abs=0.01)
-
-
-@pytest.mark.asyncio
-class TestComputeTafProbability:
-    @patch("src.ingestion.aviation.taf_amendment_count", return_value=1)
-    @patch("src.ingestion.aviation.get_taf_temperature_forecast")
-    @patch("src.ingestion.aviation.get_temp_trend")
-    async def test_temperature_above_threshold(
-        self, mock_trend, mock_taf_temp, mock_amend
-    ):
-        mock_trend.return_value = {
-            "current": 93.0,
-            "min": 85.0,
-            "max": 93.0,
-            "trend_direction": "rising",
-            "rate_of_change_per_hour": 2.0,
-        }
-        mock_taf_temp.return_value = {"confidence": 0.7, "source": "taf"}
-
-        target = datetime.now(timezone.utc) + timedelta(hours=2)
-        prob = await compute_taf_based_probability("KPHX", "temperature", 95.0, target)
-        # Current 93 + 2*2 = 97 expected. Threshold 95 → high probability
-        assert prob > 0.5
-
-    @patch("src.ingestion.aviation.taf_amendment_count", return_value=1)
-    @patch("src.ingestion.aviation.get_taf_temperature_forecast")
-    @patch("src.ingestion.aviation.get_temp_trend")
-    async def test_temperature_well_below_threshold(
-        self, mock_trend, mock_taf_temp, mock_amend
-    ):
-        mock_trend.return_value = {
-            "current": 70.0,
-            "min": 65.0,
-            "max": 70.0,
-            "trend_direction": "steady",
-            "rate_of_change_per_hour": 0.0,
-        }
-        mock_taf_temp.return_value = {"confidence": 0.7, "source": "taf"}
-
-        target = datetime.now(timezone.utc) + timedelta(hours=3)
-        prob = await compute_taf_based_probability("KPHX", "temperature", 95.0, target)
-        # Current 70, steady. Threshold 95 → low probability
-        assert prob < 0.1
-
-    @patch("src.ingestion.aviation.get_taf_precip_probability", return_value=0.3)
-    async def test_precipitation(self, mock_precip):
-        target = datetime.now(timezone.utc) + timedelta(hours=6)
-        prob = await compute_taf_based_probability(
-            "KPHX", "precipitation", 0.5, target
-        )
-        assert prob == 0.3
-
-    @patch("src.ingestion.aviation.get_taf_temperature_forecast")
-    async def test_wind_speed(self, mock_taf):
-        mock_taf.return_value = {
-            "wind_speed_kts": 20,
-            "wind_gust_kts": 30,
-            "confidence": 0.7,
-            "source": "taf",
-        }
-
-        target = datetime.now(timezone.utc) + timedelta(hours=3)
-        prob = await compute_taf_based_probability(
-            "KPHX", "wind_speed", 25.0, target
-        )
-        # 25 mph ≈ 21.7 kts, max wind 30 kts → should have some probability
-        assert 0.0 <= prob <= 1.0
-
-
-@pytest.mark.asyncio
-class TestGetRealtimeProbability:
-    @patch("src.ingestion.aviation.compute_taf_based_probability", return_value=0.85)
-    @patch("src.signals.mapper.parse_target_date")
-    @patch("src.signals.mapper.icao_for_location", return_value="KPHX")
-    async def test_returns_probability_for_short_range(
-        self, mock_icao, mock_parse_dt, mock_compute
-    ):
-        mock_parse_dt.return_value = datetime.now(timezone.utc) + timedelta(hours=6)
-
-        market = MagicMock()
-        market.parsed_variable = "temperature"
-        market.parsed_location = "Phoenix"
-        market.parsed_target_date = "April 10, 2026 12:00"
-        market.parsed_threshold = 95.0
-
-        prob = await get_realtime_probability(market)
-        assert prob == 0.85
-
-    @patch("src.signals.mapper.parse_target_date")
-    @patch("src.signals.mapper.icao_for_location", return_value="KPHX")
-    async def test_returns_none_beyond_30h(self, mock_icao, mock_parse_dt):
-        mock_parse_dt.return_value = datetime.now(timezone.utc) + timedelta(hours=48)
-
-        market = MagicMock()
-        market.parsed_variable = "temperature"
-        market.parsed_location = "Phoenix"
-        market.parsed_target_date = "April 12, 2026"
-        market.parsed_threshold = 95.0
-
-        prob = await get_realtime_probability(market)
-        assert prob is None
-
-    async def test_returns_none_unsupported_variable(self):
-        market = MagicMock()
-        market.parsed_variable = "humidity"
-        market.parsed_location = "Phoenix"
-
-        prob = await get_realtime_probability(market)
-        assert prob is None
-
-    @patch("src.signals.mapper.icao_for_location", return_value=None)
-    async def test_returns_none_unknown_location(self, mock_icao):
-        market = MagicMock()
-        market.parsed_variable = "temperature"
-        market.parsed_location = "Timbuktu"
-        market.parsed_target_date = "April 10, 2026"
-        market.parsed_threshold = 95.0
-
-        prob = await get_realtime_probability(market)
-        assert prob is None
-
-    async def test_returns_none_no_location(self):
-        market = MagicMock()
-        market.parsed_variable = "temperature"
-        market.parsed_location = None
-
-        prob = await get_realtime_probability(market)
-        assert prob is None
-
-    @patch("src.signals.mapper.parse_target_date")
-    @patch("src.signals.mapper.icao_for_location", return_value="KPHX")
-    async def test_returns_none_no_threshold(self, mock_icao, mock_parse_dt):
-        mock_parse_dt.return_value = datetime.now(timezone.utc) + timedelta(hours=6)
-
-        market = MagicMock()
-        market.parsed_variable = "temperature"
-        market.parsed_location = "Phoenix"
-        market.parsed_target_date = "April 10, 2026"
-        market.parsed_threshold = None
-
-        prob = await get_realtime_probability(market)
-        assert prob is None
 
 
 # ---------------------------------------------------------------------------

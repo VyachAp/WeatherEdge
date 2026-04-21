@@ -3,7 +3,7 @@ from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
-    model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
+    model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
 
     DATABASE_URL: str = ""
 
@@ -34,12 +34,6 @@ class Settings(BaseSettings):
     NOAA_RATE_LIMIT_RPS: float = 1.0
     AVWX_RATE_LIMIT_RPS: float = 1.0
 
-    # Short-range trading tunables
-    SR_MIN_LIQUIDITY: float = 100.0
-    SR_MIN_VOLUME: float = 50.0
-    SR_MIN_EDGE_DISCOUNT: float = 0.65
-    SR_PIPELINE_INTERVAL_MINUTES: int = 60
-
     # Weather Company v3 observations (airport ICAO stations)
     WX_API_KEY: str = ""  # Empty = WX pipeline disabled
     WX_RATE_LIMIT_RPS: float = 1.5  # ~90/min conservative
@@ -56,15 +50,14 @@ class Settings(BaseSettings):
     DAILY_SPEND_CAP_USD: float = 200.0  # Max total spend per 24h
     MIN_STAKE_USD: float = 5.0  # Skip orders below this amount
 
-    # Unified pipeline (replaces short_range + wx_rapid when enabled)
-    UNIFIED_PIPELINE_ENABLED: bool = False
+    # Unified pipeline
     UNIFIED_PIPELINE_INTERVAL_MINUTES: int = 5
 
-    # Redesigned trade filters (used by unified pipeline)
+    # Trade filters
     MIN_PROBABILITY: float = 0.60
     MIN_ENTRY_PRICE: float = 0.40
     MAX_ENTRY_PRICE: float = 0.97
-    MIN_DEPTH_USD: float = 50.0
+    MIN_DEPTH_USD: float = 10.0
     MIN_ROUTINE_COUNT: int = 3
     MARKET_CLOSE_BUFFER_MINUTES: int = 30
     MAX_POSITION_USD: float = 200.0
