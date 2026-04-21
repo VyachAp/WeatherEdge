@@ -161,6 +161,26 @@ class MetarObservation(Base):
     fetched_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
 
 
+class ForecastExceedanceAlert(Base):
+    __tablename__ = "forecast_exceedance_alerts"
+    __table_args__ = (
+        UniqueConstraint("station_icao", "observed_at", name="uq_exceedance_station_obs"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    station_icao = Column(String, nullable=False)
+    observed_at = Column(DateTime(timezone=True), nullable=False)
+    observed_temp_f = Column(Float, nullable=False)
+    forecast_temp_f = Column(Float, nullable=False)
+    delta_f = Column(Float, nullable=False)
+    forecast_hour_utc = Column(Integer, nullable=False)
+    alerted_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+
 class TafForecast(Base):
     __tablename__ = "taf_forecasts"
     __table_args__ = (

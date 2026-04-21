@@ -195,6 +195,13 @@ async def aggregate_state(
     if cycle_minutes:
         logger.debug("%s METAR cycle: %s", icao, cycle_minutes)
 
+    # 5. Diagnostic: alert when latest routine obs exceeds same-hour forecast.
+    try:
+        from src.signals.forecast_exceedance import check_and_alert_exceedance
+        await check_and_alert_exceedance(icao, history, forecast)
+    except Exception:
+        logger.warning("exceedance alert check failed for %s", icao, exc_info=True)
+
     state = WeatherState(
         station_icao=icao,
         current_max_f=current_max_f,
