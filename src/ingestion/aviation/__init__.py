@@ -23,6 +23,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Hashable, TYPE_CHECKING
 
 import httpx
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from tenacity import (
     retry,
     retry_if_exception_type,
@@ -268,7 +269,11 @@ async def fetch_latest_metars(
                     try:
                         parsed = _parse_metar_json(entry)
                         all_parsed.append(parsed)
-                        session.add(MetarObservation(**parsed))
+                        await session.execute(
+                            pg_insert(MetarObservation)
+                            .values(**parsed)
+                            .on_conflict_do_nothing(constraint="uq_metar_station_obs")
+                        )
                     except Exception:
                         logger.warning(
                             "METAR parse failed for %s",
@@ -317,7 +322,11 @@ async def fetch_metar_history(
                     try:
                         p = _parse_metar_json(entry)
                         parsed.append(p)
-                        session.add(MetarObservation(**p))
+                        await session.execute(
+                            pg_insert(MetarObservation)
+                            .values(**p)
+                            .on_conflict_do_nothing(constraint="uq_metar_station_obs")
+                        )
                     except Exception:
                         logger.warning(
                             "METAR history parse failed", exc_info=True

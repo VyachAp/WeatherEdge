@@ -137,7 +137,7 @@ class BankrollLog(Base):
 class MetarObservation(Base):
     __tablename__ = "metar_observations"
     __table_args__ = (
-        Index("ix_metar_station_observed", "station_icao", "observed_at"),
+        UniqueConstraint("station_icao", "observed_at", name="uq_metar_station_obs"),
     )
 
     id = Column(Integer, primary_key=True, autoincrement=True)

@@ -553,7 +553,7 @@ class TestFetchMetars:
         result = await fetch_latest_metars(["KPHX"])
         assert len(result) == 1
         assert result[0]["station_icao"] == "KPHX"
-        assert mock_session.add.called
+        assert mock_session.execute.called
         assert mock_session.commit.called
 
     @patch("src.ingestion.aviation._awc_get_json")
