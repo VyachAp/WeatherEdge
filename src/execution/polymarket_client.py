@@ -363,20 +363,28 @@ def get_orderbook_depth(token_id: str, price: float) -> float:
     cache, inter-request throttling, and retry with backoff.  Returns 0.0
     if the client is unavailable or all attempts fail.
     """
+    book = _fetch_orderbook(token_id)
+    if book is None:
+        return 0.0
+    return _compute_depth(book, price)
+
+
+def _fetch_orderbook(token_id: str):
+    """Return a cached or freshly fetched orderbook for *token_id*, or None."""
     client = _get_client()
     if client is None:
-        return 0.0
+        return None
 
     cached = _get_cached_orderbook(token_id)
     if cached is not None:
-        return _compute_depth(cached, price)
+        return cached
 
     for attempt in range(_OB_MAX_RETRIES + 1):
         _throttle_clob()
         try:
             book = client.get_order_book(token_id)
             _orderbook_cache[token_id] = (_time.monotonic(), book)
-            return _compute_depth(book, price)
+            return book
         except Exception as exc:
             if attempt < _OB_MAX_RETRIES:
                 _time.sleep(_OB_RETRY_BACKOFF[attempt])
@@ -385,5 +393,36 @@ def get_orderbook_depth(token_id: str, price: float) -> float:
                     "Could not fetch orderbook for token %s after %d attempts: %s",
                     token_id, _OB_MAX_RETRIES + 1, exc,
                 )
-                return 0.0
-    return 0.0
+                return None
+    return None
+
+
+def get_best_bid_ask(token_id: str) -> tuple[float, float] | None:
+    """Return (best_bid, best_ask) for *token_id*, or None if unavailable.
+
+    Reuses the 30-second orderbook cache, so this piggybacks on the same
+    HTTP request already made by ``get_orderbook_depth`` when both are
+    called in sequence.
+    """
+    book = _fetch_orderbook(token_id)
+    if book is None:
+        return None
+
+    bids = book.bids if hasattr(book, "bids") else book.get("bids", [])  # type: ignore[union-attr]
+    asks = book.asks if hasattr(book, "asks") else book.get("asks", [])  # type: ignore[union-attr]
+    if not bids or not asks:
+        return None
+
+    try:
+        best_bid = max(
+            float(b.price if hasattr(b, "price") else b.get("price", 0)) for b in bids
+        )
+        best_ask = min(
+            float(a.price if hasattr(a, "price") else a.get("price", 0)) for a in asks
+        )
+    except (ValueError, TypeError):
+        return None
+
+    if best_bid <= 0 or best_ask <= 0 or best_bid > best_ask:
+        return None
+    return best_bid, best_ask

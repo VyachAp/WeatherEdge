@@ -162,7 +162,7 @@ async def job_unified_pipeline() -> None:
         from src.signals.probability_engine import compute_distribution
         from src.signals.edge_calculator import compute_edges
         from src.signals.mapper import icao_for_location, geocode
-        from src.execution.polymarket_client import get_orderbook_depth, get_token_ids
+        from src.execution.polymarket_client import get_best_bid_ask, get_orderbook_depth, get_token_ids
 
         async with async_session() as session:
             # 1. Circuit breaker check
@@ -249,11 +249,26 @@ async def job_unified_pipeline() -> None:
                 for market in city_markets[icao]:
                     end_time = market.end_date or datetime.now(timezone.utc) + timedelta(hours=24)
 
-                    # Orderbook depth at market YES price
+                    # Orderbook depth at market YES price; refresh live price from CLOB
                     mkt_depth = 0.0
                     token_ids = await get_token_ids(market.id)
-                    if token_ids and market.current_yes_price:
-                        mkt_depth = get_orderbook_depth(token_ids[0], market.current_yes_price)
+                    if token_ids:
+                        quote = get_best_bid_ask(token_ids[0])
+                        if quote:
+                            best_bid, best_ask = quote
+                            live_price = (best_bid + best_ask) / 2
+                            market.current_yes_price = live_price
+                        if market.current_yes_price:
+                            mkt_depth = get_orderbook_depth(token_ids[0], market.current_yes_price)
+
+                    # Skip near-resolved markets — any "edge" at the tails is noise
+                    price = market.current_yes_price or 0.0
+                    if price >= 0.95 or (price > 0 and price <= 0.05):
+                        logger.info(
+                            "[%s] skip %s: market effectively resolved (price=%.2f)",
+                            icao, market.id[:12], price,
+                        )
+                        continue
 
                     if _is_binary_market(market):
                         # --- Binary threshold market ---
@@ -268,9 +283,11 @@ async def job_unified_pipeline() -> None:
 
                         op_symbol = {"above": "≥", "at_least": "≥", "below": "<", "at_most": "≤", "exactly": "="}.get(market.parsed_operator, "?")
                         tag = "PASS" if edge_result.passes else edge_result.reject_reason
+                        unit = _market_unit(market)
                         logger.info(
-                            "[%s] binary %s%d°F: P(YES)=%.3f, mkt=%.3f, edge=%+.3f %s | %s",
-                            icao, op_symbol, int(market.parsed_threshold),
+                            "[%s] binary %s%d%s: P(YES)=%.3f, mkt=%.3f, edge=%+.3f %s | %s",
+                            icao, op_symbol,
+                            _display_bucket(int(market.parsed_threshold), unit), unit,
                             edge_result.our_probability, edge_result.market_price,
                             edge_result.edge, tag, dist.reasoning,
                         )
@@ -357,9 +374,11 @@ async def job_unified_pipeline() -> None:
                             trade.status = TradeStatus.OPEN
                             exposure += adjusted_stake
                             total_trades += 1
+                            unit = _market_unit(market)
+                            display_bucket = _display_bucket(edge.bucket_value, unit)
                             await alerter._enqueue(
                                 f"\U0001f4b0 *Unified trade* [{icao}]\n"
-                                f"Bucket: {edge.bucket_value}°F | Edge: {edge.edge:.3f}\n"
+                                f"Bucket: {display_bucket}{unit} | Edge: {edge.edge:.3f}\n"
                                 f"Stake: ${adjusted_stake:.2f} | Price: {edge.market_price:.2f}\n"
                                 f"Market: {market.question[:60]}",
                             )
@@ -386,6 +405,21 @@ def _is_binary_market(market) -> bool:
         and market.parsed_operator is not None
         and market.parsed_operator != "bracket"
     )
+
+
+def _market_unit(market) -> str:
+    """Return '°C' or '°F' based on the market's original question text."""
+    q = (market.question or "").upper()
+    if "°C" in q or "CELSIUS" in q:
+        return "°C"
+    return "°F"
+
+
+def _display_bucket(bucket_f: int, unit: str) -> int:
+    """Convert an internal °F bucket to the market's display unit, rounded."""
+    if unit == "°C":
+        return round((bucket_f - 32) * 5 / 9)
+    return bucket_f
 
 
 def _make_binary_buckets(market, state) -> list[int]:
