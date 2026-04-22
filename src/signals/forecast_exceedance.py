@@ -30,6 +30,7 @@ from src.db.engine import async_session
 from src.db.models import ForecastExceedanceAlert
 from src.execution.alerter import _escape_md2, get_alerter
 from src.ingestion.openmeteo import OpenMeteoForecast
+from src.signals.mapper import f_to_c, unit_for_station
 
 if TYPE_CHECKING:
     from src.signals.state_aggregator import WeatherState
@@ -185,15 +186,29 @@ async def check_and_record_daily_max_alert(
         return
 
     e = _escape_md2
+    unit = unit_for_station(icao)
+    if unit == "°C":
+        obs_max = f_to_c(state.current_max_f)
+        trend = state.metar_trend_rate * 5.0 / 9.0
+        forecast_peak = f_to_c(state.forecast_peak_f)
+        projected = f_to_c(projected_max_f)
+        proj_delta = projection_delta_f * 5.0 / 9.0
+    else:
+        obs_max = state.current_max_f
+        trend = state.metar_trend_rate
+        forecast_peak = state.forecast_peak_f
+        projected = projected_max_f
+        proj_delta = projection_delta_f
+
     text = (
         f"\U0001f321 *Daily max set to beat forecast* `{e(icao)}`\n"
-        f"Obs max: {e(f'{state.current_max_f:.1f}')}°F "
-        f"\\(trend {e(f'{state.metar_trend_rate:+.1f}')}°F/hr, "
+        f"Obs max: {e(f'{obs_max:.1f}')}{unit} "
+        f"\\(trend {e(f'{trend:+.1f}')}{unit}/hr, "
         f"{e(state.routine_count_today)} routine METARs\\)\n"
-        f"Forecast peak: {e(f'{state.forecast_peak_f:.1f}')}°F "
+        f"Forecast peak: {e(f'{forecast_peak:.1f}')}{unit} "
         f"in {e(f'{state.hours_until_peak:.1f}')}h\n"
-        f"Projected: {e(f'{projected_max_f:.1f}')}°F "
-        f"\\({e(f'{projection_delta_f:+.1f}')}°F vs forecast\\)"
+        f"Projected: {e(f'{projected:.1f}')}{unit} "
+        f"\\({e(f'{proj_delta:+.1f}')}{unit} vs forecast\\)"
     )
     try:
         await get_alerter()._enqueue(text)

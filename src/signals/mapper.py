@@ -512,6 +512,21 @@ CITY_ICAO: dict[str, str] = {
 }
 
 
+def f_to_c(temp_f: float) -> float:
+    return (temp_f - 32.0) * 5.0 / 9.0
+
+
+def unit_for_station(icao: str) -> str:
+    """Return the temperature unit Polymarket markets use for this station.
+
+    K-prefix ICAOs are the contiguous US (every US city in CITY_ICAO uses
+    KXXX) and trade in °F; everything else (R, E, L, W, Z, S, …) trades in
+    °C. Pacific US stations (PA, PH, PG) aren't in CITY_ICAO yet — extend
+    this rule when they're added.
+    """
+    return "°F" if icao.upper().startswith("K") else "°C"
+
+
 def icao_for_location(location: str) -> str | None:
     """Resolve a location name to its nearest ICAO station code.
 

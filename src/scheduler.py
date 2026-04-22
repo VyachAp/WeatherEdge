@@ -249,6 +249,15 @@ async def job_unified_pipeline() -> None:
                 for market in city_markets[icao]:
                     end_time = market.end_date or datetime.now(timezone.utc) + timedelta(hours=24)
 
+                    now_utc = datetime.now(timezone.utc)
+                    if _should_skip_future_day(market, now_utc):
+                        logger.info(
+                            "[%s] skip %s: resolves %s, today %s — same-day-only mode",
+                            icao, market.id[:12],
+                            market.end_date.date().isoformat(), now_utc.date().isoformat(),
+                        )
+                        continue
+
                     # Orderbook depth at market YES price; refresh live price from CLOB
                     mkt_depth = 0.0
                     token_ids = await get_token_ids(market.id)
@@ -405,6 +414,21 @@ def _is_binary_market(market) -> bool:
         and market.parsed_operator is not None
         and market.parsed_operator != "bracket"
     )
+
+
+def _should_skip_future_day(market, now: datetime) -> bool:
+    """True when the market resolves on a UTC day after today.
+
+    `aggregate_state` builds WeatherState from today's METARs and Open-Meteo's
+    `forecast_days=1` (today only). Reusing that state for a market resolving
+    tomorrow or later collapses the distribution onto today's observed max via
+    the monotonicity constraint and produces artifact edges, not real signal.
+    Returns False when end_date is missing so we don't unintentionally drop
+    markets whose schedule we can't read.
+    """
+    if not market.end_date:
+        return False
+    return market.end_date.date() > now.date()
 
 
 def _market_unit(market) -> str:
