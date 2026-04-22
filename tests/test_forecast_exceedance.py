@@ -9,6 +9,7 @@ import pytest
 
 from src.ingestion.openmeteo import OpenMeteoForecast
 from src.signals.forecast_exceedance import (
+    MAX_OVERSHOOT_F,
     _closest_hour_index,
     _peak_passed,
     _pick_latest_routine,
@@ -43,6 +44,7 @@ def _state(
     *,
     current_max_f: float = 78.0,
     metar_trend_rate: float = 0.0,
+    metar_trend_rate_short: float = 0.0,
     dewpoint_trend_rate: float = 0.0,
     forecast_peak_f: float = 78.0,
     hours_until_peak: float = 0.0,
@@ -57,6 +59,7 @@ def _state(
         station_icao=icao,
         current_max_f=current_max_f,
         metar_trend_rate=metar_trend_rate,
+        metar_trend_rate_short=metar_trend_rate_short,
         dewpoint_trend_rate=dewpoint_trend_rate,
         forecast_peak_f=forecast_peak_f,
         hours_until_peak=hours_until_peak,
@@ -127,6 +130,26 @@ class TestPeakPassed:
             metar_trend_rate=1.5, hours_until_peak=4.0,
         ))
 
+    def test_short_trend_drives_peak_passed(self):
+        # 6h regression still positive because of the morning warm-up, but the
+        # short-window trend has already turned negative — peak really has
+        # passed, and the heuristic should recognise it via the short trend.
+        assert _peak_passed(_state(
+            current_max_f=70.0, forecast_peak_f=80.0,
+            metar_trend_rate=0.5, metar_trend_rate_short=-0.2,
+            solar_declining=True, hours_until_peak=2.0,
+        ))
+
+    def test_past_peak_hour_no_recent_rise_triggers_peak_passed(self):
+        # Forecast peak hour already an hour and a half behind us and the short
+        # trend is essentially flat → treat as peak passed regardless of the
+        # 6h regression sign.
+        assert _peak_passed(_state(
+            current_max_f=72.0, forecast_peak_f=80.0,
+            metar_trend_rate=0.3, metar_trend_rate_short=0.05,
+            hours_until_peak=-1.5,
+        ))
+
 
 class TestProjectDailyMax:
     def test_monotonic_floor(self):
@@ -135,34 +158,86 @@ class TestProjectDailyMax:
         assert _project_daily_max(s) == 78.0
 
     def test_rising_trend_extrapolates(self):
-        # +1°F/hr for 2h → +2°F.
-        s = _state(current_max_f=78.0, metar_trend_rate=1.0, hours_until_peak=2.0)
-        assert _project_daily_max(s) == pytest.approx(80.0)
+        # trend=+1°F/hr, h=2 → extrapolated=78 → blended with forecast_peak=80
+        # at α=exp(-1)=0.368: 0.368·78 + 0.632·80 ≈ 79.26.
+        s = _state(
+            current_max_f=76.0, metar_trend_rate=1.0,
+            forecast_peak_f=80.0, hours_until_peak=2.0,
+        )
+        assert _project_daily_max(s) == pytest.approx(79.26, abs=0.05)
 
-    def test_extrapolation_capped_at_three_hours(self):
-        # hours_until_peak=6 should cap at 3h → +3°F.
-        s = _state(current_max_f=78.0, metar_trend_rate=1.0, hours_until_peak=6.0)
-        assert _project_daily_max(s) == pytest.approx(81.0)
+    def test_far_from_peak_blends_toward_forecast(self):
+        # hours_until_peak=6 → extrapolation cap at 3h, α=exp(-3)=0.05 → projection
+        # overwhelmingly weighted toward forecast_peak (80°F) regardless of trend.
+        s = _state(
+            current_max_f=76.0, metar_trend_rate=2.0,
+            forecast_peak_f=80.0, hours_until_peak=6.0,
+        )
+        result = _project_daily_max(s)
+        assert abs(result - 80.0) < 0.5
 
     def test_solar_decline_damps_extrapolation(self):
-        # 50% solar decline → 1h of 2h extrapolation kept → +1°F.
-        s = _state(
-            current_max_f=78.0, metar_trend_rate=1.0, hours_until_peak=2.0,
+        # 50% solar decline halves extrapolation hours (2h → 1h effective):
+        # extrapolated = 76 + 1·1 = 77; projection = 0.368·77 + 0.632·80 ≈ 78.90.
+        # Compare with the no-damping case (79.26) to verify the damping path.
+        damped = _state(
+            current_max_f=76.0, metar_trend_rate=1.0,
+            forecast_peak_f=80.0, hours_until_peak=2.0,
             solar_declining=True, solar_decline_magnitude=0.5,
         )
-        assert _project_daily_max(s) == pytest.approx(79.0)
+        undamped = _state(
+            current_max_f=76.0, metar_trend_rate=1.0,
+            forecast_peak_f=80.0, hours_until_peak=2.0,
+        )
+        assert _project_daily_max(damped) == pytest.approx(78.90, abs=0.05)
+        assert _project_daily_max(damped) < _project_daily_max(undamped)
 
     def test_rising_dewpoint_nudges_down(self):
-        # Base extrapolation +2°F, dewpoint rising >1°F/hr → -0.5°F nudge.
+        # Blend projection 79.26 minus 0.5°F dewpoint nudge → 78.76.
         s = _state(
-            current_max_f=78.0, metar_trend_rate=1.0, hours_until_peak=2.0,
+            current_max_f=76.0, metar_trend_rate=1.0,
+            forecast_peak_f=80.0, hours_until_peak=2.0,
             dewpoint_trend_rate=1.5,
         )
-        assert _project_daily_max(s) == pytest.approx(79.5)
+        assert _project_daily_max(s) == pytest.approx(78.76, abs=0.05)
 
     def test_past_peak_no_extrapolation(self):
         s = _state(current_max_f=78.0, metar_trend_rate=1.0, hours_until_peak=0.0)
         assert _project_daily_max(s) == 78.0
+
+    def test_short_trend_preferred_when_nonzero(self):
+        # 6h trend +2°F/hr but short-window trend only +0.2°F/hr (curve bending
+        # near peak): the projection should use the short trend, not the 6h one.
+        s = _state(
+            current_max_f=76.0, metar_trend_rate=2.0, metar_trend_rate_short=0.2,
+            forecast_peak_f=80.0, hours_until_peak=2.0,
+        )
+        # extrapolated = 76 + 0.2·2 = 76.4; α=0.368 → 0.368·76.4 + 0.632·80 ≈ 78.67.
+        assert _project_daily_max(s) == pytest.approx(78.67, abs=0.05)
+
+    def test_plausibility_cap_clips_overshoot(self):
+        # Absurdly high trend blown up by extrapolation must be clipped at
+        # forecast_peak + MAX_OVERSHOOT_F (5°F) so we never project the Sun.
+        s = _state(
+            current_max_f=78.0, metar_trend_rate=20.0,
+            forecast_peak_f=80.0, hours_until_peak=3.0,
+        )
+        assert _project_daily_max(s) == pytest.approx(80.0 + MAX_OVERSHOOT_F)
+
+    def test_blend_tapers_with_distance_to_peak(self):
+        # Same obs/trend/forecast, different hours_until_peak. Far-out projection
+        # should sit closer to forecast_peak than the near-peak one.
+        near = _state(
+            current_max_f=76.0, metar_trend_rate=2.0,
+            forecast_peak_f=80.0, hours_until_peak=1.0,
+        )
+        far = _state(
+            current_max_f=76.0, metar_trend_rate=2.0,
+            forecast_peak_f=80.0, hours_until_peak=5.0,
+        )
+        near_proj = _project_daily_max(near)
+        far_proj = _project_daily_max(far)
+        assert abs(far_proj - 80.0) < abs(near_proj - 80.0)
 
 
 class _FakeResult:
@@ -174,9 +249,10 @@ class _FakeResult:
 
 
 class _FakeSession:
-    def __init__(self, existing_id=None, commit_raises=None):
+    def __init__(self, existing_id=None, commit_raises=None, cooldown_id=None):
         self.added: list = []
         self._existing_id = existing_id
+        self._cooldown_id = cooldown_id
         self._commit_raises = commit_raises
         self.committed = False
         self.rolled_back = False
@@ -187,7 +263,10 @@ class _FakeSession:
     async def __aexit__(self, exc_type, exc, tb):
         return False
 
-    async def execute(self, _stmt):
+    async def execute(self, stmt):
+        # Cooldown query filters on alerted_at; existence check does not.
+        if "alerted_at" in str(stmt):
+            return _FakeResult(self._cooldown_id)
         return _FakeResult(self._existing_id)
 
     def add(self, obj):
@@ -210,9 +289,10 @@ class TestCheckAndRecordDailyMaxAlert:
         # Same-hour delta +3.3°F passes recording gate.
         history = [_metar(observed_at, 78.5)]
         forecast = _make_forecast([24.0] * 24)
-        # State: trend +1.5°F/hr, peak 1.5h out → projection 80.75, delta +1.75 > 1°F.
+        # trend +3°F/hr, peak 1.5h out: extrapolated 83, α≈0.47 → blend ~80.9,
+        # delta ~1.9°F > 1°F threshold.
         state = _state(
-            current_max_f=78.5, metar_trend_rate=1.5,
+            current_max_f=78.5, metar_trend_rate=3.0,
             forecast_peak_f=79.0, hours_until_peak=1.5,
             routine_count_today=4,
         )
@@ -448,3 +528,54 @@ class TestCheckAndRecordDailyMaxAlert:
 
         assert fake_session.added == []
         alerter._enqueue.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_cooldown_suppresses_second_push_within_60min(self):
+        # Same push-happy scenario as test_pushes_when_projection_beats_forecast,
+        # but the cooldown query returns a recent alerted row. Expectation: DB
+        # row still written (alerted=False), but no Telegram enqueue.
+        observed_at = datetime(2026, 4, 22, 18, 53, tzinfo=timezone.utc)
+        history = [_metar(observed_at, 78.5)]
+        forecast = _make_forecast([24.0] * 24)
+        state = _state(
+            current_max_f=78.5, metar_trend_rate=3.0,
+            forecast_peak_f=79.0, hours_until_peak=1.5,
+            routine_count_today=4,
+        )
+
+        fake_session = _FakeSession(existing_id=None, cooldown_id=123)
+        alerter = MagicMock()
+        alerter._enqueue = AsyncMock()
+
+        with patch("src.signals.forecast_exceedance.async_session", return_value=fake_session), \
+             patch("src.signals.forecast_exceedance.get_alerter", return_value=alerter):
+            await check_and_record_daily_max_alert("KLAX", state, history, forecast)
+
+        assert len(fake_session.added) == 1
+        assert fake_session.added[0].alerted is False
+        assert fake_session.committed is True
+        alerter._enqueue.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_cooldown_allows_push_when_no_recent_alert(self):
+        # Push-happy scenario, cooldown query returns no recent alerted row.
+        observed_at = datetime(2026, 4, 22, 18, 53, tzinfo=timezone.utc)
+        history = [_metar(observed_at, 78.5)]
+        forecast = _make_forecast([24.0] * 24)
+        state = _state(
+            current_max_f=78.5, metar_trend_rate=3.0,
+            forecast_peak_f=79.0, hours_until_peak=1.5,
+            routine_count_today=4,
+        )
+
+        fake_session = _FakeSession(existing_id=None, cooldown_id=None)
+        alerter = MagicMock()
+        alerter._enqueue = AsyncMock()
+
+        with patch("src.signals.forecast_exceedance.async_session", return_value=fake_session), \
+             patch("src.signals.forecast_exceedance.get_alerter", return_value=alerter):
+            await check_and_record_daily_max_alert("KLAX", state, history, forecast)
+
+        assert len(fake_session.added) == 1
+        assert fake_session.added[0].alerted is True
+        alerter._enqueue.assert_awaited_once()

@@ -26,8 +26,9 @@ from src.resolution import (
     resolve_trades,
 )
 from src.risk.drawdown import DrawdownLevel, DrawdownMonitor
-from src.risk.kelly import size_position
+from src.risk.kelly import size_locked_position, size_position
 from src.signals.consensus import get_calibration_coefficients
+from src.signals.lock_rules import evaluate_lock
 from src.execution.polymarket_client import is_live, place_order
 
 if TYPE_CHECKING:
@@ -270,9 +271,34 @@ async def job_unified_pipeline() -> None:
                         if market.current_yes_price:
                             mkt_depth = get_orderbook_depth(token_ids[0], market.current_yes_price)
 
-                    # Skip near-resolved markets — any "edge" at the tails is noise
                     price = market.current_yes_price or 0.0
-                    if price >= 0.95 or (price > 0 and price <= 0.05):
+
+                    # --- Lock-rule fast path (deterministic physical lock-in) ---
+                    # Evaluate before the near-resolved skip so the 0.90-0.95
+                    # "we read the max on METAR before Wunderground updates" zone
+                    # is tradeable rather than filtered out as "too close to resolved".
+                    if (
+                        settings.LOCK_RULE_ENABLED
+                        and _is_binary_market(market)
+                        and price > 0
+                    ):
+                        lock_executed = await _try_lock_rule_trade(
+                            session=session, market=market, state=state,
+                            yes_price=price, token_ids=token_ids,
+                            yes_depth=mkt_depth, end_time=end_time,
+                            bankroll=bankroll, exposure=exposure,
+                            monitor=monitor, alerter=alerter, icao=icao,
+                        )
+                        if lock_executed is not None:
+                            if lock_executed:
+                                exposure += lock_executed
+                                total_trades += 1
+                            continue
+
+                    # Skip near-resolved markets — any "edge" at the tails is noise.
+                    # Threshold raised from 0.95 to 0.99 so the lock-rule path above
+                    # can evaluate high-price markets first.
+                    if price >= 0.99 or (price > 0 and price <= 0.01):
                         logger.info(
                             "[%s] skip %s: market effectively resolved (price=%.2f)",
                             icao, market.id[:12], price,
@@ -498,6 +524,150 @@ def _binary_market_edge(dist, market, end_time, routine_count, depth):
         passes=reason is None,
         reject_reason=reason,
     )
+
+
+async def _try_lock_rule_trade(
+    *,
+    session,
+    market,
+    state,
+    yes_price: float,
+    token_ids,
+    yes_depth: float,
+    end_time: datetime,
+    bankroll: float,
+    exposure: float,
+    monitor: DrawdownMonitor,
+    alerter,
+    icao: str,
+) -> float | None:
+    """Evaluate lock-rule conditions and place order if triggered.
+
+    Returns:
+      None — no lock fired; caller should fall through to probability path.
+      0.0  — lock fired but was not executable (price out of range, order
+             failed, depth insufficient, etc.). Caller should `continue`.
+      >0   — stake in USD that was actually placed. Caller should `continue`
+             and add to exposure counter.
+    """
+    from src.execution.polymarket_client import get_orderbook_depth
+    from src.signals.edge_calculator import _check_filters
+
+    decision = evaluate_lock(state, market)
+    if decision.side is None or decision.direction is None:
+        return None
+
+    effective_price = yes_price if decision.side == "YES" else (1.0 - yes_price)
+    if not (
+        settings.LOCK_RULE_MIN_PRICE
+        <= effective_price
+        <= settings.LOCK_RULE_MAX_PRICE
+    ):
+        logger.info(
+            "[%s] lock %s %s: price %.2f outside [%.2f, %.2f]",
+            icao, decision.side, market.id[:12], effective_price,
+            settings.LOCK_RULE_MIN_PRICE, settings.LOCK_RULE_MAX_PRICE,
+        )
+        return 0.0
+
+    # Depth against the side we're actually buying.
+    if decision.side == "YES":
+        buy_depth = yes_depth
+    else:
+        buy_depth = (
+            get_orderbook_depth(token_ids[1], effective_price)
+            if token_ids else 0.0
+        )
+
+    now = datetime.now(timezone.utc)
+    minutes_to_close = (end_time - now).total_seconds() / 60.0
+
+    # Reuse the existing filter helper for routine-count / close-buffer / depth.
+    # Pass stub prob/edge/price values that will pass those specific checks; we're
+    # not edge-gating here, only piggy-backing on the shared sanity filters.
+    reject = _check_filters(
+        edge=1.0,
+        prob=1.0,
+        price=max(settings.MIN_ENTRY_PRICE, min(settings.MAX_ENTRY_PRICE, effective_price)),
+        routine_count=state.routine_count_today,
+        minutes_to_close=minutes_to_close,
+        depth=buy_depth,
+    )
+    if reject is not None:
+        logger.info(
+            "[%s] lock %s %s rejected by filter: %s",
+            icao, decision.side, market.id[:12], reject,
+        )
+        return 0.0
+
+    pos = size_locked_position(
+        bankroll=bankroll,
+        price=effective_price,
+        current_exposure=exposure,
+        orderbook_depth=buy_depth or None,
+    )
+    dd_state = monitor.check(bankroll)
+    stake = pos.stake_usd * dd_state.size_multiplier
+
+    logger.info(
+        "[%s] LOCK %s %s: margin=%.1f°F, price=%.2f, stake=$%.2f "
+        "(raw=$%.2f, dd_mult=%.2f) | %s",
+        icao, decision.side, market.id[:12], decision.margin_f,
+        effective_price, stake, pos.stake_usd, dd_state.size_multiplier,
+        "; ".join(decision.reasons),
+    )
+
+    if stake < settings.MIN_STAKE_USD:
+        logger.info(
+            "[%s] LOCK %s %s: stake $%.2f < min $%.2f, skipping",
+            icao, decision.side, market.id[:12], stake, settings.MIN_STAKE_USD,
+        )
+        return 0.0
+
+    sig_row = Signal(
+        market_id=market.id,
+        model_prob=1.0,  # Lock rule is deterministic; carry no prob estimate.
+        market_prob=effective_price,
+        edge=1.0 - effective_price,
+        direction=decision.direction,
+        confidence=decision.margin_f,
+    )
+    session.add(sig_row)
+    await session.flush()
+
+    trade = Trade(
+        signal_id=sig_row.id,
+        market_id=market.id,
+        direction=decision.direction,
+        stake_usd=stake,
+        entry_price=effective_price,
+        status=TradeStatus.PENDING,
+    )
+    session.add(trade)
+    await session.flush()
+
+    order_ok = await place_order(trade, session)
+    if not order_ok:
+        logger.warning(
+            "[%s] LOCK %s %s: order placement failed",
+            icao, decision.side, market.id[:12],
+        )
+        return 0.0
+
+    trade.status = TradeStatus.OPEN
+    unit = _market_unit(market)
+    threshold_disp = _display_bucket(int(market.parsed_threshold), unit)
+    op_symbol = {"above": "≥", "at_least": "≥", "below": "<", "at_most": "≤"}.get(
+        market.parsed_operator, "?"
+    )
+    await alerter._enqueue(
+        f"\U0001f512 *LOCK trade* [{icao}] {decision.side}\n"
+        f"Threshold: {op_symbol}{threshold_disp}{unit} | Margin: {decision.margin_f:+.1f}°F\n"
+        f"Stake: ${stake:.2f} | Price: {effective_price:.2f}\n"
+        f"Reason: {decision.reasons[0] if decision.reasons else 'locked'}\n"
+        f"Market: {market.question[:60]}",
+    )
+    return stake
 
 
 def _extract_bracket_buckets(market) -> list[int]:

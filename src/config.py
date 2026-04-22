@@ -73,6 +73,15 @@ class Settings(BaseSettings):
     CONSECUTIVE_LOSS_PAUSE_COUNT: int = 3
     CONSECUTIVE_LOSS_PAUSE_HOURS: int = 2
 
+    # Lock-rule trader (deterministic physical-condition path)
+    LOCK_RULE_ENABLED: bool = True
+    LOCK_RULE_MAX_PRICE: float = 0.95
+    LOCK_RULE_MIN_PRICE: float = 0.30
+    LOCK_MARGIN_F: float = 2.0
+    LOCK_POSITION_PCT: float = 0.02
+    LOCK_RULE_LOSS_WINDOW_HOURS: int = 72
+    LOCK_RULE_LOSS_DISABLE_COUNT: int = 3
+
     # Open-Meteo forecast
     OPENMETEO_RATE_LIMIT_RPS: float = 2.0
 

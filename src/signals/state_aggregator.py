@@ -28,15 +28,23 @@ class WeatherState:
 
     station_icao: str
     current_max_f: float
-    metar_trend_rate: float         # °F/hr from last 3-4 routine METARs
+    metar_trend_rate: float         # °F/hr, 6h routine-METAR linear regression
     dewpoint_trend_rate: float      # °F/hr dewpoint
     forecast_peak_f: float          # Open-Meteo peak + station bias
-    hours_until_peak: float
+    hours_until_peak: float         # may be negative once forecast peak hour has passed
     solar_declining: bool
     solar_decline_magnitude: float
     cloud_rising: bool
     cloud_rise_magnitude: float
     routine_count_today: int
+    metar_trend_rate_short: float = 0.0  # °F/hr regression over last 2.5h
+    has_forecast: bool = False      # True iff forecast data was fetched successfully
+    # Sorted (observed_at_utc, temp_f) tuples for routine METARs in the last 24h.
+    # Used by lock_rules.evaluate_lock to compute per-market daily max anchored
+    # to the market's target day — which may differ from the station's "today"
+    # local day (e.g. a market asking about Apr 21 Dallas may close at 07:00
+    # local Apr 21, and our snapshot may be at 23:00 local Apr 20).
+    routine_history: tuple[tuple[datetime, float], ...] = ()
 
 
 # ---------------------------------------------------------------------------
@@ -46,15 +54,38 @@ class WeatherState:
 
 def _routine_daily_max(
     history: list[dict[str, Any]],
+    icao: str,
+    now_utc: datetime | None = None,
 ) -> tuple[float | None, int]:
-    """Compute (max_temp_f, routine_count) from routine METARs for the current UTC day."""
-    today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    """Compute (max_temp_f, routine_count) for the LOCAL-city day at ``icao``.
+
+    Polymarket "highest temp on [date] in [city]" markets resolve on Wunderground's
+    local-day aggregation, not the UTC day. Using station-local boundaries keeps
+    the computed daily max aligned with the resolution window, especially at UTC
+    midnight when the UTC day rolls over but the local day hasn't.
+    """
+    from src.signals.mapper import icao_timezone
+
+    if now_utc is None:
+        now_utc = datetime.now(timezone.utc)
+
+    tz = icao_timezone(icao)
+    now_local = now_utc.astimezone(tz)
+    local_day_start = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+    local_day_end = local_day_start + timedelta(days=1)
+    utc_start = local_day_start.astimezone(timezone.utc)
+    utc_end = local_day_end.astimezone(timezone.utc)
+
     routine_temps: list[float] = []
     for m in history:
         if m.get("is_speci"):
             continue
         obs_at = m.get("observed_at")
-        if obs_at is not None and isinstance(obs_at, datetime) and obs_at >= today_start:
+        if (
+            obs_at is not None
+            and isinstance(obs_at, datetime)
+            and utc_start <= obs_at < utc_end
+        ):
             temp_f = m.get("temp_f")
             if temp_f is not None:
                 routine_temps.append(temp_f)
@@ -115,6 +146,104 @@ def _compute_trend(
 # ---------------------------------------------------------------------------
 
 
+def build_state_from_metars(
+    icao: str,
+    history: list[dict[str, Any]],
+    forecast: Any | None,
+    bias_c: float,
+    now_utc: datetime,
+) -> WeatherState | None:
+    """Assemble a WeatherState from already-fetched METAR history + forecast.
+
+    Pure function — no HTTP, no DB. Used by `aggregate_state` (live) and by the
+    backtest harness (replay). Returns None if the station has no routine METARs
+    for the UTC day of ``now_utc``.
+    """
+    from src.ingestion.aviation import detect_metar_cycle
+    from src.ingestion.openmeteo import (
+        solar_declining as check_solar,
+        cloud_rising as check_cloud,
+    )
+
+    current_max_f, routine_count = _routine_daily_max(history, icao=icao, now_utc=now_utc)
+    if current_max_f is None:
+        return None
+
+    cutoff_6h = now_utc.replace(microsecond=0) - timedelta(hours=6)
+    recent_history = [
+        m for m in history
+        if m.get("observed_at") is not None
+        and isinstance(m["observed_at"], datetime)
+        and cutoff_6h <= m["observed_at"] <= now_utc
+    ]
+    trend = _compute_trend(recent_history, routine_only=True)
+    metar_trend_rate = trend["rate_of_change_per_hour"]
+    dewpoint_trend_rate = trend["dewpoint_rate"]
+
+    cutoff_short = now_utc.replace(microsecond=0) - timedelta(hours=2, minutes=30)
+    short_history = [
+        m for m in recent_history
+        if m.get("observed_at") is not None
+        and isinstance(m["observed_at"], datetime)
+        and m["observed_at"] >= cutoff_short
+    ]
+    metar_trend_rate_short = _compute_trend(short_history, routine_only=True)[
+        "rate_of_change_per_hour"
+    ]
+
+    has_forecast = forecast is not None
+    if has_forecast:
+        adjusted_peak_c = forecast.peak_temp_c + bias_c
+        forecast_peak_f = _c_to_f(adjusted_peak_c)
+        peak_dt = now_utc.replace(hour=forecast.peak_hour_utc, minute=0, second=0, microsecond=0)
+        hours_until_peak = (peak_dt - now_utc).total_seconds() / 3600.0
+        is_solar_declining, solar_mag = check_solar(forecast, now_utc.hour)
+        is_cloud_rising, cloud_mag = check_cloud(forecast, now_utc.hour)
+    else:
+        forecast_peak_f = current_max_f
+        hours_until_peak = 0.0
+        is_solar_declining = False
+        solar_mag = 0.0
+        is_cloud_rising = False
+        cloud_mag = 0.0
+
+    cycle_minutes = detect_metar_cycle(recent_history)
+    if cycle_minutes:
+        logger.debug("%s METAR cycle: %s", icao, cycle_minutes)
+
+    # Build compact routine history for per-market daily-max computation
+    # downstream. Sorted ascending by observed_at.
+    routine_points: list[tuple[datetime, float]] = []
+    for m in history:
+        if m.get("is_speci"):
+            continue
+        obs = m.get("observed_at")
+        temp = m.get("temp_f")
+        if (
+            obs is not None and isinstance(obs, datetime)
+            and temp is not None
+        ):
+            routine_points.append((obs, float(temp)))
+    routine_points.sort(key=lambda p: p[0])
+
+    return WeatherState(
+        station_icao=icao,
+        current_max_f=current_max_f,
+        metar_trend_rate=metar_trend_rate,
+        metar_trend_rate_short=metar_trend_rate_short,
+        dewpoint_trend_rate=dewpoint_trend_rate,
+        forecast_peak_f=forecast_peak_f,
+        hours_until_peak=hours_until_peak,
+        solar_declining=is_solar_declining,
+        solar_decline_magnitude=solar_mag,
+        cloud_rising=is_cloud_rising,
+        cloud_rise_magnitude=cloud_mag,
+        routine_count_today=routine_count,
+        has_forecast=has_forecast,
+        routine_history=tuple(routine_points),
+    )
+
+
 async def aggregate_state(
     session: AsyncSession,
     icao: str,
@@ -129,45 +258,15 @@ async def aggregate_state(
     METAR history is fetched once (24h) and reused for daily max, trend, and
     cycle detection — no redundant AWC calls.
     """
-    from src.ingestion.aviation import fetch_metar_history, detect_metar_cycle
-    from src.ingestion.openmeteo import (
-        fetch_forecast,
-        solar_declining as check_solar,
-        cloud_rising as check_cloud,
-    )
+    from src.ingestion.openmeteo import fetch_forecast
     from src.ingestion.station_bias import get_bias
 
-    # Fetch METAR history and Open-Meteo forecast concurrently
     metar_task = _safe_fetch_metar(icao)
     forecast_task = fetch_forecast(lat, lon)
-
     history, forecast = await asyncio.gather(metar_task, forecast_task)
 
-    # 1. Routine daily max + count (from pre-fetched history)
     if history is None:
         return None
-
-    current_max_f, routine_count = _routine_daily_max(history)
-    if current_max_f is None:
-        logger.debug("No routine METARs yet for %s, skipping", icao)
-        return None
-
-    # 2. Temperature & dewpoint trend (from pre-fetched history, no HTTP)
-    # Use only the last 6 hours of history for trend
-    now_utc = datetime.now(timezone.utc)
-    cutoff_6h = now_utc.replace(microsecond=0) - timedelta(hours=6)
-    recent_history = [
-        m for m in history
-        if m.get("observed_at") is not None
-        and isinstance(m["observed_at"], datetime)
-        and m["observed_at"] >= cutoff_6h
-    ]
-    trend = _compute_trend(recent_history, routine_only=True)
-    metar_trend_rate = trend["rate_of_change_per_hour"]
-    dewpoint_trend_rate = trend["dewpoint_rate"]
-
-    # 3. Open-Meteo forecast (already fetched concurrently)
-    current_hour = now_utc.hour
 
     if forecast is not None:
         try:
@@ -175,47 +274,24 @@ async def aggregate_state(
         except Exception:
             logger.warning("Bias fetch failed for %s, using default", icao, exc_info=True)
             bias_c = 1.0
-        adjusted_peak_c = forecast.peak_temp_c + bias_c
-        forecast_peak_f = _c_to_f(adjusted_peak_c)
-        peak_dt = now_utc.replace(hour=forecast.peak_hour_utc, minute=0, second=0, microsecond=0)
-        hours_until_peak = max(0.0, (peak_dt - now_utc).total_seconds() / 3600.0)
-
-        is_solar_declining, solar_mag = check_solar(forecast, current_hour)
-        is_cloud_rising, cloud_mag = check_cloud(forecast, current_hour)
     else:
-        forecast_peak_f = current_max_f
-        hours_until_peak = 0.0
-        is_solar_declining = False
-        solar_mag = 0.0
-        is_cloud_rising = False
-        cloud_mag = 0.0
+        bias_c = 0.0  # Not used when forecast is None
 
-    # 4. METAR cycle detection (from pre-fetched history, no HTTP)
-    cycle_minutes = detect_metar_cycle(recent_history)
-    if cycle_minutes:
-        logger.debug("%s METAR cycle: %s", icao, cycle_minutes)
+    now_utc = datetime.now(timezone.utc)
+    state = build_state_from_metars(icao, history, forecast, bias_c, now_utc)
+    if state is None:
+        logger.debug("No routine METARs yet for %s, skipping", icao)
+        return None
 
-    state = WeatherState(
-        station_icao=icao,
-        current_max_f=current_max_f,
-        metar_trend_rate=metar_trend_rate,
-        dewpoint_trend_rate=dewpoint_trend_rate,
-        forecast_peak_f=forecast_peak_f,
-        hours_until_peak=hours_until_peak,
-        solar_declining=is_solar_declining,
-        solar_decline_magnitude=solar_mag,
-        cloud_rising=is_cloud_rising,
-        cloud_rise_magnitude=cloud_mag,
-        routine_count_today=routine_count,
-    )
     logger.info(
         "[%s] state: max=%.0f°F, trend=%+.1f°F/hr, forecast_peak=%.0f°F in %.1fh, "
         "solar_declining=%s, cloud_rising=%s, routine_count=%d",
-        icao, current_max_f, metar_trend_rate, forecast_peak_f, hours_until_peak,
-        is_solar_declining, is_cloud_rising, routine_count,
+        icao, state.current_max_f, state.metar_trend_rate, state.forecast_peak_f,
+        state.hours_until_peak, state.solar_declining, state.cloud_rising,
+        state.routine_count_today,
     )
 
-    # 5. Diagnostic alert: record same-hour exceedances and push Telegram when
+    # Diagnostic alert: record same-hour exceedances and push Telegram when
     # the projected daily max is set to beat the forecast peak.
     try:
         from src.signals.forecast_exceedance import check_and_record_daily_max_alert

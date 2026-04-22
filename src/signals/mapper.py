@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 from dateutil import parser as dateutil_parser
 
@@ -510,6 +511,129 @@ CITY_ICAO: dict[str, str] = {
     "edinburgh": "EGPH",
     "barcelona": "LEBL",
 }
+
+
+# ---------------------------------------------------------------------------
+# ICAO → IANA timezone lookup
+# ---------------------------------------------------------------------------
+#
+# Polymarket daily-max markets resolve on the LOCAL city day (Wunderground
+# convention), not the UTC day. Using UTC-day boundaries for the routine-
+# daily-max computation attributes next-local-day METARs to "today" once the
+# UTC day rolls over but local time hasn't — producing spurious lock-ins and
+# bad probability estimates. See `_routine_daily_max` in state_aggregator.py.
+
+ICAO_TIMEZONE: dict[str, str] = {
+    # US Eastern
+    "KJFK": "America/New_York", "KEWR": "America/New_York", "KPHL": "America/New_York",
+    "KBOS": "America/New_York", "KBWI": "America/New_York", "KDCA": "America/New_York",
+    "KCLT": "America/New_York", "KRDU": "America/New_York", "KORF": "America/New_York",
+    "KRIC": "America/New_York", "KMIA": "America/New_York", "KTPA": "America/New_York",
+    "KJAX": "America/New_York", "KATL": "America/New_York", "KBHM": "America/Chicago",
+    "KBNA": "America/Chicago", "KSDF": "America/New_York", "KCVG": "America/New_York",
+    "KIND": "America/New_York", "KCMH": "America/New_York", "KCLE": "America/New_York",
+    "KDTW": "America/New_York", "KPIT": "America/New_York", "KPVD": "America/New_York",
+    "KMHT": "America/New_York", "KBTV": "America/New_York", "KPWM": "America/New_York",
+    "KBDL": "America/New_York", "KILG": "America/New_York", "KBUF": "America/New_York",
+    "KROC": "America/New_York", "KLEX": "America/New_York", "KCHS": "America/New_York",
+    "KGSO": "America/New_York", "KINT": "America/New_York", "KCRW": "America/New_York",
+    "KTOL": "America/New_York",
+    # US Central
+    "KORD": "America/Chicago", "KMKE": "America/Chicago", "KMSN": "America/Chicago",
+    "KMSP": "America/Chicago", "KDSM": "America/Chicago", "KSTL": "America/Chicago",
+    "KMCI": "America/Chicago", "KOMA": "America/Chicago", "KLNK": "America/Chicago",
+    "KICT": "America/Chicago", "KTUL": "America/Chicago", "KOKC": "America/Chicago",
+    "KMSY": "America/Chicago", "KBTR": "America/Chicago", "KJAN": "America/Chicago",
+    "KMEM": "America/Chicago", "KIAH": "America/Chicago", "KDFW": "America/Chicago",
+    "KSAT": "America/Chicago", "KAUS": "America/Chicago", "KFSD": "America/Chicago",
+    "KFAR": "America/Chicago", "KCRP": "America/Chicago", "KLIT": "America/Chicago",
+    "KLRD": "America/Chicago", "KLBB": "America/Chicago",
+    # US Mountain (with DST)
+    "KDEN": "America/Denver", "KCOS": "America/Denver", "KABQ": "America/Denver",
+    "KSLC": "America/Denver", "KELP": "America/Denver", "KBZN": "America/Denver",
+    "KCPR": "America/Denver",
+    # Phoenix — Arizona does not observe DST
+    "KPHX": "America/Phoenix", "KTUS": "America/Phoenix",
+    # US Pacific
+    "KLAS": "America/Los_Angeles", "KRNO": "America/Los_Angeles",
+    "KLAX": "America/Los_Angeles", "KSAN": "America/Los_Angeles",
+    "KSFO": "America/Los_Angeles", "KOAK": "America/Los_Angeles",
+    "KSJC": "America/Los_Angeles", "KSMF": "America/Los_Angeles",
+    "KFAT": "America/Los_Angeles", "KBFL": "America/Los_Angeles",
+    "KPDX": "America/Los_Angeles", "KSEA": "America/Los_Angeles",
+    "KGEG": "America/Los_Angeles", "KBOI": "America/Boise",
+    "KSCK": "America/Los_Angeles", "KMOD": "America/Los_Angeles",
+    "KRAL": "America/Los_Angeles", "KSNA": "America/Los_Angeles",
+    "KLGB": "America/Los_Angeles",
+    # US non-contiguous
+    "PANC": "America/Anchorage", "PHNL": "Pacific/Honolulu",
+    # Canada
+    "CYYZ": "America/Toronto", "CYUL": "America/Toronto",
+    "CYVR": "America/Vancouver",
+    # Mexico / Central America
+    "MMMX": "America/Mexico_City", "MPTO": "America/Panama",
+    # South America
+    "SAEZ": "America/Argentina/Buenos_Aires", "SBGR": "America/Sao_Paulo",
+    "SPJC": "America/Lima", "SKBO": "America/Bogota",
+    # Western Europe
+    "EGLL": "Europe/London", "EGPH": "Europe/London", "EIDW": "Europe/Dublin",
+    "LFPG": "Europe/Paris", "EHAM": "Europe/Amsterdam", "EBBR": "Europe/Brussels",
+    "EDDB": "Europe/Berlin", "EDDM": "Europe/Berlin", "LOWW": "Europe/Vienna",
+    "LSZH": "Europe/Zurich", "LIRF": "Europe/Rome", "LIMC": "Europe/Rome",
+    "LEMD": "Europe/Madrid", "LEBL": "Europe/Madrid", "LPPT": "Europe/Lisbon",
+    # Nordics
+    "ESSA": "Europe/Stockholm", "ENGM": "Europe/Oslo",
+    "EKCH": "Europe/Copenhagen", "EFHK": "Europe/Helsinki",
+    # Eastern Europe
+    "EPWA": "Europe/Warsaw", "LKPR": "Europe/Prague", "LHBP": "Europe/Budapest",
+    "LGAV": "Europe/Athens", "UUEE": "Europe/Moscow",
+    # Middle East / Turkey
+    "LTFM": "Europe/Istanbul", "LTAC": "Europe/Istanbul",
+    "LLBG": "Asia/Jerusalem", "OMDB": "Asia/Dubai", "OTHH": "Asia/Qatar",
+    "OERK": "Asia/Riyadh", "OEJN": "Asia/Riyadh",
+    # Africa
+    "HECA": "Africa/Cairo", "DNMM": "Africa/Lagos",
+    "FAOR": "Africa/Johannesburg", "FACT": "Africa/Johannesburg",
+    "HKJK": "Africa/Nairobi",
+    # South Asia
+    "VABB": "Asia/Kolkata", "VIDP": "Asia/Kolkata", "VECC": "Asia/Kolkata",
+    "VOMM": "Asia/Kolkata", "VOBL": "Asia/Kolkata", "VOHS": "Asia/Kolkata",
+    "VILK": "Asia/Kolkata",
+    "OPKC": "Asia/Karachi", "OPLA": "Asia/Karachi",
+    "VGHS": "Asia/Dhaka", "VCBI": "Asia/Colombo",
+    # Southeast Asia
+    "VTBS": "Asia/Bangkok", "WSSS": "Asia/Singapore",
+    "WMKK": "Asia/Kuala_Lumpur", "WMKP": "Asia/Kuala_Lumpur",
+    "WBGG": "Asia/Kuala_Lumpur", "WIII": "Asia/Jakarta",
+    "VVNB": "Asia/Ho_Chi_Minh", "VVTS": "Asia/Ho_Chi_Minh",
+    "RPLL": "Asia/Manila",
+    # East Asia
+    "RJTT": "Asia/Tokyo", "RJBB": "Asia/Tokyo",
+    "RJCC": "Asia/Tokyo", "RJFF": "Asia/Tokyo",
+    "RKSI": "Asia/Seoul", "RKPK": "Asia/Seoul",
+    "ZBAA": "Asia/Shanghai", "ZSPD": "Asia/Shanghai", "ZUCK": "Asia/Shanghai",
+    "ZHHH": "Asia/Shanghai", "ZUUU": "Asia/Shanghai", "ZGSZ": "Asia/Shanghai",
+    "ZGGG": "Asia/Shanghai",
+    "VHHH": "Asia/Hong_Kong", "RCTP": "Asia/Taipei",
+    # Oceania
+    "YSSY": "Australia/Sydney", "YMML": "Australia/Melbourne",
+    "YBBN": "Australia/Brisbane", "YPPH": "Australia/Perth",
+    "NZAA": "Pacific/Auckland", "NZWN": "Pacific/Auckland",
+}
+
+
+def icao_timezone(icao: str) -> ZoneInfo:
+    """Return the IANA timezone for an ICAO station.
+
+    Falls back to UTC with a warning when the station is not in the lookup
+    table (preserves the legacy UTC-day behavior for unknown stations rather
+    than silently producing wrong answers).
+    """
+    tz_name = ICAO_TIMEZONE.get(icao.upper())
+    if tz_name is None:
+        logger.warning("icao_timezone: no timezone for %r, falling back to UTC", icao)
+        return ZoneInfo("UTC")
+    return ZoneInfo(tz_name)
 
 
 def f_to_c(temp_f: float) -> float:

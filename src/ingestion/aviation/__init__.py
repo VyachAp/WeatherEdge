@@ -356,22 +356,36 @@ async def get_routine_daily_max(
     station: str,
     hours: int = 24,
 ) -> tuple[float | None, int]:
-    """Return (max_temp_f, routine_count) from routine-only METARs for the current UTC day.
+    """Return (max_temp_f, routine_count) for the station's LOCAL-city day.
 
     Filters out SPECI reports before computing daily max. The routine_count
     is used by the MIN_ROUTINE_COUNT circuit breaker.
+
+    Uses local-city timezone so the daily max aligns with Wunderground's
+    resolution-day convention — see `icao_timezone` in `signals.mapper`.
     """
+    from src.signals.mapper import icao_timezone
+
     history = await fetch_metar_history(station, hours=hours)
 
     now_utc = datetime.now(timezone.utc)
-    today_start = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+    tz = icao_timezone(station)
+    now_local = now_utc.astimezone(tz)
+    local_day_start = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+    local_day_end = local_day_start + timedelta(days=1)
+    utc_start = local_day_start.astimezone(timezone.utc)
+    utc_end = local_day_end.astimezone(timezone.utc)
 
     routine_temps: list[float] = []
     for m in history:
         if m.get("is_speci"):
             continue
         obs_at = m.get("observed_at")
-        if obs_at is not None and isinstance(obs_at, datetime) and obs_at >= today_start:
+        if (
+            obs_at is not None
+            and isinstance(obs_at, datetime)
+            and utc_start <= obs_at < utc_end
+        ):
             temp_f = m.get("temp_f")
             if temp_f is not None:
                 routine_temps.append(temp_f)

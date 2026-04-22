@@ -132,3 +132,62 @@ def size_position(
         capped=capped,
         reason=reason,
     )
+
+
+def size_locked_position(
+    bankroll: float,
+    price: float,
+    current_exposure: float = 0.0,
+    orderbook_depth: float | None = None,
+) -> PositionSize:
+    """Size a lock-rule trade. No Kelly — no probability to plug in.
+
+    The lock rule is a deterministic "outcome is physically decided" signal.
+    Stake uses a fixed fraction of bankroll, capped by the standard exposure,
+    max-position, and depth limits. The payout shape (buying near-resolved at
+    high price gives tiny gross margin) means sizing must stay small and
+    depth-aware to avoid moving the book.
+    """
+    price = max(0.01, min(0.99, price))
+
+    raw_stake = bankroll * settings.LOCK_POSITION_PCT
+    stake = raw_stake
+    capped = False
+    reasons: list[str] = [f"fixed {settings.LOCK_POSITION_PCT:.0%} bankroll"]
+
+    max_remaining = bankroll * MAX_EXPOSURE_PCT - current_exposure
+    if max_remaining <= 0:
+        return PositionSize(
+            stake_usd=0, kelly_pct=0.0, capped=True,
+            reason="exposure limit reached",
+        )
+    if stake > max_remaining:
+        stake = max_remaining
+        capped = True
+        reasons.append("total exposure cap")
+
+    usd_cap = settings.MAX_POSITION_USD / 2
+    if stake > usd_cap:
+        stake = usd_cap
+        capped = True
+        reasons.append(f"lock-rule cap ${usd_cap:.0f}")
+
+    if orderbook_depth is not None and orderbook_depth > 0:
+        depth_cap = orderbook_depth * 0.15
+        if stake > depth_cap:
+            stake = depth_cap
+            capped = True
+            reasons.append(f"depth cap (15% of ${orderbook_depth:.0f})")
+
+    if 0 < stake < MIN_TRADE_USD:
+        return PositionSize(
+            stake_usd=0, kelly_pct=0.0, capped=True,
+            reason=f"below ${MIN_TRADE_USD:.0f} minimum",
+        )
+
+    return PositionSize(
+        stake_usd=round(stake, 2),
+        kelly_pct=0.0,
+        capped=capped,
+        reason=", ".join(reasons),
+    )

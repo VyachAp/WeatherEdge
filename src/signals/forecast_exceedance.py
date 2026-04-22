@@ -1,26 +1,35 @@
 """Telegram alert when today's projected daily max is set to beat the forecast peak.
 
-Fires at most once per new routine METAR per station, gated to the window where
-the signal still has trading value. The DB row is written for every new routine
-METAR that exceeds the same-hour forecast (calibration history), but the
-Telegram push is suppressed once the day's peak has almost certainly passed or
-there isn't enough data to trust the projection.
+The DB row is written for every new routine METAR that exceeds the same-hour
+forecast (calibration history). The Telegram push is suppressed when the day's
+peak has almost certainly passed, when we don't have enough routine METARs yet,
+or when this station already got a push within ``ALERT_COOLDOWN``.
 
 Peak-passed heuristic (any of):
-- observed max is within 0.5°F of (bias-adjusted) forecast peak AND METAR trend ≤ 0
-- Open-Meteo peak hour is past AND METAR trend ≤ 0
-- solar_declining AND METAR trend ≤ 0
+- observed max is within 0.5°F of (bias-adjusted) forecast peak AND short trend ≤ 0
+- Open-Meteo peak hour is past AND short trend ≤ 0
+- solar_declining AND short trend ≤ 0
+- forecast peak hour ≥ 1h behind us AND short trend essentially flat (≤ 0.1°F/hr)
+
+Here "short trend" is the 2.5h linear regression on routine METAR temperatures
+(``WeatherState.metar_trend_rate_short``) — a 6h regression stays positive well
+past the real peak on sharp-cooling afternoons, so it's the wrong signal here.
 
 Projected daily max:
-- observed max plus trend-based upward extrapolation for up to 3h before the
-  forecast peak, damped by solar decline and cloud rise magnitudes, and nudged
-  down slightly when dewpoint is rising fast.
+- Blend of trend-extrapolation and forecast peak with weight ``α = exp(-h/2)``.
+  Near the peak (small h) we trust the observed slope; far out (large h) we
+  trust the forecast, because diurnal warming is concave and a morning rate of
+  +2°C/hr does not sustain for 3h.
+- Extrapolation is damped by close-hours solar decline and cloud rise, nudged
+  down when dewpoint climbs fast, and capped at ``forecast_peak + 5°F``
+  (≈ 2.8°C) to keep implausible overshoots out of the push channel.
 """
 
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+import math
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import select
@@ -42,6 +51,10 @@ DELTA_THRESHOLD_F = 1.0       # projected_max − forecast_peak to trigger push
 MIN_ROUTINE_COUNT_FOR_PUSH = 3
 EXTRAPOLATION_HOURS_CAP = 3.0
 PEAK_TOLERANCE_F = 0.5        # current_max within this of forecast_peak = "reached"
+EXTRAPOLATION_HALFLIFE_H = 2.0  # α = exp(-h/halflife); trust extrapolation near peak
+MAX_OVERSHOOT_F = 5.0           # ≈ 2.8°C plausibility ceiling vs forecast_peak
+DEWPOINT_NUDGE_F = 0.5
+ALERT_COOLDOWN = timedelta(minutes=60)  # one Telegram push per station per hour
 
 
 def _c_to_f(c: float) -> float:
@@ -65,39 +78,56 @@ def _closest_hour_index(observed_at: datetime, n_hours: int) -> int:
     return max(0, min(idx, n_hours - 1))
 
 
+def _effective_trend(state: WeatherState) -> float:
+    """Prefer the short-window (2.5h) trend; fall back to the 6h regression."""
+    return state.metar_trend_rate_short or state.metar_trend_rate
+
+
 def _peak_passed(state: WeatherState) -> bool:
     """Heuristic for 'today's peak has almost certainly passed'.
 
-    Uses only WeatherState fields. Any one of the three branches triggers.
+    The 6h trend can stay positive well past the real peak on sharp-cooling
+    afternoons, so the three cooling-branch checks use the short-window trend.
+    The fourth branch catches the case where the forecast peak hour is at
+    least an hour behind us and the short trend is essentially flat.
     """
-    if state.metar_trend_rate <= 0 and (
-        state.current_max_f >= state.forecast_peak_f - PEAK_TOLERANCE_F
-    ):
+    trend = _effective_trend(state)
+    if trend <= 0 and state.current_max_f >= state.forecast_peak_f - PEAK_TOLERANCE_F:
         return True
-    if state.metar_trend_rate <= 0 and state.hours_until_peak <= 0:
+    if trend <= 0 and state.hours_until_peak <= 0:
         return True
-    if state.metar_trend_rate <= 0 and state.solar_declining:
+    if trend <= 0 and state.solar_declining:
+        return True
+    if state.hours_until_peak <= -1.0 and state.metar_trend_rate_short <= 0.1:
         return True
     return False
 
 
 def _project_daily_max(state: WeatherState) -> float:
-    """Project today's final daily max using METAR trend + close-hours forecast.
+    """Project today's final daily max by blending extrapolation with forecast.
 
-    Linear extrapolation from the current observed max, capped at 3h, damped by
-    close-hours solar decline and cloud rise, nudged down if dewpoint is
-    climbing fast (moisture absorbing heat). Never returns below observed max.
+    Pure extrapolation ``current_max + trend*hours_to_peak`` systematically
+    overshoots on the morning warming leg because the diurnal curve is
+    concave. Blend toward ``forecast_peak_f`` with ``α = exp(-h/halflife)``:
+    near the peak we trust the observed slope, far out we trust the forecast.
+    Damped by close-hours solar decline and cloud rise, nudged down if
+    dewpoint is climbing fast, capped at ``forecast_peak + MAX_OVERSHOOT_F``,
+    and never returns below the observed max.
     """
     projected = state.current_max_f
-    if state.hours_until_peak > 0 and state.metar_trend_rate > 0:
+    trend = _effective_trend(state)
+    if state.hours_until_peak > 0 and trend > 0:
         hours = min(state.hours_until_peak, EXTRAPOLATION_HOURS_CAP)
         if state.solar_declining:
             hours *= max(0.0, 1.0 - state.solar_decline_magnitude)
         if state.cloud_rising:
             hours *= max(0.0, 1.0 - state.cloud_rise_magnitude)
-        projected += state.metar_trend_rate * hours
+        extrapolated = state.current_max_f + trend * hours
+        alpha = math.exp(-state.hours_until_peak / EXTRAPOLATION_HALFLIFE_H)
+        projected = alpha * extrapolated + (1.0 - alpha) * state.forecast_peak_f
     if state.dewpoint_trend_rate > 1.0:
-        projected -= 0.5
+        projected -= DEWPOINT_NUDGE_F
+    projected = min(projected, state.forecast_peak_f + MAX_OVERSHOOT_F)
     return max(projected, state.current_max_f)
 
 
@@ -142,6 +172,24 @@ async def check_and_record_daily_max_alert(
         and state.routine_count_today >= MIN_ROUTINE_COUNT_FOR_PUSH
         and projection_delta_f > DELTA_THRESHOLD_F
     )
+
+    # Cooldown: at most one Telegram push per station per hour. The DB row is
+    # still written (alerted=False) so calibration history and this query
+    # continue to reflect reality on the next tick.
+    if push:
+        async with async_session() as cooldown_session:
+            recent = await cooldown_session.execute(
+                select(ForecastExceedanceAlert.id)
+                .where(
+                    ForecastExceedanceAlert.station_icao == icao,
+                    ForecastExceedanceAlert.alerted.is_(True),
+                    ForecastExceedanceAlert.alerted_at
+                    >= datetime.now(timezone.utc) - ALERT_COOLDOWN,
+                )
+                .limit(1)
+            )
+            if recent.scalar() is not None:
+                push = False
 
     async with async_session() as session:
         existing = await session.execute(
