@@ -45,11 +45,39 @@ class WeatherState:
     # local day (e.g. a market asking about Apr 21 Dallas may close at 07:00
     # local Apr 21, and our snapshot may be at 23:00 local Apr 20).
     routine_history: tuple[tuple[datetime, float], ...] = ()
+    # Forecast-trajectory residual fields. All four are bias-adjusted to the
+    # same reference frame as forecast_peak_f so that residual=0 and slope
+    # match imply projected == forecast_peak_f. None when no forecast data
+    # or no routine METAR available.
+    latest_obs_temp_f: float | None = None
+    forecast_temp_now_f: float | None = None
+    forecast_slope_to_peak_f_per_hr: float | None = None
+    forecast_residual_f: float | None = None
 
 
 # ---------------------------------------------------------------------------
 # Internal helpers that work on a pre-fetched history list (no extra HTTP)
 # ---------------------------------------------------------------------------
+
+
+def _closest_hour_index(ts: datetime, n_hours: int) -> int:
+    # Duplicated from forecast_exceedance._closest_hour_index to avoid a
+    # state_aggregator → forecast_exceedance import cycle.
+    idx = ts.hour + (1 if ts.minute >= 30 else 0)
+    return max(0, min(idx, n_hours - 1))
+
+
+def _latest_routine_temp_f(history: list[dict[str, Any]]) -> float | None:
+    """Return temp_f of the newest non-SPECI METAR in ``history``, or None."""
+    routine = [
+        m for m in history
+        if not m.get("is_speci")
+        and m.get("temp_f") is not None
+        and isinstance(m.get("observed_at"), datetime)
+    ]
+    if not routine:
+        return None
+    return float(max(routine, key=lambda m: m["observed_at"])["temp_f"])
 
 
 def _routine_daily_max(
@@ -192,6 +220,10 @@ def build_state_from_metars(
     ]
 
     has_forecast = forecast is not None
+    latest_obs_temp_f: float | None = None
+    forecast_temp_now_f: float | None = None
+    forecast_slope_to_peak_f_per_hr: float | None = None
+    forecast_residual_f: float | None = None
     if has_forecast:
         adjusted_peak_c = forecast.peak_temp_c + bias_c
         forecast_peak_f = _c_to_f(adjusted_peak_c)
@@ -199,6 +231,21 @@ def build_state_from_metars(
         hours_until_peak = (peak_dt - now_utc).total_seconds() / 3600.0
         is_solar_declining, solar_mag = check_solar(forecast, now_utc.hour)
         is_cloud_rising, cloud_mag = check_cloud(forecast, now_utc.hour)
+
+        # Residual fields — all in the same bias-adjusted °F frame as
+        # forecast_peak_f so that residual=0 + matching slope ⇒
+        # projected == forecast_peak_f.
+        hourly = forecast.hourly_temps_c
+        if hourly:
+            hour_idx = _closest_hour_index(now_utc, len(hourly))
+            forecast_temp_now_f = _c_to_f(hourly[hour_idx] + bias_c)
+            forecast_slope_to_peak_f_per_hr = (
+                (forecast_peak_f - forecast_temp_now_f) / hours_until_peak
+                if hours_until_peak > 0 else 0.0
+            )
+            latest_obs_temp_f = _latest_routine_temp_f(recent_history)
+            if latest_obs_temp_f is not None:
+                forecast_residual_f = latest_obs_temp_f - forecast_temp_now_f
     else:
         forecast_peak_f = current_max_f
         hours_until_peak = 0.0
@@ -241,6 +288,10 @@ def build_state_from_metars(
         routine_count_today=routine_count,
         has_forecast=has_forecast,
         routine_history=tuple(routine_points),
+        latest_obs_temp_f=latest_obs_temp_f,
+        forecast_temp_now_f=forecast_temp_now_f,
+        forecast_slope_to_peak_f_per_hr=forecast_slope_to_peak_f_per_hr,
+        forecast_residual_f=forecast_residual_f,
     )
 
 

@@ -149,6 +149,59 @@ class TestMETARTrend:
         ev_flat = sum(b * p for b, p in dist_flat.probabilities.items())
         assert ev_rising > ev_flat
 
+    def test_matching_forecast_slope_no_shift(self):
+        """Obs slope matches forecast-implied slope → no residual shift."""
+        state_match = _make_state(
+            metar_trend_rate=2.0, hours_until_peak=4.0,
+            forecast_slope_to_peak_f_per_hr=2.0,
+            current_max_f=72.0,  # well below center so floor doesn't kick in
+        )
+        state_none = _make_state(
+            metar_trend_rate=0.0, hours_until_peak=4.0,
+            forecast_slope_to_peak_f_per_hr=0.0,
+            current_max_f=72.0,
+        )
+
+        dist_match = compute_distribution(state_match, BUCKETS)
+        dist_none = compute_distribution(state_none, BUCKETS)
+
+        ev_match = sum(b * p for b, p in dist_match.probabilities.items())
+        ev_none = sum(b * p for b, p in dist_none.probabilities.items())
+        # Centers are identical (both = forecast_peak_f) → EVs should match.
+        assert ev_match == pytest.approx(ev_none, abs=0.1)
+        assert not any("METAR trend" in r for r in dist_match.reasoning)
+
+    def test_outpacing_forecast_shifts_up(self):
+        """Obs slope > forecast slope → residual shift applied."""
+        state_outpace = _make_state(
+            metar_trend_rate=3.0, hours_until_peak=4.0,
+            forecast_slope_to_peak_f_per_hr=1.0,
+            current_max_f=72.0,
+        )
+        state_match = _make_state(
+            metar_trend_rate=1.0, hours_until_peak=4.0,
+            forecast_slope_to_peak_f_per_hr=1.0,
+            current_max_f=72.0,
+        )
+
+        dist_outpace = compute_distribution(state_outpace, BUCKETS)
+        dist_match = compute_distribution(state_match, BUCKETS)
+        ev_outpace = sum(b * p for b, p in dist_outpace.probabilities.items())
+        ev_match = sum(b * p for b, p in dist_match.probabilities.items())
+        assert ev_outpace > ev_match
+        assert any("residual" in r for r in dist_outpace.reasoning)
+
+    def test_missing_forecast_slope_uses_legacy(self):
+        """No forecast slope → fall back to legacy raw-rate shift."""
+        state_legacy = _make_state(
+            metar_trend_rate=3.0, hours_until_peak=4.0,
+            forecast_slope_to_peak_f_per_hr=None,
+            current_max_f=72.0,
+        )
+        dist = compute_distribution(state_legacy, BUCKETS)
+        # Legacy reasoning string includes "rising ... before peak".
+        assert any("rising" in r and "before peak" in r for r in dist.reasoning)
+
 
 class TestDewpointEffect:
     """Rising dewpoint should reduce upside."""

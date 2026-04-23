@@ -129,19 +129,35 @@ def _apply_metar_trend(
 ) -> float:
     """Shift distribution center based on METAR temperature trend.
 
-    Rising trend before peak = shift up. Flat/declining past peak = lock in.
+    Pre-peak: compare the observed 6h regression to the forecast's implied
+    slope to peak. Only the residual (observations outpacing the forecast's
+    own rise) shifts the center — matching slopes leave the distribution
+    anchored on the forecast peak, because the forecast already accounts for
+    that rise. Falls back to the legacy raw-rate shift when the forecast
+    slope isn't available.
+
+    Past peak: flat/declining trend locks the center to the observed max.
     """
     rate = state.metar_trend_rate
+    forecast_slope = state.forecast_slope_to_peak_f_per_hr
 
-    if state.hours_until_peak > 0 and rate > 0.5:
-        # Rising before peak: meaningful upside signal
-        shift = min(rate * 0.5, 2.0)  # Cap shift at 2°F
-        center += shift
-        reasoning.append(
-            f"METAR trend: rising {rate:.1f}°F/hr before peak, shift +{shift:.1f}°F"
-        )
+    if state.hours_until_peak > 0:
+        if forecast_slope is not None:
+            residual_rate = rate - forecast_slope
+            if residual_rate > 0.5:
+                shift = min(residual_rate * 0.5, 2.0)
+                center += shift
+                reasoning.append(
+                    f"METAR trend residual: obs {rate:+.1f} vs forecast-implied "
+                    f"{forecast_slope:+.1f} °F/hr → shift +{shift:.1f}°F"
+                )
+        elif rate > 0.5:
+            shift = min(rate * 0.5, 2.0)
+            center += shift
+            reasoning.append(
+                f"METAR trend: rising {rate:.1f}°F/hr before peak, shift +{shift:.1f}°F"
+            )
     elif state.hours_until_peak <= 0 and rate <= 0:
-        # Past peak and declining: strong lock-in
         lock_diff = state.current_max_f - center
         if lock_diff > 0:
             center = state.current_max_f
@@ -149,7 +165,6 @@ def _apply_metar_trend(
                 f"METAR trend: declining past peak, locked to observed max {state.current_max_f:.0f}°F"
             )
 
-    # If current observed max exceeds forecast center, pull center up
     if state.current_max_f > center:
         center = state.current_max_f
         reasoning.append(f"observed max {state.current_max_f:.0f}°F exceeds forecast, center adjusted up")

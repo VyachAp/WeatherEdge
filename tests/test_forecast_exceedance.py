@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -16,7 +17,7 @@ from src.signals.forecast_exceedance import (
     _project_daily_max,
     check_and_record_daily_max_alert,
 )
-from src.signals.state_aggregator import WeatherState
+from src.signals.state_aggregator import WeatherState, build_state_from_metars
 
 
 def _make_forecast(hourly_temps_c: list[float] | None = None) -> OpenMeteoForecast:
@@ -54,6 +55,10 @@ def _state(
     cloud_rise_magnitude: float = 0.0,
     routine_count_today: int = 4,
     icao: str = "KLAX",
+    latest_obs_temp_f: float | None = None,
+    forecast_temp_now_f: float | None = None,
+    forecast_slope_to_peak_f_per_hr: float | None = None,
+    forecast_residual_f: float | None = None,
 ) -> WeatherState:
     return WeatherState(
         station_icao=icao,
@@ -68,6 +73,10 @@ def _state(
         cloud_rising=cloud_rising,
         cloud_rise_magnitude=cloud_rise_magnitude,
         routine_count_today=routine_count_today,
+        latest_obs_temp_f=latest_obs_temp_f,
+        forecast_temp_now_f=forecast_temp_now_f,
+        forecast_slope_to_peak_f_per_hr=forecast_slope_to_peak_f_per_hr,
+        forecast_residual_f=forecast_residual_f,
     )
 
 
@@ -238,6 +247,149 @@ class TestProjectDailyMax:
         near_proj = _project_daily_max(near)
         far_proj = _project_daily_max(far)
         assert abs(far_proj - 80.0) < abs(near_proj - 80.0)
+
+
+class TestProjectDailyMaxResidual:
+    """Residual-carry branch: uses forecast trajectory as the anchor."""
+
+    def test_zero_residual_returns_forecast_peak(self):
+        # Obs tracks the forecast exactly: residual = 0, slope matches.
+        # Projection should land on forecast_peak_f (monotonic floor aside).
+        s = _state(
+            current_max_f=74.0, metar_trend_rate=1.0,
+            forecast_peak_f=80.0, hours_until_peak=2.0,
+            latest_obs_temp_f=76.0, forecast_temp_now_f=76.0,
+            forecast_slope_to_peak_f_per_hr=1.0, forecast_residual_f=0.0,
+        )
+        assert _project_daily_max(s) == pytest.approx(80.0, abs=0.01)
+
+    def test_positive_residual_carries_with_decay(self):
+        # Residual +4°F at h=2 → peak + 4·exp(-1) ≈ peak + 1.47°F.
+        s = _state(
+            current_max_f=78.0, metar_trend_rate=1.0,
+            forecast_peak_f=80.0, hours_until_peak=2.0,
+            latest_obs_temp_f=80.0, forecast_temp_now_f=76.0,
+            forecast_slope_to_peak_f_per_hr=1.0, forecast_residual_f=4.0,
+        )
+        assert _project_daily_max(s) == pytest.approx(80.0 + 4.0 * math.exp(-1.0), abs=0.05)
+
+    def test_positive_trend_residual_adds_carry(self):
+        # Level residual 0, observed slope +1°F/hr above forecast slope, h=2
+        # → peak + 0.5 · 1 · 2 = peak + 1.0°F.
+        s = _state(
+            current_max_f=74.0, metar_trend_rate=2.0,
+            forecast_peak_f=80.0, hours_until_peak=2.0,
+            latest_obs_temp_f=76.0, forecast_temp_now_f=76.0,
+            forecast_slope_to_peak_f_per_hr=1.0, forecast_residual_f=0.0,
+        )
+        assert _project_daily_max(s) == pytest.approx(81.0, abs=0.05)
+
+    def test_negative_residual_pulls_down_but_floored(self):
+        # Residual -2°F, obs slope matches forecast slope, h=1 →
+        # projected = 80 - 2·exp(-0.5) ≈ 78.79. current_max=78 is below this,
+        # so no floor kick; result is the residual-adjusted value.
+        s = _state(
+            current_max_f=78.0, metar_trend_rate=2.0,
+            forecast_peak_f=80.0, hours_until_peak=1.0,
+            latest_obs_temp_f=76.0, forecast_temp_now_f=78.0,
+            forecast_slope_to_peak_f_per_hr=2.0, forecast_residual_f=-2.0,
+        )
+        assert _project_daily_max(s) == pytest.approx(80.0 - 2.0 * math.exp(-0.5), abs=0.05)
+
+    def test_overshoot_cap_still_applied(self):
+        # Enormous residual should be clipped at forecast_peak + MAX_OVERSHOOT_F.
+        s = _state(
+            current_max_f=78.0, metar_trend_rate=20.0,
+            forecast_peak_f=80.0, hours_until_peak=1.0,
+            latest_obs_temp_f=100.0, forecast_temp_now_f=78.0,
+            forecast_slope_to_peak_f_per_hr=1.0, forecast_residual_f=22.0,
+        )
+        assert _project_daily_max(s) == pytest.approx(80.0 + MAX_OVERSHOOT_F)
+
+    def test_monotonic_floor_preserved(self):
+        # Residual +2 but current_max already above the residual-adjusted value.
+        # Floor kicks in — projection = current_max_f.
+        s = _state(
+            current_max_f=95.0, metar_trend_rate=0.0,
+            forecast_peak_f=80.0, hours_until_peak=2.0,
+            latest_obs_temp_f=82.0, forecast_temp_now_f=80.0,
+            forecast_slope_to_peak_f_per_hr=0.0, forecast_residual_f=2.0,
+        )
+        assert _project_daily_max(s) == pytest.approx(95.0)
+
+    def test_past_peak_skips_residual_carry(self):
+        # hours_until_peak <= 0 → no residual carry applied; return floor/cap
+        # over forecast_peak_f (since projected starts at forecast_peak_f).
+        s = _state(
+            current_max_f=79.0, metar_trend_rate=0.5,
+            forecast_peak_f=80.0, hours_until_peak=0.0,
+            latest_obs_temp_f=82.0, forecast_temp_now_f=80.0,
+            forecast_slope_to_peak_f_per_hr=0.0, forecast_residual_f=2.0,
+        )
+        # projected = max(forecast_peak_f, current_max_f) = 80.0
+        assert _project_daily_max(s) == pytest.approx(80.0)
+
+    def test_missing_forecast_now_falls_back_to_legacy(self):
+        # No residual fields → legacy projector path. Use the same setup as
+        # test_rising_trend_extrapolates to pin the fallback value.
+        s = _state(
+            current_max_f=76.0, metar_trend_rate=1.0,
+            forecast_peak_f=80.0, hours_until_peak=2.0,
+        )
+        assert _project_daily_max(s) == pytest.approx(79.26, abs=0.05)
+
+    def test_rpll_scenario_clipped_and_floored(self):
+        # Reproduces the RPLL alert: obs_max far above forecast_peak; residual
+        # is huge; overshoot cap kicks in, then current_max floor lifts the
+        # result back up to observed max — projection = current_max.
+        s = _state(
+            current_max_f=96.8, metar_trend_rate=1.8,
+            forecast_peak_f=89.6, hours_until_peak=2.8,
+            latest_obs_temp_f=96.8, forecast_temp_now_f=84.2,
+            forecast_slope_to_peak_f_per_hr=1.93, forecast_residual_f=12.6,
+        )
+        # overshoot-cap = 89.6 + 5.0 = 94.6 → floored at current_max 96.8.
+        assert _project_daily_max(s) == pytest.approx(96.8)
+
+
+class TestBuildStateResidualFields:
+    """build_state_from_metars populates the 4 residual-math fields."""
+
+    def test_forecast_populates_all_residual_fields(self):
+        # 24h hourly forecast: temp ramps 10°C → 30°C at hour 20, then drops.
+        hourly = [10.0 + (h * 1.0 if h <= 20 else 40.0 - h) for h in range(24)]
+        forecast = _make_forecast(hourly_temps_c=hourly)
+        now_utc = datetime(2026, 4, 22, 18, 0, tzinfo=timezone.utc)
+        # Two routine METARs inside the 6h window, latest at 17:53 with temp 80°F.
+        history = [
+            _metar(datetime(2026, 4, 22, 14, 53, tzinfo=timezone.utc), 70.0),
+            _metar(datetime(2026, 4, 22, 17, 53, tzinfo=timezone.utc), 80.0),
+        ]
+
+        state = build_state_from_metars("KLAX", history, forecast, bias_c=0.0, now_utc=now_utc)
+
+        assert state is not None
+        assert state.latest_obs_temp_f == pytest.approx(80.0)
+        # hour 18 forecast = 28°C → 82.4°F; residual = 80 - 82.4 = -2.4.
+        assert state.forecast_temp_now_f == pytest.approx(82.4, abs=0.05)
+        assert state.forecast_residual_f == pytest.approx(-2.4, abs=0.05)
+        # forecast_peak = 30°C = 86°F at hour 20; now at 18 → 2h to peak.
+        # Slope = (86 - 82.4) / 2 = 1.8°F/hr.
+        assert state.forecast_slope_to_peak_f_per_hr == pytest.approx(1.8, abs=0.05)
+
+    def test_no_forecast_leaves_fields_none(self):
+        now_utc = datetime(2026, 4, 22, 18, 0, tzinfo=timezone.utc)
+        history = [
+            _metar(datetime(2026, 4, 22, 17, 53, tzinfo=timezone.utc), 80.0),
+        ]
+
+        state = build_state_from_metars("KLAX", history, None, bias_c=0.0, now_utc=now_utc)
+
+        assert state is not None
+        assert state.latest_obs_temp_f is None
+        assert state.forecast_temp_now_f is None
+        assert state.forecast_slope_to_peak_f_per_hr is None
+        assert state.forecast_residual_f is None
 
 
 class _FakeResult:

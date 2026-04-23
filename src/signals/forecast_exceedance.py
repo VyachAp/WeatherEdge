@@ -55,6 +55,12 @@ EXTRAPOLATION_HALFLIFE_H = 2.0  # α = exp(-h/halflife); trust extrapolation nea
 MAX_OVERSHOOT_F = 5.0           # ≈ 2.8°C plausibility ceiling vs forecast_peak
 DEWPOINT_NUDGE_F = 0.5
 ALERT_COOLDOWN = timedelta(minutes=60)  # one Telegram push per station per hour
+# Residual-carry tunables — how much of the observed-vs-forecast gap to carry
+# forward to the forecast peak. Halflife controls how quickly the level
+# residual fades toward zero with distance to peak; K is the fraction of a
+# positive trend residual carried linearly up to EXTRAPOLATION_HOURS_CAP.
+RESIDUAL_DECAY_HALFLIFE_H = 2.0
+RESIDUAL_TREND_CARRY_K = 0.5
 
 
 def _c_to_f(c: float) -> float:
@@ -104,16 +110,48 @@ def _peak_passed(state: WeatherState) -> bool:
 
 
 def _project_daily_max(state: WeatherState) -> float:
-    """Project today's final daily max by blending extrapolation with forecast.
+    """Project today's final daily max, anchored on the forecast trajectory.
 
-    Pure extrapolation ``current_max + trend*hours_to_peak`` systematically
-    overshoots on the morning warming leg because the diurnal curve is
-    concave. Blend toward ``forecast_peak_f`` with ``α = exp(-h/halflife)``:
-    near the peak we trust the observed slope, far out we trust the forecast.
-    Damped by close-hours solar decline and cloud rise, nudged down if
-    dewpoint is climbing fast, capped at ``forecast_peak + MAX_OVERSHOOT_F``,
-    and never returns below the observed max.
+    Residual carry: start from ``forecast_peak_f`` and add the level residual
+    (``latest_obs_f − forecast_now_f``) with exponential decay toward peak
+    time, plus a damped trend residual (observed slope − forecast-implied
+    slope). When observations track the forecast exactly, projection equals
+    the forecast peak. When obs run hot, projection sits above the peak and
+    is clipped at ``forecast_peak + MAX_OVERSHOOT_F``; the observed max is
+    always a floor.
+
+    Falls back to the legacy linear-blend behaviour when the residual fields
+    are unavailable (e.g. forecast missing hourly_temps_c or no routine METAR
+    yet in the 6h window).
     """
+    if state.forecast_temp_now_f is None or state.forecast_residual_f is None:
+        return _legacy_project_daily_max(state)
+
+    projected = state.forecast_peak_f
+
+    if state.hours_until_peak > 0:
+        alpha = math.exp(-state.hours_until_peak / RESIDUAL_DECAY_HALFLIFE_H)
+        projected += alpha * state.forecast_residual_f
+
+        observed_slope = _effective_trend(state)
+        forecast_slope = state.forecast_slope_to_peak_f_per_hr or 0.0
+        residual_trend = observed_slope - forecast_slope
+        if residual_trend > 0:
+            hours = min(state.hours_until_peak, EXTRAPOLATION_HOURS_CAP)
+            if state.solar_declining:
+                hours *= max(0.0, 1.0 - state.solar_decline_magnitude)
+            if state.cloud_rising:
+                hours *= max(0.0, 1.0 - state.cloud_rise_magnitude)
+            projected += RESIDUAL_TREND_CARRY_K * residual_trend * hours
+
+    if state.dewpoint_trend_rate > 1.0:
+        projected -= DEWPOINT_NUDGE_F
+    projected = min(projected, state.forecast_peak_f + MAX_OVERSHOOT_F)
+    return max(projected, state.current_max_f)
+
+
+def _legacy_project_daily_max(state: WeatherState) -> float:
+    """Pre-residual linear-blend projector. Kept for the no-forecast-now path."""
     projected = state.current_max_f
     trend = _effective_trend(state)
     if state.hours_until_peak > 0 and trend > 0:
