@@ -76,7 +76,11 @@ class Settings(BaseSettings):
     # Lock-rule trader (deterministic physical-condition path)
     LOCK_RULE_ENABLED: bool = True
     LOCK_RULE_MAX_PRICE: float = 0.95
-    LOCK_RULE_MIN_PRICE: float = 0.30
+    # Match the unified-pipeline pre-filter so any price the lock path sees is
+    # tradeable. Previously 0.30 — blocked cases where a mispriced market was
+    # still at single-digit cents despite the outcome being physically locked
+    # (a ~10× return on the side we're certain about).
+    LOCK_RULE_MIN_PRICE: float = 0.05
     LOCK_MARGIN_F: float = 2.0
     LOCK_POSITION_PCT: float = 0.02
     LOCK_RULE_LOSS_WINDOW_HOURS: int = 72
