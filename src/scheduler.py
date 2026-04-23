@@ -44,6 +44,13 @@ _scheduler: AsyncIOScheduler | None = None
 _drawdown_monitor: DrawdownMonitor | None = None
 _shutdown_event: asyncio.Event | None = None
 
+# Fast-lock-poll bookkeeping. In-process only; reset on process restart.
+# `_locked_markets_fired_today` prevents re-firing on a market we've already
+# placed a lock order for; cleared by `job_daily_settlement` at 22:00 UTC.
+# `_last_routine_seen` skips METARs the fast loop already processed.
+_locked_markets_fired_today: set[str] = set()
+_last_routine_seen: dict[str, datetime] = {}
+
 # ---------------------------------------------------------------------------
 # Structured JSON logging
 # ---------------------------------------------------------------------------
@@ -779,7 +786,11 @@ async def job_daily_settlement() -> None:
             except Exception:
                 logger.exception("Station bias recording failed (non-fatal)")
 
-            # 6. Weekly calibration check (Sundays)
+            # 6. Reset fast-lock-poll dedup so the next trading day starts clean.
+            _locked_markets_fired_today.clear()
+            _last_routine_seen.clear()
+
+            # 7. Weekly calibration check (Sundays)
             if datetime.now(timezone.utc).weekday() == 6:
                 coeffs = await get_calibration_coefficients(session)
                 if coeffs is not None:
@@ -893,6 +904,206 @@ async def backfill_markets(days: int) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Fast lock poll — between-tick latency fix
+# ---------------------------------------------------------------------------
+
+
+def _minimal_state_for_easy_lock(
+    icao: str,
+    routine_points: list[tuple[datetime, float]],
+):
+    """Build a WeatherState with only routine history — sufficient for the
+    EASY lock direction (observed max already clears threshold), which doesn't
+    read forecast/solar/trend fields. HARD-direction locks still need the
+    main pipeline's forecast context and run there.
+    """
+    from src.signals.state_aggregator import WeatherState
+
+    return WeatherState(
+        station_icao=icao,
+        current_max_f=max(t for _, t in routine_points),
+        metar_trend_rate=0.0,
+        dewpoint_trend_rate=0.0,
+        forecast_peak_f=0.0,
+        hours_until_peak=0.0,
+        solar_declining=False,
+        solar_decline_magnitude=0.0,
+        cloud_rising=False,
+        cloud_rise_magnitude=0.0,
+        routine_count_today=len(routine_points),
+        has_forecast=False,
+        routine_history=tuple(sorted(routine_points, key=lambda p: p[0])),
+    )
+
+
+async def job_fast_lock_poll() -> None:
+    """Between-tick lock-rule check. Catches new routine METARs seconds after
+    publication so the order lands before Polymarket market-makers react.
+
+    Only the EASY lock direction fires here — observed daily max already
+    clears threshold + LOCK_MARGIN_F. HARD direction (below-threshold,
+    no-more-heating) needs forecast/solar context and stays on the main
+    5-min pipeline.
+
+    Scope: one bulk `fetch_latest_metars` per tick (AWC accepts up to 20
+    stations per request), CLOB price/depth only when a lock actually fires.
+    Dedup via `_locked_markets_fired_today`; cleared at daily settlement.
+    """
+    if not settings.LOCK_RULE_ENABLED or not settings.FAST_LOCK_POLL_ENABLED:
+        return
+
+    alerter = get_alerter()
+    try:
+        from src.ingestion.aviation import fetch_latest_metars
+        from src.ingestion.polymarket import get_active_weather_markets
+        from src.risk.circuit_breakers import check_circuit_breakers
+        from src.signals.mapper import icao_for_location
+        from src.execution.polymarket_client import (
+            get_best_bid_ask,
+            get_orderbook_depth,
+            get_token_ids,
+        )
+
+        async with async_session() as session:
+            cb = await check_circuit_breakers(session)
+            if not cb.can_trade:
+                return
+
+            markets = await get_active_weather_markets(session)
+            if not markets:
+                return
+
+            # Group active binary markets by ICAO. Skip markets the fast loop
+            # already fired on and non-binary brackets (lock rule scope).
+            by_icao: dict[str, list] = {}
+            for m in markets:
+                if m.id in _locked_markets_fired_today:
+                    continue
+                if not _is_binary_market(m):
+                    continue
+                if not m.parsed_location:
+                    continue
+                icao = icao_for_location(m.parsed_location)
+                if not icao:
+                    continue
+                by_icao.setdefault(icao, []).append(m)
+
+            if not by_icao:
+                return
+
+            try:
+                latest = await fetch_latest_metars(list(by_icao.keys()), session)
+            except Exception:
+                logger.warning("fast-poll: fetch_latest_metars failed", exc_info=True)
+                return
+
+            metars_by_icao: dict[str, list] = {}
+            for row in latest:
+                icao = row.get("station_icao")
+                if icao:
+                    metars_by_icao.setdefault(icao, []).append(row)
+
+            monitor = await _get_drawdown_monitor()
+            bankroll = await get_current_bankroll(session)
+            exposure = await get_current_exposure(session)
+            now_utc = datetime.now(timezone.utc)
+            epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+            for icao, city_markets in by_icao.items():
+                station_metars = metars_by_icao.get(icao, [])
+                if not station_metars:
+                    continue
+
+                last_seen = _last_routine_seen.get(icao, epoch)
+                new_routine = [
+                    m for m in station_metars
+                    if not m.get("is_speci")
+                    and isinstance(m.get("observed_at"), datetime)
+                    and m["observed_at"] > last_seen
+                    and m.get("temp_f") is not None
+                ]
+                if not new_routine:
+                    continue
+
+                _last_routine_seen[icao] = max(m["observed_at"] for m in new_routine)
+
+                routine_points = [
+                    (m["observed_at"], float(m["temp_f"]))
+                    for m in station_metars
+                    if not m.get("is_speci")
+                    and isinstance(m.get("observed_at"), datetime)
+                    and m.get("temp_f") is not None
+                ]
+                if not routine_points:
+                    continue
+
+                state = _minimal_state_for_easy_lock(icao, routine_points)
+                latest_obs = max(new_routine, key=lambda m: m["observed_at"])
+                logger.info(
+                    "[fast-poll %s] new routine METAR obs=%s temp=%.1f°F max=%.1f°F | %d market(s)",
+                    icao, latest_obs["observed_at"].isoformat(),
+                    latest_obs["temp_f"], state.current_max_f, len(city_markets),
+                )
+
+                for market in city_markets:
+                    if market.id in _locked_markets_fired_today:
+                        continue
+
+                    decision = evaluate_lock(state, market)
+                    if decision.side is None or decision.direction is None:
+                        continue
+
+                    token_ids = await get_token_ids(market.id)
+                    if not token_ids:
+                        logger.info(
+                            "[fast-poll %s] lock %s on %s but no token IDs",
+                            icao, decision.side, market.id[:12],
+                        )
+                        continue
+
+                    quote = get_best_bid_ask(token_ids[0])
+                    if quote is None:
+                        logger.info(
+                            "[fast-poll %s] lock %s on %s but no price",
+                            icao, decision.side, market.id[:12],
+                        )
+                        continue
+                    best_bid, best_ask = quote
+                    yes_price = (best_bid + best_ask) / 2
+                    market.current_yes_price = yes_price
+
+                    yes_depth = get_orderbook_depth(token_ids[0], yes_price) if yes_price > 0 else 0.0
+                    end_time = market.end_date or now_utc + timedelta(hours=24)
+
+                    stake = await _try_lock_rule_trade(
+                        session=session, market=market, state=state,
+                        yes_price=yes_price, token_ids=token_ids,
+                        yes_depth=yes_depth, end_time=end_time,
+                        bankroll=bankroll, exposure=exposure,
+                        monitor=monitor, alerter=alerter, icao=icao,
+                    )
+                    if stake is None:
+                        # Shouldn't happen — we already confirmed lock — but
+                        # don't dedup on unexpected None so the next tick can retry.
+                        continue
+                    # Dedup regardless of whether the order actually executed:
+                    # if the filter rejected (depth, close buffer), re-trying
+                    # every 30s won't help until the market state changes.
+                    _locked_markets_fired_today.add(market.id)
+                    if stake > 0:
+                        exposure += stake
+
+            await session.commit()
+
+    except Exception as exc:
+        logger.exception("Fast lock poll failed")
+        try:
+            await alerter.send_system_error(exc, "fast lock poll")
+        except Exception:
+            logger.warning("Alerter failed to send fast-poll error")
+
+
+# ---------------------------------------------------------------------------
 # Main entry
 # ---------------------------------------------------------------------------
 
@@ -926,6 +1137,19 @@ def setup_scheduler() -> AsyncIOScheduler:
         "Unified pipeline enabled (every %dm)",
         settings.UNIFIED_PIPELINE_INTERVAL_MINUTES,
     )
+
+    if settings.LOCK_RULE_ENABLED and settings.FAST_LOCK_POLL_ENABLED:
+        scheduler.add_job(
+            job_fast_lock_poll,
+            IntervalTrigger(seconds=settings.FAST_LOCK_POLL_INTERVAL_SECONDS),
+            id="fast_lock_poll",
+            max_instances=1,
+            coalesce=True,
+        )
+        logger.info(
+            "Fast lock poll enabled (every %ds)",
+            settings.FAST_LOCK_POLL_INTERVAL_SECONDS,
+        )
 
     return scheduler
 

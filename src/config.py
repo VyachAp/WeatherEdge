@@ -73,6 +73,13 @@ class Settings(BaseSettings):
     CONSECUTIVE_LOSS_PAUSE_COUNT: int = 3
     CONSECUTIVE_LOSS_PAUSE_HOURS: int = 2
 
+    # Fast-poll lock loop. Runs between unified-pipeline ticks, re-checking
+    # only the EASY lock direction (observed max already clears threshold by
+    # margin) so latency from METAR publication to order placement is seconds
+    # rather than up to 5 minutes.
+    FAST_LOCK_POLL_ENABLED: bool = True
+    FAST_LOCK_POLL_INTERVAL_SECONDS: int = 30
+
     # Lock-rule trader (deterministic physical-condition path)
     LOCK_RULE_ENABLED: bool = True
     LOCK_RULE_MAX_PRICE: float = 0.95
