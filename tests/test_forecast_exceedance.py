@@ -11,6 +11,8 @@ import pytest
 from src.ingestion.openmeteo import OpenMeteoForecast
 from src.signals.forecast_exceedance import (
     MAX_OVERSHOOT_F,
+    POST_PEAK_HOURS_CAP,
+    POST_PEAK_TREND_CARRY_K,
     _closest_hour_index,
     _peak_passed,
     _pick_latest_routine,
@@ -211,7 +213,9 @@ class TestProjectDailyMax:
         assert _project_daily_max(s) == pytest.approx(78.76, abs=0.05)
 
     def test_past_peak_no_extrapolation(self):
-        s = _state(current_max_f=78.0, metar_trend_rate=1.0, hours_until_peak=0.0)
+        # Flat trend past peak → projection floors at observed max. (Rising
+        # trend past peak gets its own branch; see TestProjectDailyMaxPostPeak.)
+        s = _state(current_max_f=78.0, metar_trend_rate=0.0, hours_until_peak=0.0)
         assert _project_daily_max(s) == 78.0
 
     def test_short_trend_preferred_when_nonzero(self):
@@ -350,6 +354,88 @@ class TestProjectDailyMaxResidual:
         )
         # overshoot-cap = 89.6 + 5.0 = 94.6 → floored at current_max 96.8.
         assert _project_daily_max(s) == pytest.approx(96.8)
+
+
+class TestProjectDailyMaxPostPeak:
+    """Post-peak trend carry: forecast's nominal peak may have been too early.
+
+    When hours_until_peak <= 0 but observations are still rising, the projection
+    extrapolates forward from max(current_max, forecast_peak) by a bounded,
+    solar/cloud-damped amount. This is the OPKC-style case: Open-Meteo's peak
+    passed 0.1h ago but the METARs are still climbing at +1°C/hr.
+    """
+
+    def test_rising_trend_extrapolates_residual_path(self):
+        # OPKC-like inputs: residual fields present, trend +1.8°F/hr (~+1°C/hr),
+        # solar still strong. Expect projection well above observed max.
+        s = _state(
+            current_max_f=91.4, metar_trend_rate=1.8, metar_trend_rate_short=1.8,
+            forecast_peak_f=88.3, hours_until_peak=-0.1,
+            latest_obs_temp_f=91.4, forecast_temp_now_f=88.3,
+            forecast_slope_to_peak_f_per_hr=0.0, forecast_residual_f=3.1,
+        )
+        # anchor = 91.4; shift = 1.8 * 1.5 * 0.75 = 2.025 → 93.425, clipped at
+        # forecast_peak + MAX_OVERSHOOT_F = 88.3 + 5.0 = 93.3°F (≈34.05°C).
+        assert _project_daily_max(s) == pytest.approx(93.3, abs=0.05)
+
+    def test_rising_trend_extrapolates_legacy_path(self):
+        # Same inputs but residual fields missing → legacy projector runs the
+        # same post-peak branch and produces the same clip.
+        s = _state(
+            current_max_f=91.4, metar_trend_rate=1.8, metar_trend_rate_short=1.8,
+            forecast_peak_f=88.3, hours_until_peak=-0.1,
+        )
+        assert _project_daily_max(s) == pytest.approx(93.3, abs=0.05)
+
+    def test_solar_decline_fully_damps_extrapolation(self):
+        # Solar fully declined (magnitude=1.0) → hours → 0 → no trend carry.
+        # Projection falls back to max(forecast_peak, current_max).
+        s = _state(
+            current_max_f=91.4, metar_trend_rate=1.8, metar_trend_rate_short=1.8,
+            forecast_peak_f=88.3, hours_until_peak=-0.1,
+            solar_declining=True, solar_decline_magnitude=1.0,
+            latest_obs_temp_f=91.4, forecast_temp_now_f=88.3,
+            forecast_slope_to_peak_f_per_hr=0.0, forecast_residual_f=3.1,
+        )
+        assert _project_daily_max(s) == pytest.approx(91.4)
+
+    def test_flat_trend_no_extrapolation(self):
+        # Trend just below POST_PEAK_MIN_TREND_F_PER_HR → no carry.
+        s = _state(
+            current_max_f=91.4, metar_trend_rate=0.4, metar_trend_rate_short=0.4,
+            forecast_peak_f=88.3, hours_until_peak=-0.1,
+        )
+        # projected starts at forecast_peak_f, no trend shift applied, then
+        # floored at current_max_f.
+        assert _project_daily_max(s) == pytest.approx(91.4)
+
+    def test_extrapolation_respects_overshoot_cap(self):
+        # Extreme trend → carry term huge → clipped at forecast_peak + 5°F.
+        s = _state(
+            current_max_f=88.0, metar_trend_rate=10.0, metar_trend_rate_short=10.0,
+            forecast_peak_f=85.0, hours_until_peak=-0.5,
+        )
+        assert _project_daily_max(s) == pytest.approx(85.0 + MAX_OVERSHOOT_F)
+
+    def test_short_trend_preferred_over_6h_post_peak(self):
+        # 6h trend strongly rising but short-window already flat (peak really has
+        # passed). Post-peak branch uses short trend → below min → no carry.
+        s = _state(
+            current_max_f=91.4, metar_trend_rate=2.0, metar_trend_rate_short=0.2,
+            forecast_peak_f=88.3, hours_until_peak=-0.1,
+        )
+        assert _project_daily_max(s) == pytest.approx(91.4)
+
+    def test_cloud_rise_damps_extrapolation(self):
+        # 50% cloud rise → hours halved → shift = 1.8 * 0.75 * 0.75 = 1.0125.
+        # projected = 91.4 + 1.0125 = 92.41°F.
+        s = _state(
+            current_max_f=91.4, metar_trend_rate=1.8, metar_trend_rate_short=1.8,
+            forecast_peak_f=88.3, hours_until_peak=-0.1,
+            cloud_rising=True, cloud_rise_magnitude=0.5,
+        )
+        expected = 91.4 + 1.8 * (POST_PEAK_HOURS_CAP * 0.5) * POST_PEAK_TREND_CARRY_K
+        assert _project_daily_max(s) == pytest.approx(expected, abs=0.05)
 
 
 class TestBuildStateResidualFields:

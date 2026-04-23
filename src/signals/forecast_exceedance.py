@@ -61,6 +61,18 @@ ALERT_COOLDOWN = timedelta(minutes=60)  # one Telegram push per station per hour
 # positive trend residual carried linearly up to EXTRAPOLATION_HOURS_CAP.
 RESIDUAL_DECAY_HALFLIFE_H = 2.0
 RESIDUAL_TREND_CARRY_K = 0.5
+# Post-peak trend carry — when `hours_until_peak <= 0` but obs is still rising,
+# Open-Meteo's nominal peak was simply too early (common in hot arid cities like
+# OPKC/Phoenix/Delhi). Extrapolate a bounded, solar/cloud-damped amount beyond
+# the observed max. Hours cap is shorter than pre-peak because diurnal concavity
+# is sharper after nominal peak.
+POST_PEAK_HOURS_CAP = 1.5
+# K=0.75 post-peak is more aggressive than the pre-peak residual carry (K=0.5)
+# because post-peak the raw trend is used directly instead of the observed-minus-
+# forecast residual — and a positive post-peak trend is itself evidence that
+# Open-Meteo's nominal peak hour was wrong, so the signal deserves higher weight.
+POST_PEAK_TREND_CARRY_K = 0.75
+POST_PEAK_MIN_TREND_F_PER_HR = 0.5
 
 
 def _c_to_f(c: float) -> float:
@@ -143,6 +155,16 @@ def _project_daily_max(state: WeatherState) -> float:
             if state.cloud_rising:
                 hours *= max(0.0, 1.0 - state.cloud_rise_magnitude)
             projected += RESIDUAL_TREND_CARRY_K * residual_trend * hours
+    else:
+        observed_slope = _effective_trend(state)
+        if observed_slope > POST_PEAK_MIN_TREND_F_PER_HR:
+            hours = POST_PEAK_HOURS_CAP
+            if state.solar_declining:
+                hours *= max(0.0, 1.0 - state.solar_decline_magnitude)
+            if state.cloud_rising:
+                hours *= max(0.0, 1.0 - state.cloud_rise_magnitude)
+            anchor = max(state.current_max_f, state.forecast_peak_f)
+            projected = anchor + POST_PEAK_TREND_CARRY_K * observed_slope * hours
 
     if state.dewpoint_trend_rate > 1.0:
         projected -= DEWPOINT_NUDGE_F
@@ -163,6 +185,14 @@ def _legacy_project_daily_max(state: WeatherState) -> float:
         extrapolated = state.current_max_f + trend * hours
         alpha = math.exp(-state.hours_until_peak / EXTRAPOLATION_HALFLIFE_H)
         projected = alpha * extrapolated + (1.0 - alpha) * state.forecast_peak_f
+    elif state.hours_until_peak <= 0 and trend > POST_PEAK_MIN_TREND_F_PER_HR:
+        hours = POST_PEAK_HOURS_CAP
+        if state.solar_declining:
+            hours *= max(0.0, 1.0 - state.solar_decline_magnitude)
+        if state.cloud_rising:
+            hours *= max(0.0, 1.0 - state.cloud_rise_magnitude)
+        anchor = max(state.current_max_f, state.forecast_peak_f)
+        projected = anchor + POST_PEAK_TREND_CARRY_K * trend * hours
     if state.dewpoint_trend_rate > 1.0:
         projected -= DEWPOINT_NUDGE_F
     projected = min(projected, state.forecast_peak_f + MAX_OVERSHOOT_F)

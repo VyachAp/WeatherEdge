@@ -203,6 +203,88 @@ class TestMETARTrend:
         assert any("rising" in r and "before peak" in r for r in dist.reasoning)
 
 
+class TestPostPeakRisingTrend:
+    """Post-peak but still rising: Open-Meteo's nominal peak was too early.
+
+    The Gaussian center should shift above the observed max so the distribution
+    has mass on higher buckets. Monotonicity and solar/cloud caps still apply.
+    """
+
+    def test_rising_trend_shifts_center_above_observed_max(self):
+        # OPKC-like: current_max=91, forecast_peak=88, trend=+1.8°F/hr post-peak.
+        # Solar still strong. Expect mass on buckets above current_max.
+        state = _make_state(
+            current_max_f=91.0,
+            forecast_peak_f=88.0,
+            metar_trend_rate=1.8,
+            hours_until_peak=-0.1,
+            solar_declining=False,
+        )
+        buckets = list(range(85, 98))
+        dist = compute_distribution(state, buckets)
+        # Some mass above observed max (the point of the fix).
+        mass_above = sum(p for b, p in dist.probabilities.items() if b > 91)
+        assert mass_above > 0.1
+        # Distribution must not collapse entirely onto current_max.
+        assert dist.probabilities.get(91, 0.0) < 0.95
+        assert any("past forecast peak" in r for r in dist.reasoning)
+
+    def test_solar_cloud_cap_overrides_rising_trend(self):
+        # Solar declining AND clouds rising → hard cap at int(current_max_f).
+        # Even with a rising trend, no mass should sit above current_max.
+        state = _make_state(
+            current_max_f=91.0,
+            forecast_peak_f=88.0,
+            metar_trend_rate=1.8,
+            hours_until_peak=-0.1,
+            solar_declining=True,
+            solar_decline_magnitude=0.8,
+            cloud_rising=True,
+            cloud_rise_magnitude=0.8,
+        )
+        buckets = list(range(85, 98))
+        dist = compute_distribution(state, buckets)
+        mass_above = sum(p for b, p in dist.probabilities.items() if b > 91)
+        assert mass_above == 0.0
+
+    def test_monotonicity_still_applied(self):
+        # Rising trend past peak must still zero all buckets below current_max.
+        state = _make_state(
+            current_max_f=91.0,
+            forecast_peak_f=88.0,
+            metar_trend_rate=2.0,
+            hours_until_peak=-0.5,
+        )
+        buckets = list(range(85, 98))
+        dist = compute_distribution(state, buckets)
+        for b, p in dist.probabilities.items():
+            if b < 91:
+                assert p == 0.0, f"bucket {b} has mass {p} below observed max"
+
+    def test_flat_trend_past_peak_no_shift(self):
+        # Trend below POST_PEAK_MIN_TREND_F_PER_HR → no new shift; existing
+        # behaviour (lock/floor to observed max) applies.
+        state_flat = _make_state(
+            current_max_f=91.0,
+            forecast_peak_f=88.0,
+            metar_trend_rate=0.3,
+            hours_until_peak=-0.1,
+        )
+        dist = compute_distribution(state_flat, list(range(85, 98)))
+        assert not any("past forecast peak" in r for r in dist.reasoning)
+
+    def test_declining_past_peak_still_locks(self):
+        # Cooling past peak: existing "locked to observed max" branch fires.
+        state = _make_state(
+            current_max_f=91.0,
+            forecast_peak_f=88.0,
+            metar_trend_rate=-1.0,
+            hours_until_peak=-1.0,
+        )
+        dist = compute_distribution(state, list(range(85, 98)))
+        assert any("locked to observed max" in r for r in dist.reasoning)
+
+
 class TestDewpointEffect:
     """Rising dewpoint should reduce upside."""
 

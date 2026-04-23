@@ -12,6 +12,19 @@ from dataclasses import dataclass, field
 from src.signals.state_aggregator import WeatherState
 
 
+# Post-peak trend shift — when `hours_until_peak <= 0` but the METAR trend is
+# still rising, Open-Meteo's nominal peak was too early (systematic in hot arid
+# cities). Shift the Gaussian center upward by a bounded, solar/cloud-damped
+# amount so the distribution has mass above the current observed max.
+POST_PEAK_EXTRAPOLATION_HOURS_CAP = 1.5
+POST_PEAK_MAX_SHIFT_F = 3.0
+POST_PEAK_MIN_TREND_F_PER_HR = 0.5
+# Fraction of (rate * hours) carried into the center shift. Matches the
+# forecast_exceedance post-peak carry so the alert and the trading Gaussian move
+# in lockstep when Open-Meteo's nominal peak was too early.
+POST_PEAK_TREND_CARRY_K = 0.75
+
+
 @dataclass
 class BucketDistribution:
     """Full probability distribution over temperature buckets."""
@@ -163,6 +176,20 @@ def _apply_metar_trend(
             center = state.current_max_f
             reasoning.append(
                 f"METAR trend: declining past peak, locked to observed max {state.current_max_f:.0f}°F"
+            )
+    elif state.hours_until_peak <= 0 and rate > POST_PEAK_MIN_TREND_F_PER_HR:
+        hours = POST_PEAK_EXTRAPOLATION_HOURS_CAP
+        if state.solar_declining:
+            hours *= max(0.0, 1.0 - state.solar_decline_magnitude)
+        if state.cloud_rising:
+            hours *= max(0.0, 1.0 - state.cloud_rise_magnitude)
+        shift = min(rate * hours * POST_PEAK_TREND_CARRY_K, POST_PEAK_MAX_SHIFT_F)
+        if shift > 0:
+            anchor = max(center, state.current_max_f)
+            center = anchor + shift
+            reasoning.append(
+                f"METAR trend: rising {rate:+.1f}°F/hr past forecast peak, "
+                f"shift center to {center:.1f}°F (hours={hours:.2f})"
             )
 
     if state.current_max_f > center:
