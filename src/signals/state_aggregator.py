@@ -53,6 +53,11 @@ class WeatherState:
     forecast_temp_now_f: float | None = None
     forecast_slope_to_peak_f_per_hr: float | None = None
     forecast_residual_f: float | None = None
+    # Ensemble-derived σ in °F (std at peak hour across NWP models, already
+    # converted from °C via ×1.8). None when fewer than ENSEMBLE_MIN_MODELS
+    # returned data → probability engine falls back to hours-based σ.
+    forecast_sigma_f: float | None = None
+    ensemble_model_count: int = 1
 
 
 # ---------------------------------------------------------------------------
@@ -224,6 +229,8 @@ def build_state_from_metars(
     forecast_temp_now_f: float | None = None
     forecast_slope_to_peak_f_per_hr: float | None = None
     forecast_residual_f: float | None = None
+    forecast_sigma_f: float | None = None
+    ensemble_model_count: int = 1
     if has_forecast:
         adjusted_peak_c = forecast.peak_temp_c + bias_c
         forecast_peak_f = _c_to_f(adjusted_peak_c)
@@ -246,6 +253,13 @@ def build_state_from_metars(
             latest_obs_temp_f = _latest_routine_temp_f(recent_history)
             if latest_obs_temp_f is not None:
                 forecast_residual_f = latest_obs_temp_f - forecast_temp_now_f
+
+        # Ensemble spread → σ (°C × 1.8 = °F; peak_temp_std_c is 0 when the
+        # deterministic fallback ran).
+        peak_std_c = getattr(forecast, "peak_temp_std_c", 0.0) or 0.0
+        ensemble_model_count = getattr(forecast, "model_count", 1) or 1
+        if peak_std_c > 0:
+            forecast_sigma_f = peak_std_c * 9.0 / 5.0
     else:
         forecast_peak_f = current_max_f
         hours_until_peak = 0.0
@@ -292,6 +306,8 @@ def build_state_from_metars(
         forecast_temp_now_f=forecast_temp_now_f,
         forecast_slope_to_peak_f_per_hr=forecast_slope_to_peak_f_per_hr,
         forecast_residual_f=forecast_residual_f,
+        forecast_sigma_f=forecast_sigma_f,
+        ensemble_model_count=ensemble_model_count,
     )
 
 
@@ -334,11 +350,16 @@ async def aggregate_state(
         logger.debug("No routine METARs yet for %s, skipping", icao)
         return None
 
+    sigma_desc = (
+        f"σ={state.forecast_sigma_f:.2f}°F (n={state.ensemble_model_count})"
+        if state.forecast_sigma_f is not None
+        else "σ=hours-based"
+    )
     logger.info(
         "[%s] state: max=%.0f°F, trend=%+.1f°F/hr, forecast_peak=%.0f°F in %.1fh, "
-        "solar_declining=%s, cloud_rising=%s, routine_count=%d",
+        "%s, solar_declining=%s, cloud_rising=%s, routine_count=%d",
         icao, state.current_max_f, state.metar_trend_rate, state.forecast_peak_f,
-        state.hours_until_peak, state.solar_declining, state.cloud_rising,
+        state.hours_until_peak, sigma_desc, state.solar_declining, state.cloud_rising,
         state.routine_count_today,
     )
 

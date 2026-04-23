@@ -301,6 +301,77 @@ class TestDewpointEffect:
         assert peak_wet >= peak_dry
 
 
+class TestEnsembleSigma:
+    """σ driven by ensemble spread instead of the hardcoded hours-based schedule."""
+
+    def test_sigma_uses_ensemble_spread(self):
+        state = _make_state(
+            forecast_sigma_f=2.0,
+            ensemble_model_count=5,
+            hours_until_peak=3.0,  # would give hours-based σ=2.5
+        )
+        dist = compute_distribution(state, BUCKETS)
+        # Expected σ = 2.0 * 1.3 = 2.6 (above floor 2.5*0.5=1.25, below max 5.0).
+        assert any("ensemble spread 2.00°F" in r for r in dist.reasoning)
+        assert any("from 5 models" in r for r in dist.reasoning)
+
+    def test_fallback_to_hours_based_when_no_ensemble(self):
+        state = _make_state(
+            forecast_sigma_f=None,
+            hours_until_peak=1.0,
+        )
+        dist = compute_distribution(state, BUCKETS)
+        assert any(
+            "hours-based, no ensemble" in r and "1.50°F" in r
+            for r in dist.reasoning
+        )
+
+    def test_sigma_clipped_to_max(self):
+        """Extreme ensemble spread gets clipped at ENSEMBLE_MAX_SIGMA_F=5.0."""
+        state = _make_state(
+            forecast_sigma_f=10.0,      # × 1.3 = 13.0, should clip to 5.0
+            ensemble_model_count=5,
+            hours_until_peak=3.0,
+            current_max_f=60.0,         # low so gaussian has room
+        )
+        dist = compute_distribution(state, BUCKETS)
+        # σ=5.0 is wide → peak probability should be modest.
+        peak_prob = max(dist.probabilities.values())
+        assert peak_prob < 0.20, f"expected wide distribution, got peak {peak_prob}"
+
+    def test_sigma_clipped_to_min(self):
+        """Tight ensemble agreement gets floored at ENSEMBLE_MIN_SIGMA_F=1.0."""
+        state = _make_state(
+            forecast_sigma_f=0.1,       # × 1.3 = 0.13, should floor to 1.0
+            ensemble_model_count=5,
+            hours_until_peak=3.0,
+            current_max_f=60.0,
+        )
+        dist = compute_distribution(state, BUCKETS)
+        # σ floored at 1.0 → reasoning still mentions ensemble path.
+        assert any("ensemble spread" in r for r in dist.reasoning)
+
+    def test_tighter_ensemble_gives_narrower_distribution(self):
+        """Smaller σ from ensemble → higher peak probability."""
+        narrow = _make_state(
+            forecast_sigma_f=1.0,       # × 1.3 = 1.3
+            ensemble_model_count=5,
+            hours_until_peak=3.0,
+            current_max_f=60.0,
+        )
+        wide = _make_state(
+            forecast_sigma_f=3.5,       # × 1.3 = 4.55
+            ensemble_model_count=5,
+            hours_until_peak=3.0,
+            current_max_f=60.0,
+        )
+        dist_narrow = compute_distribution(narrow, BUCKETS)
+        dist_wide = compute_distribution(wide, BUCKETS)
+        peak_narrow = max(dist_narrow.probabilities.values())
+        peak_wide = max(dist_wide.probabilities.values())
+        assert peak_narrow > peak_wide
+
+
 class TestReasoning:
     """Every distribution should have reasoning entries."""
 

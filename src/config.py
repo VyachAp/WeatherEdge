@@ -85,5 +85,20 @@ class Settings(BaseSettings):
     # Open-Meteo forecast
     OPENMETEO_RATE_LIMIT_RPS: float = 2.0
 
+    # Multi-model ensemble (Open-Meteo models= param). Spread across these
+    # models drives the probability-engine sigma instead of the hardcoded
+    # hours-based schedule.
+    ENSEMBLE_MODELS: str = (
+        "ecmwf_ifs04,gfs_seamless,icon_seamless,gem_seamless,meteofrance_seamless"
+    )
+    # Inflate raw inter-model spread — NWP ensembles are under-dispersive vs
+    # actual forecast error, ~20-30% for surface T.
+    ENSEMBLE_SPREAD_MULTIPLIER: float = 1.3
+    ENSEMBLE_MIN_SIGMA_F: float = 1.0
+    ENSEMBLE_MAX_SIGMA_F: float = 5.0
+    # If fewer than this many models returned usable peak-hour data, fall back
+    # to the deterministic single-source endpoint.
+    ENSEMBLE_MIN_MODELS: int = 3
+
 
 settings = Settings()

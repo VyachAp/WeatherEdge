@@ -9,6 +9,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 
+from src.config import settings
 from src.signals.state_aggregator import WeatherState
 
 
@@ -59,8 +60,8 @@ def compute_distribution(
     center = state.forecast_peak_f
     reasoning.append(f"baseline: forecast peak {center:.1f}°F")
 
-    # Base sigma depends on time until peak
-    base_sigma = _compute_sigma(state.hours_until_peak, reasoning)
+    # Base sigma: ensemble spread when available, else hours-based schedule.
+    base_sigma = _compute_sigma(state, reasoning)
 
     # --- Signal 2: METAR trend shift ---
     center = _apply_metar_trend(center, state, reasoning)
@@ -115,23 +116,51 @@ def compute_distribution(
 # ---------------------------------------------------------------------------
 
 
-def _compute_sigma(hours_until_peak: float, reasoning: list[str]) -> float:
-    """Compute Gaussian sigma based on time until forecast peak.
+def _hours_based_sigma(hours_until_peak: float) -> float:
+    """Legacy sigma schedule based on time until forecast peak.
 
-    Wider when peak is hours away; tightens as peak passes.
+    Used as the fallback when no ensemble spread is available, and as a soft
+    floor so σ can't collapse below a sensible minimum when models agree too
+    tightly on a trivial central-day forecast.
     """
     if hours_until_peak <= 0:
-        sigma = 1.0
-        reasoning.append("time: past peak hour, tight distribution (sigma=1.0)")
-    elif hours_until_peak <= 2:
-        sigma = 1.5
-        reasoning.append(f"time: {hours_until_peak:.1f}h to peak, moderate width (sigma=1.5)")
-    elif hours_until_peak <= 4:
-        sigma = 2.5
-        reasoning.append(f"time: {hours_until_peak:.1f}h to peak, wider (sigma=2.5)")
-    else:
-        sigma = 3.5
-        reasoning.append(f"time: {hours_until_peak:.1f}h to peak, wide distribution (sigma=3.5)")
+        return 1.0
+    if hours_until_peak <= 2:
+        return 1.5
+    if hours_until_peak <= 4:
+        return 2.5
+    return 3.5
+
+
+def _compute_sigma(state: WeatherState, reasoning: list[str]) -> float:
+    """Base σ for the Gaussian: ensemble spread with floors, else hours-based.
+
+    When `state.forecast_sigma_f` is populated (multi-model fetch succeeded),
+    it is inflated by `ENSEMBLE_SPREAD_MULTIPLIER` to correct for documented
+    NWP under-dispersion, then clipped to [ENSEMBLE_MIN_SIGMA_F,
+    ENSEMBLE_MAX_SIGMA_F]. A soft floor at half the hours-based σ prevents
+    runaway overconfidence on stable days.
+    """
+    hours_floor = _hours_based_sigma(state.hours_until_peak)
+
+    if state.forecast_sigma_f is None:
+        reasoning.append(
+            f"sigma={hours_floor:.2f}°F (hours-based, no ensemble; "
+            f"hours_until_peak={state.hours_until_peak:.1f})"
+        )
+        return hours_floor
+
+    raw = state.forecast_sigma_f * settings.ENSEMBLE_SPREAD_MULTIPLIER
+    clipped = max(
+        settings.ENSEMBLE_MIN_SIGMA_F,
+        min(settings.ENSEMBLE_MAX_SIGMA_F, raw),
+    )
+    sigma = max(clipped, hours_floor * 0.5)
+    reasoning.append(
+        f"sigma={sigma:.2f}°F (ensemble spread {state.forecast_sigma_f:.2f}°F "
+        f"× {settings.ENSEMBLE_SPREAD_MULTIPLIER} from {state.ensemble_model_count} models, "
+        f"hours_floor={hours_floor:.2f}°F)"
+    )
     return sigma
 
 
