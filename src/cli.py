@@ -1034,8 +1034,9 @@ def bet_orders(max_orders: int) -> None:
 
 
 @bet.command("portfolio")
+@click.option("--all", "show_all", is_flag=True, help="Show all positions ever held (including redeemed).")
 @click.option("--history", is_flag=True, help="Show full trade history instead of positions.")
-def bet_portfolio(history: bool) -> None:
+def bet_portfolio(show_all: bool, history: bool) -> None:
     """Show open positions and P&L from your Polymarket trades."""
 
     async def _portfolio() -> None:
@@ -1043,6 +1044,7 @@ def bet_portfolio(history: bool) -> None:
         from src.bet_helpers import (
             compute_positions,
             get_clob_client,
+            get_ctf_readonly,
             get_open_orders,
             get_trades_history,
             get_usdc_balance,
@@ -1125,9 +1127,9 @@ def bet_portfolio(history: bool) -> None:
 
         # --- Positions ---
         positions = compute_positions(trades)
-        click.echo(f"\n=== Positions ({len(positions)}) ===")
 
         if not positions:
+            click.echo("\n=== Positions (0) ===")
             click.echo("  No open positions (all trades fully closed).")
             return
 
@@ -1152,6 +1154,41 @@ def bet_portfolio(history: bool) -> None:
                         seen_conds[cond] = None
                 if seen_conds[cond]:
                     token_to_market[asset_id] = seen_conds[cond]
+
+        # Default: hide positions in resolved markets whose on-chain balance
+        # is zero (already redeemed). `--all` keeps the raw CLOB-history view.
+        if not show_all:
+            resolved_assets = [
+                asset_id for asset_id, mkt in token_to_market.items()
+                if mkt.get("closed") is True
+                or str(mkt.get("closed", "")).lower() == "true"
+            ]
+            if resolved_assets:
+                try:
+                    _w3, ctf, wallet_addr, _rpc = get_ctf_readonly()
+                except Exception as e:
+                    click.echo(f"  Warning: could not reach Polygon RPC ({e}); showing unfiltered.")
+                else:
+                    for asset_id in resolved_assets:
+                        try:
+                            bal = ctf.functions.balanceOf(
+                                wallet_addr, int(asset_id)
+                            ).call()
+                        except Exception:
+                            continue
+                        if bal == 0:
+                            positions.pop(asset_id, None)
+                            token_to_market.pop(asset_id, None)
+
+        mode_label = "all-time" if show_all else "active+unredeemed"
+        click.echo(f"\n=== Positions ({len(positions)}) [{mode_label}] ===")
+
+        if not positions:
+            click.echo(
+                "  No active or unredeemed positions. "
+                "Use --all to show redeemed positions as well."
+            )
+            return
 
         total_cost = 0.0
         total_value = 0.0
@@ -1235,6 +1272,7 @@ def bet_redeem(redeem_all: bool, skip_confirm: bool) -> None:
         from src.bet_helpers import (
             compute_positions,
             get_clob_client,
+            get_ctf_readonly,
             get_trades_history,
             get_usdc_balance,
         )
@@ -1336,44 +1374,10 @@ def bet_redeem(redeem_all: bool, skip_confirm: bool) -> None:
             return
 
         # --- Web3 setup with RPC failover ---
-        from eth_account import Account
         from web3 import Web3
 
-        RPC_URLS = [
-            "https://polygon-bor-rpc.publicnode.com",
-            "https://rpc.ankr.com/polygon",
-            "https://polygon.drpc.org",
-            "https://polygon-rpc.com",
-        ]
-
-        CTF_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
         NEG_RISK_ADAPTER_ADDRESS = "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296"
         PUSD_ADDRESS = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
-
-        CTF_REDEEM_ABI = [
-            {
-                "inputs": [
-                    {"name": "account", "type": "address"},
-                    {"name": "id", "type": "uint256"},
-                ],
-                "name": "balanceOf",
-                "outputs": [{"name": "", "type": "uint256"}],
-                "stateMutability": "view",
-                "type": "function",
-            },
-            {
-                "inputs": [
-                    {"name": "collateralToken", "type": "address"},
-                    {"name": "parentCollectionId", "type": "bytes32"},
-                    {"name": "conditionId", "type": "bytes32"},
-                    {"name": "indexSets", "type": "uint256[]"},
-                ],
-                "name": "redeemPositions",
-                "outputs": [],
-                "stateMutability": "nonpayable",
-                "type": "function",
-            },
-        ]
 
         NEG_RISK_ADAPTER_ABI = [
             {
@@ -1388,23 +1392,12 @@ def bet_redeem(redeem_all: bool, skip_confirm: bool) -> None:
             },
         ]
 
-        account = Account.from_key(settings.POLYMARKET_PRIVATE_KEY)
-        address = account.address
-
-        w3 = None
-        for rpc_url in RPC_URLS:
-            try:
-                _w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": 10}))
-                _w3.eth.get_balance(address)
-                w3 = _w3
-                click.echo(f"Connected to {rpc_url}")
-                break
-            except Exception:
-                continue
-
-        if w3 is None:
-            click.echo("Error: all Polygon RPC endpoints failed")
+        try:
+            w3, ctf, address, rpc_url = get_ctf_readonly()
+        except Exception as e:
+            click.echo(f"Error: {e}")
             raise SystemExit(1)
+        click.echo(f"Connected to {rpc_url}")
 
         bal = w3.eth.get_balance(address)
         click.echo(f"POL balance: {w3.from_wei(bal, 'ether'):.4f} (for gas)")
@@ -1412,9 +1405,6 @@ def bet_redeem(redeem_all: bool, skip_confirm: bool) -> None:
             click.echo("Error: wallet has no POL for gas fees")
             raise SystemExit(1)
 
-        ctf = w3.eth.contract(
-            address=Web3.to_checksum_address(CTF_ADDRESS), abi=CTF_REDEEM_ABI
-        )
         neg_risk_adapter = w3.eth.contract(
             address=Web3.to_checksum_address(NEG_RISK_ADAPTER_ADDRESS),
             abi=NEG_RISK_ADAPTER_ABI,

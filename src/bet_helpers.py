@@ -228,6 +228,69 @@ async def get_usdc_balance(private_key: str) -> tuple[float, float, float]:
 # ---------------------------------------------------------------------------
 
 
+CTF_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
+
+_POLYGON_RPC_URLS = (
+    "https://polygon-bor-rpc.publicnode.com",
+    "https://rpc.ankr.com/polygon",
+    "https://polygon.drpc.org",
+    "https://polygon-rpc.com",
+)
+
+_CTF_BALANCE_ABI = [
+    {
+        "inputs": [
+            {"name": "account", "type": "address"},
+            {"name": "id", "type": "uint256"},
+        ],
+        "name": "balanceOf",
+        "outputs": [{"name": "", "type": "uint256"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
+    {
+        "inputs": [
+            {"name": "collateralToken", "type": "address"},
+            {"name": "parentCollectionId", "type": "bytes32"},
+            {"name": "conditionId", "type": "bytes32"},
+            {"name": "indexSets", "type": "uint256[]"},
+        ],
+        "name": "redeemPositions",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function",
+    },
+]
+
+
+def get_ctf_readonly():
+    """Connect to Polygon with RPC failover and return (w3, ctf, address).
+
+    Read-only bootstrap shared by portfolio and redeem flows — does not
+    check the POL gas balance; callers that submit transactions must do
+    that themselves.
+    """
+    from eth_account import Account
+    from web3 import Web3
+
+    account = Account.from_key(settings.POLYMARKET_PRIVATE_KEY)
+    address = account.address
+
+    for rpc_url in _POLYGON_RPC_URLS:
+        try:
+            w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": 10}))
+            w3.eth.get_balance(address)
+            ctf = w3.eth.contract(
+                address=Web3.to_checksum_address(CTF_ADDRESS),
+                abi=_CTF_BALANCE_ABI,
+            )
+            return w3, ctf, address, rpc_url
+        except Exception:
+            continue
+
+    raise RuntimeError("all Polygon RPC endpoints failed")
+
+
 def get_clob_client():
     """Initialise a ClobClient for manual bet placement.
 
