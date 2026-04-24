@@ -752,10 +752,25 @@ async def job_daily_settlement() -> None:
                 from src.ingestion.openmeteo import fetch_forecast
                 from src.signals.mapper import icao_for_location, geocode, CITY_ICAO
 
+                # Only markets that resolved in the last ~36h. Settlement runs
+                # at 22:00 UTC, markets close at 12:00 UTC the same day → 10h
+                # old; 36h covers yesterday's run being missed. Anchoring to a
+                # specific market (instead of "any market with this ICAO")
+                # lets us pass end_date into the observation window so eastern
+                # TZs stop recording the pre-dawn hours of the next local day.
+                now_utc = datetime.now(timezone.utc)
+                recent_cutoff = now_utc - timedelta(hours=36)
                 seen_icaos: set[str] = set()
-                stmt_markets = select(Market).where(
-                    Market.parsed_location.isnot(None),
-                    Market.parsed_variable == "temperature",
+                stmt_markets = (
+                    select(Market)
+                    .where(
+                        Market.parsed_location.isnot(None),
+                        Market.parsed_variable == "temperature",
+                        Market.end_date.isnot(None),
+                        Market.end_date <= now_utc,
+                        Market.end_date > recent_cutoff,
+                    )
+                    .order_by(Market.end_date.desc())
                 )
                 market_result = await session.execute(stmt_markets)
                 for mkt in market_result.scalars():
@@ -764,7 +779,9 @@ async def job_daily_settlement() -> None:
                         continue
                     seen_icaos.add(icao)
 
-                    max_f, count = await get_routine_daily_max(icao)
+                    max_f, count = await get_routine_daily_max(
+                        icao, reference_utc=mkt.end_date,
+                    )
                     if max_f is None or count < 3:
                         continue
 
@@ -779,7 +796,7 @@ async def job_daily_settlement() -> None:
                     max_c = (max_f - 32.0) * 5.0 / 9.0
                     await record_daily_outcome(
                         session, icao,
-                        datetime.now(timezone.utc),
+                        mkt.end_date,
                         max_c, forecast.peak_temp_c,
                     )
                 logger.info("Station bias recorded for %d stations", len(seen_icaos))

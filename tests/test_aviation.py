@@ -778,6 +778,109 @@ class TestSpeciDetection:
 
 
 # ---------------------------------------------------------------------------
+# Daily max (local-day window) tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestGetRoutineDailyMax:
+    @patch("src.ingestion.aviation.fetch_metar_history")
+    async def test_reference_utc_anchors_to_market_day_for_eastern_tz(
+        self, mock_history,
+    ):
+        """RKPK (KST = UTC+9): passing the market's end_date (12:00 UTC Apr 22)
+        as reference must pick the Apr 22 KST window (15:00 UTC Apr 21 - 15:00
+        UTC Apr 22) — not the Apr 23 KST window that a 'now-local-day' lookup
+        at 22:00 UTC picks up (which contains only pre-dawn hours of the day
+        AFTER the market, producing garbage maxes).
+        """
+        from src.ingestion.aviation import get_routine_daily_max
+
+        market_end = datetime(2026, 4, 22, 12, 0, tzinfo=timezone.utc)
+
+        # METARs spanning Apr 21 evening → Apr 22 evening UTC.
+        # Apr 22 KST peak (05:00 UTC Apr 22 = 14:00 KST) = 71.6°F.
+        # Apr 23 KST pre-dawn (21:00 UTC Apr 22 = 06:00 KST next) = 55.4°F.
+        mock_history.return_value = [
+            {"observed_at": datetime(2026, 4, 21, 20, 0, tzinfo=timezone.utc),
+             "temp_f": 62.6, "is_speci": False},  # Apr 22 KST 05:00 — in window
+            {"observed_at": datetime(2026, 4, 22, 5, 0, tzinfo=timezone.utc),
+             "temp_f": 71.6, "is_speci": False},  # Apr 22 KST 14:00 — peak
+            {"observed_at": datetime(2026, 4, 22, 10, 0, tzinfo=timezone.utc),
+             "temp_f": 68.0, "is_speci": False},  # Apr 22 KST 19:00 — in window
+            {"observed_at": datetime(2026, 4, 22, 21, 0, tzinfo=timezone.utc),
+             "temp_f": 55.4, "is_speci": False},  # Apr 23 KST 06:00 — outside
+        ]
+
+        max_f, count = await get_routine_daily_max(
+            "RKPK", reference_utc=market_end,
+        )
+
+        assert max_f == 71.6  # Apr 22 KST afternoon peak, not Apr 23 pre-dawn
+        assert count == 3     # three Apr 22 KST routines in window
+
+    @patch("src.ingestion.aviation.fetch_metar_history")
+    async def test_default_reference_uses_now(self, mock_history):
+        """Without reference_utc, the window is the local day containing 'now' —
+        preserving the pre-fix behavior for intra-day callers."""
+        from src.ingestion.aviation import get_routine_daily_max
+
+        now = datetime.now(timezone.utc)
+        mock_history.return_value = [
+            {"observed_at": now - timedelta(hours=1), "temp_f": 75.0, "is_speci": False},
+            {"observed_at": now - timedelta(hours=2), "temp_f": 78.0, "is_speci": False},
+            {"observed_at": now - timedelta(hours=3), "temp_f": 72.0, "is_speci": False},
+        ]
+        max_f, count = await get_routine_daily_max("KPHX")
+        assert max_f == 78.0
+        assert count == 3
+
+    @patch("src.ingestion.aviation.fetch_metar_history")
+    async def test_reference_at_midnight_boundary_utc_plus_12(
+        self, mock_history,
+    ):
+        """NZWN (UTC+12, Pacific/Auckland): a 12:00 UTC market close lands
+        exactly at 00:00 NZ next-day. Anchoring must still pick the local
+        day that ENDS at close, not the one starting at that instant.
+        """
+        from src.ingestion.aviation import get_routine_daily_max
+
+        market_end = datetime(2026, 4, 20, 12, 0, tzinfo=timezone.utc)
+
+        # Apr 20 NZ: 12:00 UTC Apr 19 → 12:00 UTC Apr 20.
+        # Apr 21 NZ: 12:00 UTC Apr 20 → 12:00 UTC Apr 21.
+        mock_history.return_value = [
+            {"observed_at": datetime(2026, 4, 19, 20, 0, tzinfo=timezone.utc),
+             "temp_f": 55.0, "is_speci": False},  # Apr 20 NZ 08:00 — in window
+            {"observed_at": datetime(2026, 4, 20, 1, 0, tzinfo=timezone.utc),
+             "temp_f": 68.0, "is_speci": False},  # Apr 20 NZ 13:00 — peak
+            {"observed_at": datetime(2026, 4, 20, 15, 0, tzinfo=timezone.utc),
+             "temp_f": 62.0, "is_speci": False},  # Apr 21 NZ 03:00 — outside
+        ]
+
+        max_f, count = await get_routine_daily_max(
+            "NZWN", reference_utc=market_end,
+        )
+
+        assert max_f == 68.0
+        assert count == 2
+
+    @patch("src.ingestion.aviation.fetch_metar_history")
+    async def test_speci_excluded(self, mock_history):
+        from src.ingestion.aviation import get_routine_daily_max
+
+        now = datetime.now(timezone.utc)
+        mock_history.return_value = [
+            {"observed_at": now - timedelta(hours=1), "temp_f": 75.0, "is_speci": False},
+            {"observed_at": now - timedelta(hours=2), "temp_f": 99.0, "is_speci": True},
+            {"observed_at": now - timedelta(hours=3), "temp_f": 72.0, "is_speci": False},
+        ]
+        max_f, count = await get_routine_daily_max("KPHX")
+        assert max_f == 75.0
+        assert count == 2  # SPECI skipped
+
+
+# ---------------------------------------------------------------------------
 # Composite probability tests
 # ---------------------------------------------------------------------------
 

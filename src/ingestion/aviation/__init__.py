@@ -355,6 +355,7 @@ async def get_current_temp(station: str) -> float | None:
 async def get_routine_daily_max(
     station: str,
     hours: int = 24,
+    reference_utc: datetime | None = None,
 ) -> tuple[float | None, int]:
     """Return (max_temp_f, routine_count) for the station's LOCAL-city day.
 
@@ -363,18 +364,36 @@ async def get_routine_daily_max(
 
     Uses local-city timezone so the daily max aligns with Wunderground's
     resolution-day convention — see `icao_timezone` in `signals.mapper`.
+
+    ``reference_utc`` anchors the local day. Default is "now", which is
+    correct for intra-day callers reading the current day's state. At
+    settlement time, pass the market's resolution timestamp (e.g.
+    ``market.end_date``) — otherwise stations far east of UTC (KST, JST,
+    UTC+8) pick the *next* local day and record the pre-dawn window
+    instead of the market's target day.
+
+    The reference is nudged back 1µs before truncating to local midnight
+    so that UTC+12 stations (NZ), whose 12:00 UTC market close lands
+    exactly on their 00:00 local-next-day boundary, anchor to the day
+    that ENDS at close rather than the next one.
     """
     from src.signals.mapper import icao_timezone
 
-    history = await fetch_metar_history(station, hours=hours)
-
-    now_utc = datetime.now(timezone.utc)
     tz = icao_timezone(station)
-    now_local = now_utc.astimezone(tz)
-    local_day_start = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+    ref_utc = reference_utc or datetime.now(timezone.utc)
+    ref_local = (ref_utc - timedelta(microseconds=1)).astimezone(tz)
+    local_day_start = ref_local.replace(hour=0, minute=0, second=0, microsecond=0)
     local_day_end = local_day_start + timedelta(days=1)
     utc_start = local_day_start.astimezone(timezone.utc)
     utc_end = local_day_end.astimezone(timezone.utc)
+
+    # Fetch enough history to reach the start of the target local day from
+    # now. For UTC+9 at settlement (22:00 UTC), the local-day start is 31h
+    # ago; the default 24h window misses the first third of the day.
+    now_utc = datetime.now(timezone.utc)
+    needed_hours = int((now_utc - utc_start).total_seconds() // 3600) + 2
+    fetch_hours = max(hours, needed_hours)
+    history = await fetch_metar_history(station, hours=fetch_hours)
 
     routine_temps: list[float] = []
     for m in history:
