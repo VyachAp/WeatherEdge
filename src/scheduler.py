@@ -149,6 +149,11 @@ async def job_scan_markets() -> None:
 
 _UNIFIED_CONCURRENCY = 8  # Max concurrent city aggregations
 
+# Stations whose Polymarket resolution source diverges from the routine-METAR
+# stream we consume (e.g. uses a different airport, an HKO-style city station,
+# or a different rounding convention) — skip them entirely in the pipeline.
+_EXCLUDED_ICAOS: set[str] = {"VHHH", "LLBG"}  # Hong Kong, Tel Aviv
+
 
 async def job_unified_pipeline() -> None:
     """Every 5 min — unified METAR + Open-Meteo + market pipeline.
@@ -191,9 +196,16 @@ async def job_unified_pipeline() -> None:
             for m in markets:
                 loc = m.parsed_location
                 if not loc:
+                    logger.debug("skip %s: parsed_location is None", m.id[:12])
                     continue
                 icao = icao_for_location(loc)
                 if not icao:
+                    continue
+                if icao in _EXCLUDED_ICAOS:
+                    logger.debug(
+                        "skip %s: ICAO %s excluded from pipeline (resolution source divergence)",
+                        m.id[:12], icao,
+                    )
                     continue
                 city_markets.setdefault(icao, []).append(m)
                 if icao not in city_coords:
@@ -321,6 +333,10 @@ async def job_unified_pipeline() -> None:
                             state.routine_count_today, mkt_depth,
                         )
                         if edge_result is None:
+                            logger.info(
+                                "[%s] skip %s: binary edge None (operator=%r)",
+                                icao, market.id[:12], market.parsed_operator,
+                            )
                             continue
 
                         op_symbol = {"above": "≥", "at_least": "≥", "below": "<", "at_most": "≤", "exactly": "="}.get(market.parsed_operator, "?")
@@ -341,6 +357,10 @@ async def job_unified_pipeline() -> None:
                         # --- Bracket market ---
                         buckets = _extract_bracket_buckets(market)
                         if not buckets:
+                            logger.info(
+                                "[%s] skip %s: bracket has no parseable buckets (outcomes=%d)",
+                                icao, market.id[:12], len(market.outcomes or []),
+                            )
                             continue
 
                         dist = compute_distribution(state, buckets)
