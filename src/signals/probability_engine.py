@@ -63,7 +63,12 @@ def compute_distribution(
     # Base sigma: ensemble spread when available, else hours-based schedule.
     base_sigma = _compute_sigma(state, reasoning)
 
-    # --- Signal 2: METAR trend shift ---
+    # --- Signal 2 (prior): Bayesian blend of forecast (likelihood) with the
+    # climate normal (prior). Blends BOTH center and σ; falls through
+    # unchanged when no climate normal is available for this station.
+    center, base_sigma = _apply_climate_prior(center, base_sigma, state, reasoning)
+
+    # --- Signal 3: METAR trend shift ---
     center = _apply_metar_trend(center, state, reasoning)
 
     # --- Signal 3: Solar/cloud cap ---
@@ -162,6 +167,58 @@ def _compute_sigma(state: WeatherState, reasoning: list[str]) -> float:
         f"hours_floor={hours_floor:.2f}°F)"
     )
     return sigma
+
+
+def _apply_climate_prior(
+    center: float,
+    sigma: float,
+    state: WeatherState,
+    reasoning: list[str],
+) -> tuple[float, float]:
+    """Blend the forecast with a Gaussian climate prior.
+
+    When ``state.climate_prior_mean_f`` and ``climate_prior_std_f`` are
+    both populated, treats the forecast `(center, sigma)` as the
+    likelihood and the climatology `(prior_mean, prior_std)` as the
+    prior. Returns the precision-weighted Bayesian posterior:
+
+      posterior_var  = 1 / (1/prior_var + 1/likelihood_var)
+      posterior_mean = posterior_var * (prior_mean/prior_var
+                                        + likelihood_mean/likelihood_var)
+
+    Tightens σ (always — the posterior is at least as informative as
+    either input alone), and pulls the center toward whichever input
+    has lower variance. Floor on σ via ``CLIMATE_PRIOR_MIN_SIGMA_F``
+    prevents tropical/oceanic stations whose climatological σ is
+    ~1°F from collapsing posterior σ to a degenerately narrow band.
+
+    Returns the inputs unchanged when:
+      - ``CLIMATE_PRIOR_ENABLED`` is False (state fields will be None)
+      - the station has no climate normal row backfilled yet
+      - the prior σ is zero (degenerate, would divide by zero)
+    """
+    prior_mean = state.climate_prior_mean_f
+    prior_std = state.climate_prior_std_f
+    if prior_mean is None or prior_std is None or prior_std <= 0 or sigma <= 0:
+        return center, sigma
+
+    prior_var = prior_std ** 2
+    like_var = sigma ** 2
+    posterior_var = 1.0 / (1.0 / prior_var + 1.0 / like_var)
+    posterior_mean = posterior_var * (prior_mean / prior_var + center / like_var)
+    posterior_sigma = posterior_var ** 0.5
+
+    # Floor — keeps the engine honest on stations with low climatological σ.
+    floor = settings.CLIMATE_PRIOR_MIN_SIGMA_F
+    if posterior_sigma < floor:
+        posterior_sigma = floor
+
+    reasoning.append(
+        f"prior: climate N(μ={prior_mean:.1f}°F, σ={prior_std:.2f}°F) "
+        f"× forecast N(μ={center:.1f}°F, σ={sigma:.2f}°F) "
+        f"→ posterior μ={posterior_mean:.1f}°F, σ={posterior_sigma:.2f}°F"
+    )
+    return posterior_mean, posterior_sigma
 
 
 def _apply_metar_trend(

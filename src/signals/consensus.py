@@ -31,6 +31,14 @@ async def get_calibration_coefficients(
     fits ``actual = slope * predicted + intercept``, and returns
     ``(slope, intercept)``.  Returns ``None`` when fewer than
     :data:`MIN_CALIBRATION_SAMPLES` resolved signals exist.
+
+    Convention: ``Signal.model_prob`` is stored in the **side-effective
+    frame** — i.e. it is the model's probability of the side the trade
+    actually bet on (= P(YES) for BUY_YES trades, = 1-P(YES) for BUY_NO).
+    That keeps this regression's input range consistent across both
+    directions: ``predicted`` is "model's confidence in winning",
+    ``actual`` is "did we win", and the slope/intercept describe how
+    well-calibrated those confidences are.
     """
     stmt = (
         select(Signal)

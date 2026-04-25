@@ -58,6 +58,13 @@ class WeatherState:
     # returned data → probability engine falls back to hours-based σ.
     forecast_sigma_f: float | None = None
     ensemble_model_count: int = 1
+    # Climatological prior for the trading day's daily max — multi-year
+    # mean and std for this (station, day-of-year) from
+    # ``ingestion.station_normals``. None when no normal exists for the
+    # station or when CLIMATE_PRIOR_ENABLED is False; the probability
+    # engine then degrades to its pre-prior baseline.
+    climate_prior_mean_f: float | None = None
+    climate_prior_std_f: float | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -185,6 +192,8 @@ def build_state_from_metars(
     forecast: Any | None,
     bias_c: float,
     now_utc: datetime,
+    climate_prior_mean_f: float | None = None,
+    climate_prior_std_f: float | None = None,
 ) -> WeatherState | None:
     """Assemble a WeatherState from already-fetched METAR history + forecast.
 
@@ -236,6 +245,19 @@ def build_state_from_metars(
         forecast_peak_f = _c_to_f(adjusted_peak_c)
         peak_dt = now_utc.replace(hour=forecast.peak_hour_utc, minute=0, second=0, microsecond=0)
         hours_until_peak = (peak_dt - now_utc).total_seconds() / 3600.0
+        # Open-Meteo's `forecast_days=1, timezone=UTC` returns 24 hourly
+        # slots covering [today_utc 00:00, today_utc 23:00]. For stations
+        # west of UTC (Americas, Pacific) today's local-day heating peak
+        # occurs late in the UTC day — often at hour 23 — and yesterday's
+        # heating tail bleeds into hour 0 of the same UTC day. The
+        # `argmax` then reports hour 0 (yesterday's tail), which gives
+        # `hours_until_peak ≈ -17h` mid-day local. The peak we actually
+        # care about is today's, which is the *next* occurrence of the
+        # same hour-of-day. Shift by 24h whenever the same-day peak lies
+        # more than 12h in the past.
+        if hours_until_peak < -12.0:
+            peak_dt += timedelta(days=1)
+            hours_until_peak += 24.0
         is_solar_declining, solar_mag = check_solar(forecast, now_utc.hour)
         is_cloud_rising, cloud_mag = check_cloud(forecast, now_utc.hour)
 
@@ -308,6 +330,8 @@ def build_state_from_metars(
         forecast_residual_f=forecast_residual_f,
         forecast_sigma_f=forecast_sigma_f,
         ensemble_model_count=ensemble_model_count,
+        climate_prior_mean_f=climate_prior_mean_f,
+        climate_prior_std_f=climate_prior_std_f,
     )
 
 
@@ -334,11 +358,14 @@ async def aggregate_state(
     engine; when deterministic fails, ensemble is used alone (lossy bias
     frame, but better than no forecast).
     """
+    from src.config import settings
     from src.ingestion.openmeteo import (
         fetch_deterministic_forecast,
         fetch_ensemble_forecast,
     )
     from src.ingestion.station_bias import get_bias
+    from src.ingestion.station_normals import get_normal
+    from src.signals.mapper import icao_timezone, today_local
 
     metar_task = _safe_fetch_metar(icao)
     deterministic_task = fetch_deterministic_forecast(lat, lon)
@@ -361,8 +388,41 @@ async def aggregate_state(
     else:
         bias_c = 0.0  # Not used when forecast is None
 
+    # Climate-normal prior — read once per station per tick. Uses today's
+    # station-local DOY (off-by-one DOY between adjacent days changes the
+    # normal by <0.1°F, negligible vs the per-market target-day distinction).
+    climate_prior_mean_f: float | None = None
+    climate_prior_std_f: float | None = None
+    if settings.CLIMATE_PRIOR_ENABLED:
+        try:
+            tz = icao_timezone(icao)
+            normal = await get_normal(session, icao, today_local(tz))
+        except Exception:
+            logger.warning("Climate normal fetch failed for %s", icao, exc_info=True)
+            normal = None
+        if normal is not None:
+            std_f = normal.std_max_c * 9.0 / 5.0
+            if (
+                settings.CLIMATE_PRIOR_MIN_SIGMA_F * 0.5  # accept tighter, the engine clamps
+                <= std_f
+                <= settings.CLIMATE_PRIOR_MAX_SIGMA_F
+            ):
+                climate_prior_mean_f = normal.mean_max_c * 9.0 / 5.0 + 32.0
+                climate_prior_std_f = std_f
+            else:
+                logger.info(
+                    "[%s] climate normal σ=%.2f°F outside [%.1f, %.1f] — prior bypassed",
+                    icao, std_f,
+                    settings.CLIMATE_PRIOR_MIN_SIGMA_F * 0.5,
+                    settings.CLIMATE_PRIOR_MAX_SIGMA_F,
+                )
+
     now_utc = datetime.now(timezone.utc)
-    state = build_state_from_metars(icao, history, forecast, bias_c, now_utc)
+    state = build_state_from_metars(
+        icao, history, forecast, bias_c, now_utc,
+        climate_prior_mean_f=climate_prior_mean_f,
+        climate_prior_std_f=climate_prior_std_f,
+    )
     if state is None:
         logger.debug("No routine METARs yet for %s, skipping", icao)
         return None

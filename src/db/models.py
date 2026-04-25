@@ -299,6 +299,36 @@ class StationBias(Base):
     created_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
 
 
+class StationNormal(Base):
+    """Climatological prior — multi-year mean & std of daily-max
+    temperature for one (station, day-of-year) combination.
+
+    Source defaults to the Open-Meteo Archive ERA5 reanalysis. Backfilled
+    once via ``scripts/backfill_station_normals.py`` and read on every
+    pipeline tick by ``ingestion.station_normals.get_normal`` to seed the
+    Bayesian prior before forecast/observation likelihoods update it.
+    """
+
+    __tablename__ = "station_normals"
+    __table_args__ = (
+        UniqueConstraint("station_icao", "day_of_year", name="uq_station_normal_doy"),
+        Index("ix_station_normal_icao_doy", "station_icao", "day_of_year"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    station_icao = Column(String, nullable=False)
+    day_of_year = Column(Integer, nullable=False)  # 1..366; Feb 29 collapses to Feb 28
+    mean_max_c = Column(Float, nullable=False)
+    std_max_c = Column(Float, nullable=False)
+    sample_years = Column(Integer, nullable=False)
+    source = Column(String, nullable=False, default="openmeteo_archive_era5")
+    computed_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+
 class AviationAlert(Base):
     __tablename__ = "aviation_alerts"
 

@@ -340,9 +340,22 @@ async def job_unified_pipeline() -> None:
 
                     buckets = _make_binary_buckets(market, state)
                     dist = compute_distribution(state, buckets)
+
+                    # Build a deferred NO-depth fetcher; only invoked when
+                    # _binary_market_edge actually picks the NO side, so
+                    # we don't pay an extra CLOB call on the (more common)
+                    # YES branch.
+                    def _no_depth_for_market(market=market, token_ids=token_ids, price=price):
+                        if not token_ids:
+                            return 0.0
+                        no_price = max(0.001, 1.0 - price)
+                        return get_orderbook_depth(token_ids[1], no_price)
+
                     edge_result = _binary_market_edge(
                         dist, market, end_time,
-                        state.routine_count_today, mkt_depth,
+                        state.routine_count_today,
+                        depth_yes=mkt_depth,
+                        depth_no_fn=_no_depth_for_market,
                     )
                     if edge_result is None:
                         logger.info(
@@ -365,48 +378,63 @@ async def job_unified_pipeline() -> None:
                         label = f"{_display_bucket(int(market.parsed_threshold), unit)}{unit}"
                     else:
                         label = f"{edge_result.bucket_value}{unit}"
+                    side_label = "YES" if edge_result.direction.value == "BUY_YES" else "NO"
                     logger.info(
-                        "[%s] %s %s%s: P(YES)=%.3f, mkt=%.3f, edge=%+.3f %s | %s",
-                        icao, market.parsed_operator, op_symbol, label,
+                        "[%s] %s %s%s [%s]: P=%.3f, mkt=%.3f, edge=%+.3f %s | %s",
+                        icao, market.parsed_operator, op_symbol, label, side_label,
                         edge_result.our_probability, edge_result.market_price,
                         edge_result.edge, tag, dist.reasoning,
                     )
 
                     edges = [edge_result]
                     passing = [edge_result] if edge_result.passes else []
-                    depths = {edge_result.bucket_value: mkt_depth}
 
                     dd_state = monitor.check(bankroll)
                     for edge in passing:
+                        # Side-effective depth for the chosen direction —
+                        # the NO branch already fetched its own depth via
+                        # _no_depth_for_market during edge evaluation; the
+                        # YES branch reuses mkt_depth.
+                        side_depth = (
+                            mkt_depth
+                            if edge.direction.value == "BUY_YES"
+                            else _no_depth_for_market()
+                        )
                         pos = size_position(
                             bankroll=bankroll,
                             model_prob=edge.our_probability,
                             market_prob=edge.market_price,
                             current_exposure=exposure,
                             max_position_usd=settings.MAX_POSITION_USD,
-                            orderbook_depth=depths.get(edge.bucket_value),
+                            orderbook_depth=side_depth or None,
                         )
 
                         adjusted_stake = pos.stake_usd * dd_state.size_multiplier
                         logger.info(
-                            "[%s] sizing bucket=%d: kelly_stake=$%.2f, dd_mult=%.2f, adjusted=$%.2f, bankroll=$%.0f, exposure=$%.0f",
-                            icao, edge.bucket_value, pos.stake_usd, dd_state.size_multiplier,
-                            adjusted_stake, bankroll, exposure,
+                            "[%s] sizing %s bucket=%d: kelly_stake=$%.2f, dd_mult=%.2f, adjusted=$%.2f, bankroll=$%.0f, exposure=$%.0f",
+                            icao, side_label, edge.bucket_value, pos.stake_usd,
+                            dd_state.size_multiplier, adjusted_stake, bankroll, exposure,
                         )
                         if adjusted_stake < settings.MIN_STAKE_USD:
                             logger.info(
-                                "[%s] skip bucket=%d: adjusted_stake=$%.2f < min $%.2f",
-                                icao, edge.bucket_value, adjusted_stake, settings.MIN_STAKE_USD,
+                                "[%s] skip %s bucket=%d: adjusted_stake=$%.2f < min $%.2f",
+                                icao, side_label, edge.bucket_value,
+                                adjusted_stake, settings.MIN_STAKE_USD,
                             )
                             continue
 
-                        from src.db.models import Signal, TradeDirection
+                        from src.db.models import Signal
+                        # Store the side-effective probability so the
+                        # consensus calibration regression (which reads
+                        # `model_prob` against won={0,1}) treats both
+                        # YES and NO trades uniformly. See
+                        # src/signals/consensus.py.
                         sig_row = Signal(
                             market_id=market.id,
                             model_prob=edge.our_probability,
                             market_prob=edge.market_price,
                             edge=edge.edge,
-                            direction=TradeDirection.BUY_YES,
+                            direction=edge.direction,
                             confidence=edge.our_probability,
                         )
                         session.add(sig_row)
@@ -415,7 +443,7 @@ async def job_unified_pipeline() -> None:
                         trade = Trade(
                             signal_id=sig_row.id,
                             market_id=market.id,
-                            direction=TradeDirection.BUY_YES,
+                            direction=edge.direction,
                             stake_usd=adjusted_stake,
                             entry_price=edge.market_price,
                             status=TradeStatus.PENDING,
@@ -433,7 +461,7 @@ async def job_unified_pipeline() -> None:
                             display_bucket = _display_bucket(edge.bucket_value, unit)
                             fill = trade.fill_price or edge.market_price
                             await alerter._enqueue(
-                                f"\U0001f4b0 *Unified trade* [{icao}]\n"
+                                f"\U0001f4b0 *Unified trade* [{icao}] {side_label}\n"
                                 f"Bucket: {display_bucket}{unit} | Edge: {edge.edge:.3f}\n"
                                 f"Filled: ${actual_stake:.2f} (req ${adjusted_stake:.2f}) @ {fill:.3f}\n"
                                 f"Market: {market.question[:60]}",
@@ -444,8 +472,8 @@ async def job_unified_pipeline() -> None:
                             # exposure increment, no dedup.
                             trade.status = TradeStatus.PENDING
                             logger.info(
-                                "[%s] %s bucket=%d: FAK posted, no fill at quoted price",
-                                icao, market.id[:12], edge.bucket_value,
+                                "[%s] %s %s bucket=%d: FAK posted, no fill at quoted price",
+                                icao, side_label, market.id[:12], edge.bucket_value,
                             )
 
               except Exception:
@@ -601,61 +629,103 @@ def _make_binary_buckets(market, state) -> list[int]:
     return list(range(low, upper + 11))
 
 
-def _binary_market_edge(dist, market, end_time, routine_count, depth):
-    """Collapse distribution into cumulative probability for a binary market.
+def _binary_market_edge(
+    dist,
+    market,
+    end_time,
+    routine_count,
+    depth_yes: float,
+    depth_no_fn=None,
+):
+    """Pick the best side (YES or NO) of a binary market and gate it.
 
-    Returns a BucketEdge or None if the market can't be evaluated.
+    Computes ``our_prob_yes`` from the distribution under the operator,
+    then evaluates *both* sides:
 
-    Routes:
-      - above/at_least: P(daily_max >= threshold)
-      - below/at_most:  P(daily_max <  threshold)
-      - exactly / range / bracket-with-parseable-window:
-          P(daily_max in [low_f, high_f]) using market_range_f()
+      * YES: prob = our_prob_yes, price = yes_price, edge = prob - price
+      * NO:  prob = 1 - our_prob_yes, price = 1 - yes_price, edge = prob - price
+
+    For a binary market ``edge_NO == -edge_YES``, so picking the side
+    with positive edge is equivalent to picking the side that the model
+    disagrees with the market on. Each side is gated through
+    ``_check_filters`` in its own price/probability frame so the
+    ``MIN_ENTRY_PRICE``/``MIN_PROBABILITY`` thresholds are correct for
+    a NO trade as well as a YES trade.
+
+    ``depth_no_fn`` is an optional zero-arg callable returning NO-side
+    orderbook depth in USD; only invoked when the chosen direction is
+    NO, so the additional CLOB call is skipped on the (more common) YES
+    side.
+
+    Returns the passing-side ``BucketEdge`` if one passes; otherwise the
+    higher-edge candidate (with ``passes=False`` and a reject reason),
+    so callers can still log what was attempted.
     """
+    from src.db.models import TradeDirection
     from src.signals.edge_calculator import BucketEdge, _check_filters
 
     op = market.parsed_operator
-    price = market.current_yes_price or 0.0
+    yes_price = market.current_yes_price or 0.0
     bucket_value: int
 
     if op in ("above", "at_least"):
         threshold = int(market.parsed_threshold)
         bucket_value = threshold
-        our_prob = sum(p for b, p in dist.probabilities.items() if b >= threshold)
+        our_prob_yes = sum(p for b, p in dist.probabilities.items() if b >= threshold)
     elif op in ("below", "at_most"):
         threshold = int(market.parsed_threshold)
         bucket_value = threshold
-        our_prob = sum(p for b, p in dist.probabilities.items() if b < threshold)
+        our_prob_yes = sum(p for b, p in dist.probabilities.items() if b < threshold)
     elif op in ("exactly", "range", "bracket"):
         rng = market_range_f(market)
         if rng is None:
             return None
         low, high = rng
         bucket_value = (low + high) // 2
-        our_prob = sum(p for b, p in dist.probabilities.items() if low <= b <= high)
+        our_prob_yes = sum(p for b, p in dist.probabilities.items() if low <= b <= high)
     else:
         return None
 
-    our_prob = round(our_prob, 4)
-    edge = round(our_prob - price, 4)
+    our_prob_yes = round(our_prob_yes, 4)
+    yes_edge = round(our_prob_yes - yes_price, 4)
+    no_prob = round(1.0 - our_prob_yes, 4)
+    no_price = round(1.0 - yes_price, 4)
+    no_edge = round(no_prob - no_price, 4)
 
     now = datetime.now(timezone.utc)
     minutes_to_close = (end_time - now).total_seconds() / 60.0
 
+    # Pick the side whose edge is positive. If both are non-positive,
+    # the higher-edge side is still returned (with passes=False) so the
+    # caller's log line shows what was considered.
+    if no_edge > yes_edge:
+        direction = TradeDirection.BUY_NO
+        side_prob = no_prob
+        side_price = no_price
+        side_edge = no_edge
+        side_depth = depth_no_fn() if depth_no_fn is not None else 0.0
+    else:
+        direction = TradeDirection.BUY_YES
+        side_prob = our_prob_yes
+        side_price = yes_price
+        side_edge = yes_edge
+        side_depth = depth_yes
+
     reason = _check_filters(
-        edge=edge, prob=our_prob, price=price,
+        edge=side_edge, prob=side_prob, price=side_price,
         routine_count=routine_count,
         minutes_to_close=minutes_to_close,
-        depth=depth,
+        depth=side_depth,
     )
 
     return BucketEdge(
         bucket_value=bucket_value,
-        our_probability=our_prob,
-        market_price=price,
-        edge=edge,
+        our_probability=side_prob,
+        market_price=side_price,
+        edge=side_edge,
         passes=reason is None,
         reject_reason=reason,
+        direction=direction,
     )
 
 

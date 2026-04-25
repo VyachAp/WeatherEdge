@@ -394,3 +394,117 @@ class TestReasoning:
         )
         dist = compute_distribution(state, BUCKETS)
         assert any("cap" in r.lower() for r in dist.reasoning)
+
+
+class TestClimatePrior:
+    """Bayesian Gaussian-Gaussian blend of forecast (likelihood) with the
+    climate normal (prior). Modifies both center and σ."""
+
+    def test_disabled_no_change(self):
+        """With both prior fields None, output is identical to baseline."""
+        baseline = compute_distribution(_make_state(), BUCKETS)
+        with_no_prior = compute_distribution(
+            _make_state(climate_prior_mean_f=None, climate_prior_std_f=None),
+            BUCKETS,
+        )
+        assert baseline.probabilities == with_no_prior.probabilities
+        assert not any("prior:" in r for r in with_no_prior.reasoning)
+
+    def test_pulls_outlier_forecast_toward_normal(self):
+        """Forecast 100°F + tight prior 80°F → posterior between, much closer
+        to the prior because its variance is lower."""
+        # Wide bucket grid so the posterior fits.
+        buckets = list(range(70, 110))
+        state = _make_state(
+            current_max_f=70.0,
+            forecast_peak_f=100.0,
+            forecast_sigma_f=5.0,            # likelihood σ
+            ensemble_model_count=3,
+            climate_prior_mean_f=80.0,
+            climate_prior_std_f=3.0,         # prior σ — tighter
+            metar_trend_rate=0.0,            # no trend shift
+            hours_until_peak=0.5,
+            solar_declining=False,
+            cloud_rising=False,
+        )
+        dist = compute_distribution(state, buckets)
+        # Posterior mean is between 80 and 100, weighted toward 80 because
+        # 1/9 (prior precision) > 1/25 (likelihood precision).
+        # Closed form: posterior_mean = (80/9 + 100/25) / (1/9 + 1/25) ≈ 84.7
+        # The mode of the integer-bucket distribution should be at ~85.
+        mode_bucket = max(dist.probabilities, key=lambda b: dist.probabilities[b])
+        assert 82 <= mode_bucket <= 87
+
+    def test_tightens_sigma(self):
+        """Posterior σ is always less than both inputs (Bayesian invariant),
+        floored by CLIMATE_PRIOR_MIN_SIGMA_F."""
+        # The reasoning string captures the posterior σ; assert it's <
+        # both inputs and >= the floor.
+        state = _make_state(
+            forecast_sigma_f=4.0,
+            ensemble_model_count=3,
+            climate_prior_mean_f=82.0,
+            climate_prior_std_f=4.0,
+        )
+        dist = compute_distribution(state, BUCKETS)
+        prior_lines = [r for r in dist.reasoning if "prior:" in r]
+        assert prior_lines, "expected a prior reasoning line"
+        # Pull out posterior σ from "→ posterior μ=X.X°F, σ=Y.YY°F".
+        import re
+        m = re.search(r"σ=(\d+\.\d+)°F\s*$", prior_lines[0])
+        assert m is not None, prior_lines[0]
+        post_sigma = float(m.group(1))
+        # Bayesian Gaussian blend with equal σ inputs: posterior_var = σ²/2,
+        # posterior_σ = σ/√2 ≈ 2.83. Floor is 2.0, so posterior σ ≈ 2.83.
+        assert post_sigma < 4.0
+        assert post_sigma >= 2.0  # floor
+
+    def test_wide_prior_minimal_pull(self):
+        """When prior σ is very wide, the posterior is nearly the
+        likelihood (prior carries almost no information)."""
+        buckets = list(range(70, 110))
+        state = _make_state(
+            current_max_f=70.0,
+            forecast_peak_f=95.0,
+            forecast_sigma_f=2.0,            # tight likelihood
+            ensemble_model_count=3,
+            climate_prior_mean_f=80.0,
+            climate_prior_std_f=20.0,        # very wide prior
+            metar_trend_rate=0.0,
+            hours_until_peak=0.5,
+            solar_declining=False,
+            cloud_rising=False,
+        )
+        dist = compute_distribution(state, buckets)
+        mode_bucket = max(dist.probabilities, key=lambda b: dist.probabilities[b])
+        # Posterior mean ≈ (95/4 + 80/400) / (1/4 + 1/400) ≈ 94.6 — barely
+        # moved from the forecast. Within 1°F.
+        assert 94 <= mode_bucket <= 96
+
+    def test_min_sigma_floor_clamps_overshrunk_posterior(self):
+        """Two very-tight inputs would naturally combine to σ ≈ 0.7°F; the
+        floor should catch that and hold the posterior at MIN_SIGMA."""
+        from src.config import settings
+        state = _make_state(
+            forecast_sigma_f=1.0,            # very tight likelihood
+            ensemble_model_count=4,
+            climate_prior_mean_f=82.0,
+            climate_prior_std_f=1.0,         # very tight prior
+        )
+        dist = compute_distribution(state, BUCKETS)
+        prior_lines = [r for r in dist.reasoning if "prior:" in r]
+        assert prior_lines, "expected a prior reasoning line"
+        import re
+        m = re.search(r"σ=(\d+\.\d+)°F\s*$", prior_lines[0])
+        assert m is not None
+        post_sigma = float(m.group(1))
+        assert post_sigma == pytest.approx(settings.CLIMATE_PRIOR_MIN_SIGMA_F)
+
+    def test_zero_prior_sigma_is_passthrough(self):
+        """Degenerate prior σ=0 must not divide-by-zero — fall through cleanly."""
+        baseline = compute_distribution(_make_state(), BUCKETS)
+        bad_prior = compute_distribution(
+            _make_state(climate_prior_mean_f=80.0, climate_prior_std_f=0.0),
+            BUCKETS,
+        )
+        assert baseline.probabilities == bad_prior.probabilities

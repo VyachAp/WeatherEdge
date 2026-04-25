@@ -44,14 +44,25 @@ class TestEdgeComputation:
 
 class TestMinProbabilityFilter:
     def test_low_probability_rejected(self):
-        dist = _make_dist({80: 0.55})  # Below 0.60
-        prices = {80: 0.30}  # Edge = 0.25 (passes edge filter)
+        # Prob 0.45 fails the new 0.50 floor; edge=0.15 is fine.
+        dist = _make_dist({80: 0.45})
+        prices = {80: 0.30}
         depths = {80: 100.0}
         end = datetime.now(timezone.utc) + timedelta(hours=5)
 
         edges = compute_edges(dist, prices, routine_count=5, market_end_time=end, orderbook_depths=depths)
         assert edges[0].passes is False
         assert "probability" in edges[0].reject_reason
+
+    def test_at_floor_passes(self):
+        # 0.55 used to be rejected (was below 0.60); now passes (>= 0.50).
+        dist = _make_dist({80: 0.55})
+        prices = {80: 0.45}  # Edge = 0.10 (passes edge filter)
+        depths = {80: 100.0}
+        end = datetime.now(timezone.utc) + timedelta(hours=5)
+
+        edges = compute_edges(dist, prices, routine_count=5, market_end_time=end, orderbook_depths=depths)
+        assert edges[0].passes is True
 
     def test_high_probability_passes(self):
         dist = _make_dist({80: 0.80})
@@ -144,3 +155,28 @@ class TestMultipleBuckets:
         assert any(e.bucket_value == 80 for e in passing)
         # Bucket 78: prob = 0.05 → fails probability filter
         assert any(e.bucket_value == 78 for e in failing)
+
+
+class TestBucketEdgeDirection:
+    """`BucketEdge.direction` is BUY_YES by default (back-compat) but is
+    set explicitly by `_binary_market_edge` based on which side of the
+    market the model disagrees with."""
+
+    def test_default_direction_is_yes(self):
+        from src.db.models import TradeDirection
+
+        e = BucketEdge(
+            bucket_value=80, our_probability=0.7, market_price=0.5,
+            edge=0.2, passes=True, reject_reason=None,
+        )
+        assert e.direction == TradeDirection.BUY_YES
+
+    def test_explicit_no_direction(self):
+        from src.db.models import TradeDirection
+
+        e = BucketEdge(
+            bucket_value=80, our_probability=0.7, market_price=0.45,
+            edge=0.25, passes=True, reject_reason=None,
+            direction=TradeDirection.BUY_NO,
+        )
+        assert e.direction == TradeDirection.BUY_NO

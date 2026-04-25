@@ -7,10 +7,11 @@ applies the redesigned trade filters, and returns tradeable edges.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from src.config import settings
+from src.db.models import TradeDirection
 from src.signals.probability_engine import BucketDistribution
 
 logger = logging.getLogger(__name__)
@@ -21,7 +22,17 @@ MIN_EDGE: float = 0.05
 
 @dataclass
 class BucketEdge:
-    """Edge analysis for a single bucket."""
+    """Edge analysis for a single bucket on one side of a binary market.
+
+    Fields are interpreted *in the frame of the side we're proposing to
+    trade*: ``our_probability`` is P(side=YES) when ``direction=BUY_YES``
+    and P(side=NO) when ``direction=BUY_NO``; ``market_price`` is the
+    cost of one share of that side; ``edge = our_probability - market_price``.
+    The ``MIN_EDGE``, ``MIN_PROBABILITY``, ``MIN/MAX_ENTRY_PRICE`` filters
+    in :func:`_check_filters` all evaluate against these side-effective
+    values, so a high-confidence NO trade is gated correctly even when
+    the underlying YES probability is low.
+    """
 
     bucket_value: int
     our_probability: float
@@ -29,6 +40,7 @@ class BucketEdge:
     edge: float
     passes: bool
     reject_reason: str | None
+    direction: TradeDirection = field(default=TradeDirection.BUY_YES)
 
 
 def compute_edges(
@@ -100,7 +112,15 @@ def _check_filters(
     minutes_to_close: float,
     depth: float,
 ) -> str | None:
-    """Return rejection reason or None if all filters pass."""
+    """Return rejection reason or None if all filters pass.
+
+    All inputs are interpreted in the **side-effective frame** — i.e.
+    ``prob`` is the probability of the side we're betting on (YES or NO),
+    ``price`` is the per-share cost of that side, ``edge = prob - price``,
+    and ``depth`` is the depth on the buy book of that side's token. The
+    same gate works symmetrically for YES and NO trades because the math
+    is identical once expressed in the chosen side's units.
+    """
     if edge < MIN_EDGE:
         return f"edge {edge:.4f} < {MIN_EDGE}"
 

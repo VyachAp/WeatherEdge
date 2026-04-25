@@ -54,7 +54,13 @@ class Settings(BaseSettings):
     UNIFIED_PIPELINE_INTERVAL_MINUTES: int = 5
 
     # Trade filters
-    MIN_PROBABILITY: float = 0.60
+    # Side-effective probability floor. After PR-1 the BucketEdge stores
+    # `our_probability` in the chosen-side frame, so 0.50 means "trade
+    # only when the model is at least a coin flip on the side we're
+    # buying". Combined with MIN_EDGE=0.05 this allows entries down to
+    # ~0.45 on whichever side has positive edge — the "earlier, lower
+    # price" zone the user explicitly asked to unlock.
+    MIN_PROBABILITY: float = 0.50
     MIN_ENTRY_PRICE: float = 0.40
     MAX_ENTRY_PRICE: float = 0.97
     MIN_DEPTH_USD: float = 10.0
@@ -114,6 +120,24 @@ class Settings(BaseSettings):
     # If fewer than this many models returned usable peak-hour data, fall back
     # to the deterministic single-source endpoint.
     ENSEMBLE_MIN_MODELS: int = 3
+
+    # Climate-normal prior. Multi-year per-station per-DOY climatology
+    # acts as the Bayesian prior for the daily-max distribution before the
+    # forecast Gaussian (likelihood) and METAR observations update it.
+    # Ships disabled — backfill the `station_normals` table first via
+    # `scripts/backfill_station_normals.py`, sanity-check the values,
+    # then flip CLIMATE_PRIOR_ENABLED=true.
+    CLIMATE_PRIOR_ENABLED: bool = False
+    CLIMATE_NORMAL_YEARS: int = 10
+    # Floor on posterior σ after the Bayesian blend — prevents tropical
+    # / oceanic stations (low climatological σ) from collapsing the
+    # distribution width to ~1°F and over-confidently quoting narrow
+    # bracket markets.
+    CLIMATE_PRIOR_MIN_SIGMA_F: float = 2.0
+    # Reject degenerate priors entirely. A station whose computed
+    # std_max_c exceeds this is silently bypassed — it would dilute the
+    # forecast rather than anchor it.
+    CLIMATE_PRIOR_MAX_SIGMA_F: float = 8.0
 
 
 settings = Settings()
