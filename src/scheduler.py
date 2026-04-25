@@ -270,11 +270,18 @@ async def job_unified_pipeline() -> None:
                     end_time = market.end_date or datetime.now(timezone.utc) + timedelta(hours=24)
 
                     now_utc = datetime.now(timezone.utc)
-                    if _should_skip_future_day(market, now_utc):
+                    if _should_skip_future_day(market, now_utc, station_icao=icao):
+                        from src.signals.mapper import (
+                            icao_timezone as _tz_for,
+                            resolve_target_local_day as _target_day,
+                            today_local as _today_local,
+                        )
+                        _tz = _tz_for(icao)
                         logger.info(
-                            "[%s] skip %s: resolves %s, today %s — same-day-only mode",
+                            "[%s] skip %s: target_local=%s today_local=%s — future-day",
                             icao, market.id[:12],
-                            market.end_date.date().isoformat(), now_utc.date().isoformat(),
+                            _target_day(market.end_date, _tz),
+                            _today_local(_tz),
                         )
                         continue
 
@@ -324,65 +331,50 @@ async def job_unified_pipeline() -> None:
                         )
                         continue
 
-                    if _is_binary_market(market):
-                        # --- Binary threshold market ---
-                        buckets = _make_binary_buckets(market, state)
-                        dist = compute_distribution(state, buckets)
-                        edge_result = _binary_market_edge(
-                            dist, market, end_time,
-                            state.routine_count_today, mkt_depth,
+                    if not _is_binary_market(market):
+                        logger.debug(
+                            "[%s] skip %s: not a binary/range market (operator=%r)",
+                            icao, market.id[:12], market.parsed_operator,
                         )
-                        if edge_result is None:
-                            logger.info(
-                                "[%s] skip %s: binary edge None (operator=%r)",
-                                icao, market.id[:12], market.parsed_operator,
-                            )
-                            continue
+                        continue
 
-                        op_symbol = {"above": "≥", "at_least": "≥", "below": "<", "at_most": "≤", "exactly": "="}.get(market.parsed_operator, "?")
-                        tag = "PASS" if edge_result.passes else edge_result.reject_reason
-                        unit = _market_unit(market)
+                    buckets = _make_binary_buckets(market, state)
+                    dist = compute_distribution(state, buckets)
+                    edge_result = _binary_market_edge(
+                        dist, market, end_time,
+                        state.routine_count_today, mkt_depth,
+                    )
+                    if edge_result is None:
                         logger.info(
-                            "[%s] binary %s%d%s: P(YES)=%.3f, mkt=%.3f, edge=%+.3f %s | %s",
-                            icao, op_symbol,
-                            _display_bucket(int(market.parsed_threshold), unit), unit,
-                            edge_result.our_probability, edge_result.market_price,
-                            edge_result.edge, tag, dist.reasoning,
+                            "[%s] skip %s: edge None (operator=%r)",
+                            icao, market.id[:12], market.parsed_operator,
                         )
+                        continue
 
-                        edges = [edge_result]
-                        passing = [edge_result] if edge_result.passes else []
-                        depths = {int(market.parsed_threshold): mkt_depth}
+                    op_symbol = {
+                        "above": "≥", "at_least": "≥",
+                        "below": "<", "at_most": "≤",
+                        "exactly": "=", "range": "∈", "bracket": "∈",
+                    }.get(market.parsed_operator, "?")
+                    tag = "PASS" if edge_result.passes else edge_result.reject_reason
+                    unit = _market_unit(market)
+                    rng = market_range_f(market)
+                    if rng is not None and rng[0] != rng[1]:
+                        label = f"[{_display_bucket(rng[0], unit)}-{_display_bucket(rng[1], unit)}]{unit}"
+                    elif market.parsed_threshold is not None:
+                        label = f"{_display_bucket(int(market.parsed_threshold), unit)}{unit}"
                     else:
-                        # --- Bracket market ---
-                        buckets = _extract_bracket_buckets(market)
-                        if not buckets:
-                            logger.info(
-                                "[%s] skip %s: bracket has no parseable buckets (outcomes=%d)",
-                                icao, market.id[:12], len(market.outcomes or []),
-                            )
-                            continue
+                        label = f"{edge_result.bucket_value}{unit}"
+                    logger.info(
+                        "[%s] %s %s%s: P(YES)=%.3f, mkt=%.3f, edge=%+.3f %s | %s",
+                        icao, market.parsed_operator, op_symbol, label,
+                        edge_result.our_probability, edge_result.market_price,
+                        edge_result.edge, tag, dist.reasoning,
+                    )
 
-                        dist = compute_distribution(state, buckets)
-                        market_prices = _extract_market_prices(market, buckets)
-
-                        depths: dict[int, float] = {}
-                        if token_ids:
-                            for b in buckets:
-                                price = market_prices.get(b, 0)
-                                if price > 0:
-                                    depths[b] = get_orderbook_depth(token_ids[0], price)
-
-                        edges = compute_edges(
-                            dist, market_prices, state.routine_count_today, end_time, depths
-                        )
-                        passing = [e for e in edges if e.passes]
-                        logger.info(
-                            "Unified pipeline [%s/%s]: dist=%s, passing_edges=%d/%d, reasoning=%s",
-                            icao, market.id[:12],
-                            {k: f"{v:.3f}" for k, v in dist.probabilities.items() if v > 0.01},
-                            len(passing), len(edges), dist.reasoning,
-                        )
+                    edges = [edge_result]
+                    passing = [edge_result] if edge_result.passes else []
+                    depths = {edge_result.bucket_value: mkt_depth}
 
                     dd_state = monitor.check(bankroll)
                     for edge in passing:
@@ -432,17 +424,28 @@ async def job_unified_pipeline() -> None:
                         await session.flush()
 
                         order_ok = await place_order(trade, session)
-                        if order_ok:
+                        if order_ok and (trade.stake_usd or 0.0) > 0:
                             trade.status = TradeStatus.OPEN
-                            exposure += adjusted_stake
+                            actual_stake = trade.stake_usd
+                            exposure += actual_stake
                             total_trades += 1
                             unit = _market_unit(market)
                             display_bucket = _display_bucket(edge.bucket_value, unit)
+                            fill = trade.fill_price or edge.market_price
                             await alerter._enqueue(
                                 f"\U0001f4b0 *Unified trade* [{icao}]\n"
                                 f"Bucket: {display_bucket}{unit} | Edge: {edge.edge:.3f}\n"
-                                f"Stake: ${adjusted_stake:.2f} | Price: {edge.market_price:.2f}\n"
+                                f"Filled: ${actual_stake:.2f} (req ${adjusted_stake:.2f}) @ {fill:.3f}\n"
                                 f"Market: {market.question[:60]}",
+                            )
+                        elif order_ok:
+                            # FAK posted but didn't match — leave PENDING so
+                            # the next pipeline tick can re-evaluate. No
+                            # exposure increment, no dedup.
+                            trade.status = TradeStatus.PENDING
+                            logger.info(
+                                "[%s] %s bucket=%d: FAK posted, no fill at quoted price",
+                                icao, market.id[:12], edge.bucket_value,
                             )
 
               except Exception:
@@ -461,27 +464,107 @@ async def job_unified_pipeline() -> None:
 
 
 def _is_binary_market(market) -> bool:
-    """True if market is a binary threshold market (not a bracket)."""
-    return (
-        market.parsed_threshold is not None
-        and market.parsed_operator is not None
-        and market.parsed_operator != "bracket"
-    )
+    """True if market is a single-outcome binary YES/NO market.
+
+    All temperature markets we trade are binary at the CLOB level (one
+    YES token, one NO token) — the "bracket" operator from the parser
+    refers to questions like "Will the highest be between 88-89°F?" which
+    are *single binary* markets asking about a 2°F window, not a multi-
+    outcome bracket. We unify them here and let downstream routing pick
+    threshold-vs-range handling based on market_range_f().
+    """
+    op = market.parsed_operator
+    if op is None:
+        return False
+    if op in ("above", "at_least", "below", "at_most"):
+        return market.parsed_threshold is not None
+    if op == "exactly":
+        return market.parsed_threshold is not None
+    if op in ("range", "bracket"):
+        # bracket-operator markets need a parseable °F window in the
+        # question text; otherwise they're true multi-outcome brackets
+        # (very rare in practice for weather markets).
+        return market_range_f(market) is not None
+    return False
 
 
-def _should_skip_future_day(market, now: datetime) -> bool:
-    """True when the market resolves on a UTC day after today.
+def market_range_f(market) -> tuple[int, int] | None:
+    """Inclusive integer °F range for a range-style binary market.
 
-    `aggregate_state` builds WeatherState from today's METARs and Open-Meteo's
-    `forecast_days=1` (today only). Reusing that state for a market resolving
-    tomorrow or later collapses the distribution onto today's observed max via
-    the monotonicity constraint and produces artifact edges, not real signal.
-    Returns False when end_date is missing so we don't unintentionally drop
-    markets whose schedule we can't read.
+    Recognized shapes:
+      * "Will the highest temperature in X be between 88-89°F on …?"
+        → (88, 89)  — a 2°F-wide window
+      * "Will the highest temperature in X be 17°C on …?"
+        → (62, 63)  — integer °F values that round to 17°C
+      * "Will the highest temperature in X be 88°F on …?"
+        → (88, 88)  — single-degree window
+
+    Returns None for one-sided threshold markets (above/below) and for
+    questions where neither pattern matches.
+    """
+    import math
+
+    op = market.parsed_operator
+
+    # 1. Explicit "between X-Y°[FC]" in the question text.
+    if op in ("range", "bracket"):
+        from src.ingestion.polymarket import parse_bracket_from_question
+
+        parsed = parse_bracket_from_question(market.question or "")
+        if parsed is not None:
+            low_f, high_f_excl = parsed  # high is exclusive (+1)
+            return (int(round(low_f)), int(round(high_f_excl)) - 1)
+        return None
+
+    # 2. "Exactly" — Celsius single-value or Fahrenheit single-value.
+    if op == "exactly" and market.parsed_threshold is not None:
+        if _market_unit(market) == "°C":
+            c_int = round((market.parsed_threshold - 32.0) * 5.0 / 9.0)
+            lo_c = c_int - 0.5
+            hi_c = c_int + 0.5
+            lo_f = lo_c * 9.0 / 5.0 + 32.0
+            hi_f = hi_c * 9.0 / 5.0 + 32.0
+            f_lo = int(math.ceil(lo_f - 1e-9))
+            f_hi = int(math.floor(hi_f - 1e-9))
+            if f_hi < f_lo:
+                return (f_lo, f_lo)
+            return (f_lo, f_hi)
+        f = int(round(market.parsed_threshold))
+        return (f, f)
+
+    return None
+
+
+def _should_skip_future_day(market, now: datetime, station_icao: str | None = None) -> bool:
+    """True when the market's data day is *strictly later* than today
+    in the **station's local timezone**.
+
+    Each Polymarket weather market resolves to a single local-day max at
+    the station that resolves it. The data day is computed by
+    ``resolve_target_local_day(end_date, station_tz)`` (see mapper for the
+    derivation). A market for tomorrow's local data still has no
+    observations — skip. A market for today's local data, or yesterday's
+    that hasn't yet been settled, stays in scope.
+
+    Falls back to the legacy UTC-date comparison when no station is
+    available — keeps the rule defined for callers that don't know the
+    station yet.
     """
     if not market.end_date:
         return False
-    return market.end_date.date() > now.date()
+    if station_icao is None:
+        return market.end_date.date() > now.date()
+
+    from src.signals.mapper import (
+        icao_timezone,
+        resolve_target_local_day,
+        today_local,
+    )
+    tz = icao_timezone(station_icao)
+    target = resolve_target_local_day(market.end_date, tz)
+    if target is None:
+        return False
+    return target > today_local(tz)
 
 
 def _market_unit(market) -> str:
@@ -500,33 +583,56 @@ def _display_bucket(bucket_f: int, unit: str) -> int:
 
 
 def _make_binary_buckets(market, state) -> list[int]:
-    """Generate integer temperature range for distribution over a binary market."""
-    from src.signals.state_aggregator import WeatherState
+    """Generate the integer °F bucket grid for a single-binary market.
 
-    threshold = int(market.parsed_threshold)
+    The grid spans from one degree below the observed max up through the
+    forecast peak (or the threshold/range upper bound, whichever is
+    higher) plus a 10°F headroom — wide enough to capture upside tails
+    without wasting compute on far-out buckets.
+    """
+    rng = market_range_f(market)
+    if rng is not None:
+        upper = max(rng[1], int(state.forecast_peak_f))
+    elif market.parsed_threshold is not None:
+        upper = max(int(market.parsed_threshold), int(state.forecast_peak_f))
+    else:
+        upper = int(state.forecast_peak_f)
     low = int(state.current_max_f) - 1
-    high = max(threshold, int(state.forecast_peak_f)) + 10
-    return list(range(low, high + 1))
+    return list(range(low, upper + 11))
 
 
 def _binary_market_edge(dist, market, end_time, routine_count, depth):
     """Collapse distribution into cumulative probability for a binary market.
 
     Returns a BucketEdge or None if the market can't be evaluated.
+
+    Routes:
+      - above/at_least: P(daily_max >= threshold)
+      - below/at_most:  P(daily_max <  threshold)
+      - exactly / range / bracket-with-parseable-window:
+          P(daily_max in [low_f, high_f]) using market_range_f()
     """
     from src.signals.edge_calculator import BucketEdge, _check_filters
 
-    threshold = int(market.parsed_threshold)
     op = market.parsed_operator
     price = market.current_yes_price or 0.0
+    bucket_value: int
 
-    # Cumulative probability based on operator
     if op in ("above", "at_least"):
+        threshold = int(market.parsed_threshold)
+        bucket_value = threshold
         our_prob = sum(p for b, p in dist.probabilities.items() if b >= threshold)
     elif op in ("below", "at_most"):
+        threshold = int(market.parsed_threshold)
+        bucket_value = threshold
         our_prob = sum(p for b, p in dist.probabilities.items() if b < threshold)
-    elif op == "exactly":
-        our_prob = dist.probabilities.get(threshold, 0.0)
+    elif op in ("exactly", "range", "bracket"):
+        rng = market_range_f(market)
+        if rng is None:
+            return None
+        low, high = rng
+        bucket_value = (low + high) // 2
+        our_prob = sum(p for b, p in dist.probabilities.items() if low <= b <= high)
     else:
         return None
 
@@ -544,7 +650,7 @@ def _binary_market_edge(dist, market, end_time, routine_count, depth):
     )
 
     return BucketEdge(
-        bucket_value=threshold,
+        bucket_value=bucket_value,
         our_probability=our_prob,
         market_price=price,
         edge=edge,
@@ -681,20 +787,48 @@ async def _try_lock_rule_trade(
         )
         return 0.0
 
+    # FAK orders may fill partially or not at all when liquidity is thin.
+    # ``_update_fill_details`` already replaced trade.stake_usd with the
+    # actual filled cost (zeroed when nothing matched). Use that value as
+    # the source of truth for exposure / dedup so we don't book an order
+    # that never landed.
+    actual_stake = trade.stake_usd or 0.0
+    if actual_stake <= 0:
+        trade.status = TradeStatus.PENDING
+        logger.info(
+            "[%s] LOCK %s %s: order posted but no fill (book empty at limit); "
+            "leaving open for next-tick retry",
+            icao, decision.side, market.id[:12],
+        )
+        return 0.0
+
     trade.status = TradeStatus.OPEN
     unit = _market_unit(market)
-    threshold_disp = _display_bucket(int(market.parsed_threshold), unit)
-    op_symbol = {"above": "≥", "at_least": "≥", "below": "<", "at_most": "≤"}.get(
-        market.parsed_operator, "?"
-    )
+    rng = market_range_f(market)
+    if rng is not None and rng[0] != rng[1]:
+        threshold_disp = (
+            f"[{_display_bucket(rng[0], unit)}-{_display_bucket(rng[1], unit)}]"
+        )
+        op_symbol = "∈"
+    elif market.parsed_threshold is not None:
+        threshold_disp = str(_display_bucket(int(market.parsed_threshold), unit))
+        op_symbol = {
+            "above": "≥", "at_least": "≥",
+            "below": "<", "at_most": "≤",
+            "exactly": "=",
+        }.get(market.parsed_operator, "?")
+    else:
+        threshold_disp = "?"
+        op_symbol = "?"
+    fill_price = trade.fill_price or effective_price
     await alerter._enqueue(
         f"\U0001f512 *LOCK trade* [{icao}] {decision.side}\n"
         f"Threshold: {op_symbol}{threshold_disp}{unit} | Margin: {decision.margin_f:+.1f}°F\n"
-        f"Stake: ${stake:.2f} | Price: {effective_price:.2f}\n"
+        f"Filled: ${actual_stake:.2f} (req ${stake:.2f}) @ {fill_price:.3f}\n"
         f"Reason: {decision.reasons[0] if decision.reasons else 'locked'}\n"
         f"Market: {market.question[:60]}",
     )
-    return stake
+    return actual_stake
 
 
 def _extract_bracket_buckets(market) -> list[int]:
@@ -1127,15 +1261,17 @@ async def job_fast_lock_poll() -> None:
                         monitor=monitor, alerter=alerter, icao=icao,
                     )
                     if stake is None:
-                        # Shouldn't happen — we already confirmed lock — but
-                        # don't dedup on unexpected None so the next tick can retry.
                         continue
-                    # Dedup regardless of whether the order actually executed:
-                    # if the filter rejected (depth, close buffer), re-trying
-                    # every 30s won't help until the market state changes.
-                    _locked_markets_fired_today.add(market.id)
                     if stake > 0:
+                        # Real fill — dedup so we don't keep adding to the
+                        # same market on every poll. A second fresh entry
+                        # later in the day would require a new lock signal.
+                        _locked_markets_fired_today.add(market.id)
                         exposure += stake
+                    # If stake == 0 the FAK didn't fill (book empty at the
+                    # limit) or the filter rejected. Don't dedup — fresh
+                    # liquidity may appear on the next METAR tick and we
+                    # want to take it.
 
             await session.commit()
 

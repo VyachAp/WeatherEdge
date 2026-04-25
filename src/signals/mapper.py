@@ -622,6 +622,45 @@ ICAO_TIMEZONE: dict[str, str] = {
 }
 
 
+_DATA_DAY_BACKDATE_HOURS = 12
+
+
+def resolve_target_local_day(
+    end_date: datetime | None,
+    tz: ZoneInfo,
+) -> "date | None":
+    """Resolve the local calendar day a market is asking about.
+
+    Polymarket weather markets close at a UTC instant (``end_date``) that
+    sits just after the resolved local data day has finished. Wunderground
+    has published the previous-local-day max by then, and Polymarket reads
+    it to settle. Subtracting a half-day from ``end_date`` and projecting
+    into the station's timezone always lands inside the data day:
+
+      * Atlanta (UTC-4), end Apr 26 12:00 UTC, anchor = Apr 26 00:00 UTC
+        → Apr 25 20:00 EDT → **Apr 25** (yesterday for Atlanta — correct;
+        the market is asking about Apr 25 EDT's max).
+      * Tokyo (UTC+9), end Apr 26 12:00 UTC, anchor = Apr 26 00:00 UTC
+        → Apr 26 09:00 JST → **Apr 26** (today for Tokyo — correct; market
+        closes around sunset Tokyo time, after the day's heat).
+
+    Note: the question text's "April 26" is just Polymarket's UTC-based
+    label and does **not** reliably indicate the data day in local time.
+    Trust ``end_date`` instead.
+    """
+    from datetime import timedelta as _td
+
+    if end_date is None:
+        return None
+    anchor = end_date - _td(hours=_DATA_DAY_BACKDATE_HOURS)
+    return anchor.astimezone(tz).date()
+
+
+def today_local(tz: ZoneInfo) -> "date":
+    """Today's date in the station's local timezone."""
+    return datetime.now(timezone.utc).astimezone(tz).date()
+
+
 def icao_timezone(icao: str) -> ZoneInfo:
     """Return the IANA timezone for an ICAO station.
 

@@ -94,7 +94,24 @@ async def calculate_daily_pnl(session: AsyncSession) -> float:
 
 
 async def get_current_bankroll(session: AsyncSession) -> float:
-    """Return the latest bankroll balance, or ``INITIAL_BANKROLL`` if none."""
+    """Return current spendable bankroll in USD.
+
+    Source of truth, in priority order:
+      1. Live USDC wallet balance via the CLOB client (when a private key
+         is configured). The wallet is the only authoritative figure once
+         we are placing real orders — settled wins/losses move funds in or
+         out of it directly, so reading it avoids drift between the bot's
+         internal accounting and reality.
+      2. Latest BankrollLog row, written by daily settlement.
+      3. ``INITIAL_BANKROLL`` setting as a last-resort fallback for fresh
+         installs / dry-run environments with no settled history yet.
+    """
+    from src.execution.polymarket_client import get_wallet_usdc_balance
+
+    wallet = get_wallet_usdc_balance()
+    if wallet is not None and wallet > 0:
+        return wallet
+
     result = await session.execute(
         select(BankrollLog.balance)
         .order_by(BankrollLog.timestamp.desc())

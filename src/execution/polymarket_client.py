@@ -76,6 +76,58 @@ def is_live() -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Wallet balance
+# ---------------------------------------------------------------------------
+
+_WALLET_BALANCE_TTL_SEC = 300.0  # cache USDC balance lookups for 5 min
+_wallet_balance_cache: tuple[float, float] | None = None  # (fetched_at, usdc)
+
+
+def get_wallet_usdc_balance(force_refresh: bool = False) -> float | None:
+    """Return spendable USDC balance for the configured wallet.
+
+    Returns None when no private key is configured (dry-run) or the lookup
+    fails. Cached for ``_WALLET_BALANCE_TTL_SEC`` seconds.
+
+    The CLOB ``get_balance_allowance`` endpoint returns the on-chain USDC
+    balance held by the proxy/EOA in 6-decimal base units. We expose it in
+    plain USD so the rest of the bot can size positions against the real
+    bankroll instead of a static ``INITIAL_BANKROLL`` setting.
+    """
+    global _wallet_balance_cache  # noqa: PLW0603
+
+    if not settings.POLYMARKET_PRIVATE_KEY:
+        return None
+
+    now = _time.monotonic()
+    if not force_refresh and _wallet_balance_cache is not None:
+        ts, cached = _wallet_balance_cache
+        if now - ts < _WALLET_BALANCE_TTL_SEC:
+            return cached
+
+    client = _get_client()
+    if client is None:
+        return None
+
+    try:
+        from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
+
+        resp = client.get_balance_allowance(
+            BalanceAllowanceParams(asset_type=AssetType.COLLATERAL),
+        )
+        # USDC has 6 decimals; the API returns the base-unit string.
+        raw = resp.get("balance") if isinstance(resp, dict) else None
+        if raw is None:
+            return _wallet_balance_cache[1] if _wallet_balance_cache else None
+        usdc = float(raw) / 1_000_000.0
+        _wallet_balance_cache = (now, usdc)
+        return usdc
+    except Exception:
+        logger.warning("Failed to fetch wallet USDC balance", exc_info=True)
+        return _wallet_balance_cache[1] if _wallet_balance_cache else None
+
+
+# ---------------------------------------------------------------------------
 # Token ID resolution
 # ---------------------------------------------------------------------------
 
@@ -150,23 +202,38 @@ async def get_daily_spend(session: AsyncSession) -> float:
 async def place_order(
     trade: Trade,
     session: AsyncSession,
+    max_slippage_cents: float = 2.0,
 ) -> bool:
-    """Place a FOK market order on Polymarket for the given Trade.
+    """Place a price-limited FAK (immediate-or-cancel) order on Polymarket.
 
-    Updates the Trade row with order_id, token_id, fill_price,
-    exchange_status. Returns True if the order was successfully placed
-    (regardless of fill), False on failure.
+    Buy semantics: we set a per-share limit price = ``trade.entry_price +
+    max_slippage_cents/100`` (clamped to [0.001, 0.999]) and post a Fill-
+    And-Kill order at that limit. The matching engine sweeps every ask
+    priced at-or-below the limit, fills as much as is available, then
+    cancels the unfilled remainder. Result: the order naturally walks
+    across the price ladder (e.g. 0.95 → 0.96 → 0.97) instead of
+    rejecting when the top of book can't cover the full size.
 
-    In dry-run mode (no private key or AUTO_EXECUTE=False), logs the
-    order details and returns True without touching the exchange.
+    After the order is posted we read back ``size_matched`` and the
+    weighted-average fill price; ``trade.stake_usd`` is updated to
+    reflect the actual USDC spent so downstream P&L and exposure
+    accounting remain accurate even on partial fills.
+
+    Returns True when the order was successfully posted (regardless of
+    whether it filled — partial fills and zero fills both return True so
+    the caller can decide what to do based on ``trade.filled_size``).
+    Returns False on outright failures (cap exceeded, no token IDs,
+    client error).
     """
     # --- Dry-run guard ---
     if not is_live():
         logger.info(
-            "DRY-RUN: would place %s order on market %s for $%.2f",
+            "DRY-RUN: would place %s on %s for $%.2f at limit %.3f (+%.0f¢ slip)",
             trade.direction.value,
             trade.market_id,
             trade.stake_usd,
+            trade.entry_price or 0.0,
+            max_slippage_cents,
         )
         trade.exchange_status = "dry_run"
         return True
@@ -192,17 +259,12 @@ async def place_order(
 
     yes_token_id, no_token_id = token_ids
 
-    from py_clob_client.clob_types import MarketOrderArgs, OrderType
+    from py_clob_client.clob_types import OrderArgs, OrderType
     from py_clob_client.order_builder.constants import BUY
 
-    # BUY_YES → buy YES token; BUY_NO → buy NO token
     from src.db.models import TradeDirection
 
-    if trade.direction == TradeDirection.BUY_YES:
-        token_id = yes_token_id
-    else:
-        token_id = no_token_id
-
+    token_id = yes_token_id if trade.direction == TradeDirection.BUY_YES else no_token_id
     trade.token_id = token_id
 
     client = _get_client()
@@ -210,43 +272,76 @@ async def place_order(
         trade.exchange_status = "no_client"
         return False
 
-    try:
-        # Get tick size and neg_risk for this token
-        tick_size = client.get_tick_size(token_id)
-        neg_risk = client.get_neg_risk(token_id)
+    # Build the price-limited FAK order. The limit price is the highest
+    # per-share price we'll pay; FAK lets the matching engine sweep all
+    # asks at-or-below that limit and cancel the rest.
+    base_price = trade.entry_price or 0.0
+    if base_price <= 0:
+        # Fallback: read live best ask. Without a price we can't size or limit.
+        quote = get_best_bid_ask(token_id)
+        if quote is None:
+            trade.exchange_status = "no_price"
+            return False
+        base_price = quote[1]
 
-        # Create FOK market order
-        market_order = MarketOrderArgs(
+    limit_price = max(0.001, min(0.999, base_price + max_slippage_cents / 100.0))
+    # Snap to the token's tick size so the exchange accepts the order.
+    try:
+        tick_size = float(client.get_tick_size(token_id))
+        if tick_size > 0:
+            limit_price = round(limit_price / tick_size) * tick_size
+            limit_price = max(tick_size, min(1.0 - tick_size, limit_price))
+    except Exception:
+        logger.debug("tick-size lookup failed; using raw limit_price", exc_info=True)
+
+    # Worst-case sizing: if every share fills at the limit, we spend
+    # exactly stake_usd. Better-priced fills leave us underspent — fine.
+    raw_size = trade.stake_usd / limit_price
+    # Polymarket requires whole-cent share sizes (typically 2-decimal).
+    size_shares = round(raw_size, 2)
+    if size_shares <= 0:
+        trade.exchange_status = "size_zero"
+        return False
+
+    try:
+        order = OrderArgs(
             token_id=token_id,
-            amount=trade.stake_usd,  # USDC amount to spend
+            price=limit_price,
+            size=size_shares,
             side=BUY,
         )
-        signed = client.create_market_order(market_order)
-        resp = client.post_order(signed, OrderType.FOK)
+        signed = client.create_order(order)
+        resp = client.post_order(signed, OrderType.FAK)
 
         trade.order_id = resp.get("orderID")
         trade.exchange_status = resp.get("status", "unknown")
 
         if resp.get("success") or resp.get("orderID"):
             logger.info(
-                "Order placed: market=%s direction=%s amount=$%.2f order_id=%s status=%s",
-                trade.market_id,
-                trade.direction.value,
-                trade.stake_usd,
-                trade.order_id,
-                trade.exchange_status,
+                "Order posted: market=%s side=%s limit=%.3f size=%.2f stake=$%.2f order=%s status=%s",
+                trade.market_id, trade.direction.value,
+                limit_price, size_shares, trade.stake_usd,
+                trade.order_id, trade.exchange_status,
             )
-
-            # Fetch fill details if matched
-            if trade.order_id and (trade.exchange_status or "").lower() == "matched":
+            if trade.order_id:
                 await _update_fill_details(trade, client)
-
+                if trade.filled_size and trade.filled_size > 0:
+                    logger.info(
+                        "Fill: %.2f shares @ avg %.3f → spent $%.2f (limit was %.3f)",
+                        trade.filled_size,
+                        trade.fill_price or 0.0,
+                        trade.stake_usd,
+                        limit_price,
+                    )
+                else:
+                    logger.info(
+                        "FAK order posted but no fill at limit %.3f (book empty at/below limit)",
+                        limit_price,
+                    )
             return True
 
         error_msg = resp.get("errorMsg", "unknown error")
-        logger.error(
-            "Order failed: market=%s error=%s", trade.market_id, error_msg,
-        )
+        logger.error("Order failed: market=%s error=%s", trade.market_id, error_msg)
         trade.exchange_status = f"failed: {error_msg}"
         return False
 
@@ -257,17 +352,52 @@ async def place_order(
 
 
 async def _update_fill_details(trade: Trade, client) -> None:
-    """Query the CLOB for fill price and size after a matched order."""
+    """Read fill details (size, weighted avg price, actual spend) from CLOB.
+
+    For FAK orders that walked the book, ``associate_trades`` is a list
+    of individual fills at different prices. We weight by size to get
+    the true average and update ``trade.stake_usd`` to the actual amount
+    spent — partial fills (or no-fills) reduce stake_usd from the
+    requested amount, so exposure and bankroll accounting stay correct.
+    """
     try:
         order = client.get_order(trade.order_id)
-        trade.fill_price = float(order.get("associate_trades", [{}])[0].get("price", 0)) if order.get("associate_trades") else None
-        trade.filled_size = float(order.get("size_matched", 0))
-
-        if trade.fill_price:
-            trade.entry_price = trade.fill_price
-
     except Exception:
         logger.warning("Could not fetch fill details for order %s", trade.order_id)
+        return
+
+    fills = order.get("associate_trades") or []
+    total_size = 0.0
+    total_cost = 0.0
+    for f in fills:
+        try:
+            p = float(f.get("price", 0))
+            s = float(f.get("size", 0))
+        except (TypeError, ValueError):
+            continue
+        if p > 0 and s > 0:
+            total_size += s
+            total_cost += p * s
+
+    # Fall back to size_matched if associate_trades is missing.
+    if total_size == 0.0:
+        sm = order.get("size_matched")
+        if sm:
+            try:
+                total_size = float(sm)
+            except (TypeError, ValueError):
+                total_size = 0.0
+
+    trade.filled_size = total_size
+    if total_size > 0 and total_cost > 0:
+        avg_price = total_cost / total_size
+        trade.fill_price = avg_price
+        trade.entry_price = avg_price  # the price for P&L
+        trade.stake_usd = round(total_cost, 2)
+    elif total_size == 0.0:
+        # FAK order rejected with no fill. Zero out stake so it doesn't
+        # contaminate exposure or daily-spend accounting.
+        trade.stake_usd = 0.0
 
 
 async def check_order_status(trade: Trade) -> str | None:

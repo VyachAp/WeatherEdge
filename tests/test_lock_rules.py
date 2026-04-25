@@ -25,6 +25,8 @@ class _FakeMarket:
     parsed_threshold: float | None
     parsed_operator: str | None
     end_date: datetime | None = _MARKET_END
+    question: str = ""
+    parsed_target_date: str | None = None
 
 
 def _build_history(current_max_f: float, count: int = 5) -> tuple[tuple[datetime, float], ...]:
@@ -162,8 +164,10 @@ class TestHardDirectionBelow:
 
 
 class TestRejections:
-    def test_exactly_operator_never_locks(self):
-        mkt = _FakeMarket(parsed_threshold=80.0, parsed_operator="exactly")
+    def test_exactly_no_question_unparseable_no_lock(self):
+        # 'exactly' with no question text and no threshold-shaped fallback
+        # has no parseable range — lock returns None.
+        mkt = _FakeMarket(parsed_threshold=None, parsed_operator="exactly")
         state = _state(current_max_f=85.0)
         assert _eval(state, mkt).side is None
 
@@ -296,3 +300,97 @@ class TestDecisionShape:
         decision = _eval(state, mkt)
         assert decision.reasons
         assert any("85" in r for r in decision.reasons)
+
+
+class TestRangeMarkets:
+    """Lock-rule support for 'between X-Y°F' and 'X°C exactly' shapes."""
+
+    def test_overshoot_locks_no(self):
+        # 'between 80-81°F' market, observed max already 85°F → NO lock.
+        mkt = _FakeMarket(
+            parsed_threshold=None,
+            parsed_operator="bracket",
+            question="Will the highest temperature in NYC be between 80-81°F on June 15?",
+        )
+        state = _state(current_max_f=85.0)
+        decision = _eval(state, mkt)
+        assert decision.side == "NO"
+        # Margin is observed - high (3°F over 81 + 2 margin = 4 → margin_f=4)
+        assert decision.margin_f >= 4.0
+
+    def test_undershoot_with_no_more_heating_locks_no(self):
+        mkt = _FakeMarket(
+            parsed_threshold=None,
+            parsed_operator="bracket",
+            question="Will the highest temperature in NYC be between 80-81°F on June 15?",
+        )
+        # Far below the range AND past peak with declining solar.
+        state = _state(
+            current_max_f=70.0, forecast_peak_f=75.0, solar_declining=True,
+        )
+        assert _eval(state, mkt).side == "NO"
+
+    def test_in_range_post_peak_locks_yes(self):
+        mkt = _FakeMarket(
+            parsed_threshold=None,
+            parsed_operator="bracket",
+            question="Will the highest temperature in NYC be between 80-81°F on June 15?",
+        )
+        # Observed 80, past peak, solar declining, trend flat, forecast caps at 81.
+        state = _state(
+            current_max_f=80.0, forecast_peak_f=81.0,
+            solar_declining=True, metar_trend=0.0,
+        )
+        decision = _eval(state, mkt)
+        assert decision.side == "YES"
+
+    def test_in_range_pre_peak_no_lock(self):
+        # Same market, observed in-range but still pre-peak → don't lock yet.
+        mkt = _FakeMarket(
+            parsed_threshold=None,
+            parsed_operator="bracket",
+            question="Will the highest temperature in NYC be between 80-81°F on June 15?",
+        )
+        state = WeatherState(
+            station_icao=_TEST_ICAO,
+            current_max_f=80.0, metar_trend_rate=+1.0,
+            dewpoint_trend_rate=0.0,
+            forecast_peak_f=81.0, hours_until_peak=2.0,  # peak still ahead
+            solar_declining=False, solar_decline_magnitude=0.0,
+            cloud_rising=False, cloud_rise_magnitude=0.0,
+            routine_count_today=5, has_forecast=True,
+            routine_history=_build_history(80.0, count=5),
+        )
+        assert _eval(state, mkt).side is None
+
+    def test_celsius_exactly_overshoot_locks_no(self):
+        # '17°C exactly' resolves to °F bucket {62, 63}. Observed 70°F
+        # (>> 63 + margin) → NO.
+        from src.signals.mapper import f_to_c
+
+        c17_in_f = 17.0 * 9.0 / 5.0 + 32.0  # = 62.6°F
+        mkt = _FakeMarket(
+            parsed_threshold=c17_in_f,
+            parsed_operator="exactly",
+            question="Will the highest temperature in Amsterdam be 17°C on June 15?",
+        )
+        state = _state(current_max_f=70.0)
+        assert _eval(state, mkt).side == "NO"
+        # Sanity: Celsius round-trip
+        assert round(f_to_c(c17_in_f)) == 17
+
+    def test_celsius_exactly_in_range_locks_yes(self):
+        # 17°C exactly = bucket [62, 63]. Observed 63°F (= 17.2°C, rounds to 17),
+        # past peak, declining, forecast caps at 63°F → YES.
+        c17_in_f = 17.0 * 9.0 / 5.0 + 32.0
+        mkt = _FakeMarket(
+            parsed_threshold=c17_in_f,
+            parsed_operator="exactly",
+            question="Will the highest temperature in Amsterdam be 17°C on June 15?",
+        )
+        state = _state(
+            current_max_f=63.0, forecast_peak_f=63.0,
+            solar_declining=True, metar_trend=0.0,
+        )
+        decision = _eval(state, mkt)
+        assert decision.side == "YES"

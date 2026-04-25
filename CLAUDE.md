@@ -2,9 +2,12 @@
 
 ## Project Overview
 
-WeatherEdge is a weather-driven trading bot for Polymarket daily "highest temperature in [city]" markets. Every 5 minutes it aggregates live METAR observations + Open-Meteo forecasts per city, builds a full probability distribution over integer temperature buckets, compares it to live Polymarket CLOB prices, and sizes positions via fractional Kelly.
+WeatherEdge is a weather-driven trading bot for Polymarket daily "highest temperature in [city]" markets. Two trading paths run concurrently:
 
-The resolution source for these markets is the Wunderground history page, which mirrors **routine** (non-SPECI) METARs. The bot reads METARs directly and typically sees the same data 1–2 hours before the UI updates — that's the edge.
+1. **Probability path** — every 5 minutes, aggregate live METAR observations + a deterministic Open-Meteo forecast (with multi-model ensemble σ) per city, build a full probability distribution over integer temperature buckets, compare to live Polymarket CLOB prices, and size positions via fractional Kelly.
+2. **Lock-rule path** — every 30 seconds, re-check active binary markets for new routine METARs and fire deterministic trades when the daily max is mathematically locked above (or below) threshold.
+
+The resolution source for these markets is the Wunderground history page, which mirrors **routine** (non-SPECI) METARs. The bot reads METARs directly and typically sees the same data 1–2 hours before the UI updates — that's the edge both paths exploit.
 
 ## Quick Reference
 
@@ -24,39 +27,62 @@ python -m src.cli run
 
 # Backfill historical markets
 python -m src.cli backfill --days 30
+
+# Replay the probability pipeline against resolved markets
+python -m src.cli backtest-v2 --days 30
+
+# Dry simulation against historical snapshots (no orders)
+python -m src.cli paper-trade --days 30
+
+# Look up a market in the local DB (faster than Gamma search)
+python -m src.cli bet find --city Phoenix --date 2026-04-30
+
+# Backtest the lock-rule trader specifically
+python scripts/backtest_lock_rule.py --days 30
 ```
 
 ## Architecture
 
 ### Pipeline (critical path)
 
-The unified pipeline runs in `src/scheduler.py::job_unified_pipeline` every 5 min:
+The unified pipeline runs in `src/scheduler.py::job_unified_pipeline` every 5 min. A second loop, `job_fast_lock_poll`, runs every 30 s and re-fires the same lock-rule logic between unified ticks.
 
 ```
-circuit_breakers ─► get_active_weather_markets ─► group by ICAO
+circuit_breakers ─► get_active_weather_markets ─► group by ICAO (skip _EXCLUDED_ICAOS)
         │                                             │
         ▼                                             ▼
-  Phase 1 (concurrent, sem=8):                 Phase 2 (sequential):
-    aggregate_state(session, icao, lat, lon)     for each market in city:
-      ├─ fetch_metar_history(icao, 24h)            ├─ get_token_ids (Gamma)
-      ├─ fetch_forecast(lat, lon) (Open-Meteo)     ├─ get_best_bid_ask → live price
-      ├─ get_bias(session, icao)                   ├─ get_orderbook_depth
-      └─ returns WeatherState                      ├─ skip if price <= 0.05 or >= 0.95
-                                                   ├─ compute_distribution(state, buckets)
-                                                   ├─ compute_edges (or _binary_market_edge)
-                                                   ├─ size_position (fractional Kelly)
-                                                   └─ place_order
+  Phase 1 (concurrent, sem=8):                 Phase 2 (sequential, per market):
+    aggregate_state(session, icao, lat, lon)     ├─ skip future-day markets (_should_skip_future_day)
+      ├─ fetch_metar_history(icao, 24h)          ├─ get_token_ids (Gamma)
+      ├─ fetch_deterministic_forecast \\         ├─ get_best_bid_ask → live yes_price
+      │  +  fetch_ensemble_forecast    } gather  ├─ get_orderbook_depth
+      ├─ _blend_forecasts (det. central +        ├─ _try_lock_rule_trade ── if locked: size_locked_position,
+      │   ensemble σ at peak hour)               │   filter, place_order, dedup, continue
+      ├─ get_bias(session, icao)                 ├─ skip if price ≥ 0.99 or ≤ 0.01
+      ├─ check_and_record_daily_max_alert        ├─ compute_distribution(state, buckets)
+      └─ returns WeatherState                    ├─ _binary_market_edge / compute_edges
+                                                 ├─ size_position (fractional Kelly × dd_mult)
+                                                 └─ place_order
+
+  job_fast_lock_poll (30s):
+    fetch_latest_metars(active_icaos) ─► for each (icao, market):
+        evaluate_lock(_minimal_state, market) ─► _try_lock_rule_trade
 ```
+
+`_locked_markets_fired_today` and `_last_routine_seen` are in-process dicts cleared by `job_daily_settlement` so the next trading day starts fresh. A bias-runaway station (`|bias| > 3°C`) is skipped at Phase 1 grouping.
 
 ### Scheduler Jobs (`src/scheduler.py`)
 
 | Job | Schedule | Purpose |
 |-----|----------|---------|
 | `job_scan_markets` | Every 15 min | Fetch Polymarket weather markets via Gamma API, upsert `Market` + `MarketSnapshot` |
-| `job_unified_pipeline` | Every `UNIFIED_PIPELINE_INTERVAL_MINUTES` (5m default) | Aggregate per-city weather state, compute edges, place trades |
-| `job_daily_settlement` | 22:00 UTC | Resolve expired trades, record station bias, send daily summary, weekly calibration check |
+| `job_unified_pipeline` | Every `UNIFIED_PIPELINE_INTERVAL_MINUTES` (5m default) | Aggregate per-city weather state, evaluate lock + probability paths, place trades |
+| `job_fast_lock_poll` | Every `FAST_LOCK_POLL_INTERVAL_SECONDS` (30s default) | Bulk `fetch_latest_metars` for active binary-market ICAOs; fire EASY-direction lock trades on new routine METARs without waiting for the 5-min tick. Dedup via `_locked_markets_fired_today`, cleared at 22:00 UTC settlement. Disabled by `FAST_LOCK_POLL_ENABLED=false` or `LOCK_RULE_ENABLED=false`. |
+| `job_daily_settlement` | 22:00 UTC | Resolve expired trades, record station bias, send daily summary, weekly calibration check, reset fast-poll dedup |
 
 `job_startup` runs once on boot: starts Telegram alerter, loads drawdown state, runs an initial market scan.
+
+`job_fast_lock_poll` only fires the **EASY** lock direction (observed max already clears threshold + margin) — it builds a `_minimal_state_for_easy_lock` with no forecast, no solar/cloud, just `routine_history`. The **HARD** direction (no-more-heating: market-day max below threshold AND past-peak signal AND forecast peak < threshold) needs full forecast context and stays in `job_unified_pipeline`.
 
 ### Data sources
 
@@ -65,7 +91,7 @@ circuit_breakers ─► get_active_weather_markets ─► group by ICAO
 | Polymarket Gamma API | `src/ingestion/polymarket.py` | Active market list, parsed threshold/operator/location/date |
 | Polymarket CLOB | `src/execution/polymarket_client.py` | Live best bid/ask, orderbook depth, order placement |
 | Aviation METAR (6 providers) | `src/ingestion/aviation/` | Routine METAR history, daily max, trend, cycle detection |
-| Open-Meteo | `src/ingestion/openmeteo.py` | Hourly temp/cloud/solar/dewpoint forecast (no API key) |
+| Open-Meteo (deterministic + ensemble) | `src/ingestion/openmeteo.py` | Hourly temp/cloud/solar/dewpoint forecast (no API key). Two endpoints fetched concurrently per city: `fetch_deterministic_forecast` for the central peak/hourly arrays (used as the **bias reference frame**), `fetch_ensemble_forecast` (`ENSEMBLE_MODELS=ecmwf_ifs025,gfs_seamless,icon_seamless,gem_seamless`) for inter-model spread at peak hour. `_blend_forecasts` combines them. Either alone is acceptable as fallback; ensemble σ falls back to the hours-based schedule when fewer than `ENSEMBLE_MIN_MODELS=3` models return data. |
 | Weather.com v3 | `src/ingestion/wx.py` | Optional auxiliary station observations (`WX_API_KEY` gated) |
 
 Aviation providers fail over in order: AWC → IEM → OGIMET → NOAA → CheckWX/AVWX (API-key gated). See `src/ingestion/aviation/_aggregator.py`.
@@ -74,9 +100,10 @@ Aviation providers fail over in order: AWC → IEM → OGIMET → NOAA → Check
 
 Core: `Market`, `MarketSnapshot`, `Signal`, `Trade`, `BankrollLog`, `StationBias`
 Aviation: `MetarObservation`, `TafForecast`, `Pirep`, `SynopObservation`, `AviationAlert`
+Alerting: `ForecastExceedanceAlert` (every same-hour delta > 0.5°F, with `alerted` flag for Telegram-pushed rows)
 Auxiliary: `WxObservation`
 
-`Signal` has legacy `gfs_prob`/`ecmwf_prob`/`aviation_prob`/`wx_prob` columns — always NULL in the unified pipeline; kept for schema compatibility.
+`Signal` has legacy `gfs_prob`/`ecmwf_prob`/`aviation_prob`/`wx_prob` columns — always NULL in the unified pipeline; kept for schema compatibility (still read by `alerter._build_detail_message` for the inline-button "detail" view).
 
 ## Key Patterns
 
@@ -85,14 +112,70 @@ Auxiliary: `WxObservation`
 `compute_distribution(state, buckets)` produces a `BucketDistribution` with `probabilities: {bucket_f: prob}` summing to 1.0.
 
 Signal combination:
-1. **Baseline Gaussian** centered on `state.forecast_peak_f` (Open-Meteo peak + station bias).
-2. **Time-dependent sigma** from `hours_until_peak`: 1.0 past peak, 1.5 (≤2h), 2.5 (≤4h), 3.5 (>4h).
-3. **METAR trend shift**: if rising >0.5°F/hr before peak, center shifts +min(rate*0.5, 2°F). If declining past peak, center locks to observed max.
-4. **Solar/cloud cap**: if solar dropping >50% AND clouds rising >10% to >70%, hard cap upside at observed max. Strong solar decline alone → soft cap at max+1°F.
-5. **Dewpoint adjustment**: rising Td >1°F/hr tightens sigma; falling Td widens it.
-6. **Monotonicity constraint** (hard): `P(bucket < current_max_f) = 0`. If all mass gets zeroed, collapse to observed max bucket.
+
+1. **Baseline Gaussian** centered on `state.forecast_peak_f` (deterministic Open-Meteo peak + 30-day station bias).
+2. **σ from `_compute_sigma`**: ensemble spread when available (`state.forecast_sigma_f × ENSEMBLE_SPREAD_MULTIPLIER (1.3)`), clipped to `[ENSEMBLE_MIN_SIGMA_F=1.0, ENSEMBLE_MAX_SIGMA_F=5.0]` °F, with a soft floor at half the hours-based schedule. Hours-based fallback (`_hours_based_sigma`): 1.0 past peak, 1.5 (≤2h), 2.5 (≤4h), 3.5 (>4h) — used when fewer than `ENSEMBLE_MIN_MODELS=3` models returned data.
+3. **METAR trend shift** (three branches):
+   - *Pre-peak* (`hours_until_peak > 0`): shift by **residual rate** (`metar_trend_rate − forecast_slope_to_peak_f_per_hr`) when ≥0.5°F/hr — only the part of the obs slope the forecast didn't already account for. Falls back to the legacy raw-rate shift when forecast slope is unavailable. Capped at +2°F.
+   - *Past peak + declining* (`hours_until_peak ≤ 0` AND `rate ≤ 0`): lock center to observed max.
+   - *Past peak + still rising* (`hours_until_peak ≤ 0` AND `rate > POST_PEAK_MIN_TREND_F_PER_HR=0.5`): extrapolate `rate × hours × POST_PEAK_TREND_CARRY_K (0.75)`, capped at `POST_PEAK_MAX_SHIFT_F=3°F`, damped by `solar_decline_magnitude` and `cloud_rise_magnitude`. Reason: Open-Meteo's nominal peak is systematically too early in hot arid stations (OPKC/OMDB/Phoenix).
+4. **Solar/cloud cap** (`_apply_solar_cloud_cap`): combined `solar_declining` AND `cloud_rising` → hard cap at observed max. Strong solar decline alone (`solar_decline_magnitude > 0.7`) → soft cap at `observed_max + 1°F`.
+5. **Dewpoint adjustment**: rising Td >1°F/hr tightens sigma (max 0.5°F); falling Td <-1°F/hr widens it (max 0.3°F).
+6. **Monotonicity constraint** (hard): `P(bucket < current_max_f) = 0`. **Degenerate fallback**: when all mass is zeroed, collapse to the bucket closest to `current_max_f` with prob 1.0 (logged as "degenerate: all mass on Xº°F (no upside)").
 
 Every applied signal is appended to `distribution.reasoning` — the log tail you see in `[LTFM] binary ...` lines is this list.
+
+#### State aggregator (`src/signals/state_aggregator.py`)
+
+`aggregate_state` returns a `WeatherState` snapshot per city. Key fields beyond the obvious ones:
+
+- `metar_trend_rate` / `metar_trend_rate_short` — 6h and 2.5h linear regressions on routine METAR temps. Probability engine uses the 6h slope; `forecast_exceedance` uses the 2.5h slope (the 6h regression stays positive past the real peak on sharp-cooling afternoons).
+- `routine_history` — sorted `(observed_at_utc, temp_f)` tuples for last 24 h, used by `lock_rules._market_daily_max` to compute the per-market daily max anchored to `market.end_date`'s **station-local** day (matters for markets that close at e.g. 07:00 local time).
+- `latest_obs_temp_f`, `forecast_temp_now_f`, `forecast_slope_to_peak_f_per_hr`, `forecast_residual_f` — bias-adjusted residuals; trajectory comparison drives the residual-rate METAR trend signal.
+- `forecast_sigma_f`, `ensemble_model_count` — ensemble σ at peak hour (None when ensemble unavailable).
+- `has_forecast` — gates HARD-direction lock evaluation.
+- `_routine_daily_max` boundaries are **station-local day**, not UTC.
+- When Open-Meteo fails entirely, `WeatherState` is still returned: `forecast_peak_f = current_max_f`, `hours_until_peak = 0`, solar/cloud signals False, `forecast_sigma_f = None`. The probability engine degenerates to a narrow band around current max; lock rule's HARD direction is disabled.
+
+### Lock-rule trader (`src/signals/lock_rules.py`, `scheduler._try_lock_rule_trade`)
+
+Deterministic complement to the probability engine. Returns a `LockDecision(side, reasons, margin_f)` rather than a probability. Operators in scope: `above`, `at_least`, `below`, `at_most`. `exactly` and bracket markets are out of scope.
+
+Two directions:
+
+- **EASY** — market-day max ≥ threshold + `LOCK_MARGIN_F` (default 2.0°F). Mathematically locked because daily max is monotonic. Decides YES for `above`/`at_least`, NO for `below`/`at_most`. No forecast required.
+- **HARD** — market-day max < threshold − margin AND `_no_more_heating(state, threshold)`:
+  - `state.has_forecast` must be True;
+  - `forecast_peak_f < threshold`;
+  - past-peak signal: `solar_declining` OR `metar_trend_rate ≤ 0`.
+  Decides NO for `above`/`at_least`, YES for `below`/`at_most`.
+
+Per-market daily max comes from `_market_daily_max(state, market.end_date, now_utc)` — anchored to **`market.end_date`'s local day**, not the snapshot's local day. Source: `state.routine_history`. Routine count guard: `routine_count >= MIN_ROUTINE_COUNT`.
+
+`_try_lock_rule_trade` (in `scheduler.py`) is the executor used by both `job_unified_pipeline` (Phase 2, before the near-resolved skip) and `job_fast_lock_poll`. Flow:
+
+1. `evaluate_lock(state, market)` → if `side is None`, return `None` (caller falls through to probability).
+2. Compute `effective_price` = `yes_price` (YES side) or `1 - yes_price` (NO side); reject if outside `[LOCK_RULE_MIN_PRICE=0.05, LOCK_RULE_MAX_PRICE=0.95]`.
+3. Pull buy-side depth, run shared `_check_filters` (routine count, close buffer, depth) with stub edge/prob — no edge gate.
+4. Size via `size_locked_position` (`LOCK_POSITION_PCT=2%` of bankroll, capped at `MAX_POSITION_USD/2` and 15% of orderbook depth), apply drawdown multiplier, place FOK order.
+5. On execution, write `Signal(model_prob=1.0, market_prob=effective_price, edge=1-effective_price)` and `Trade(direction, stake_usd, entry_price=effective_price)`. Telegram 🔒 alert.
+
+Settings: `LOCK_RULE_ENABLED`, `LOCK_RULE_MIN_PRICE`, `LOCK_RULE_MAX_PRICE`, `LOCK_MARGIN_F`, `LOCK_POSITION_PCT`, `LOCK_RULE_LOSS_WINDOW_HOURS=72`, `LOCK_RULE_LOSS_DISABLE_COUNT=3`, plus the fast-poll knobs `FAST_LOCK_POLL_ENABLED`, `FAST_LOCK_POLL_INTERVAL_SECONDS`.
+
+### Forecast-exceedance alerts (`src/signals/forecast_exceedance.py`)
+
+Diagnostic + Polymarket-discovery layer that runs from `aggregate_state` every tick. Two outputs:
+
+1. **DB row** in `forecast_exceedance_alerts` for every routine METAR whose same-hour delta vs forecast exceeds `EXCEEDANCE_THRESHOLD_F=0.5°F`. This is calibration history — bucket by `alerted` to compare push rate vs reality.
+2. **Telegram 🌡 push** when *all* of:
+   - `_peak_passed(state)` is False (heuristics on `metar_trend_rate_short`, solar, hours_until_peak);
+   - `routine_count_today >= MIN_ROUTINE_COUNT_FOR_PUSH=3`;
+   - `_project_daily_max(state) - state.forecast_peak_f > DELTA_THRESHOLD_F=1.0°F`;
+   - station hasn't already pushed within `ALERT_COOLDOWN=30 min`.
+
+`_project_daily_max` blends a residual-carry projection with the forecast peak: pre-peak it adds `α·forecast_residual_f` (`α=exp(-h/2)`) plus a damped trend residual; post-peak with positive obs slope it extrapolates `POST_PEAK_TREND_CARRY_K=0.75 × rate × hours`. Capped at `forecast_peak + MAX_OVERSHOOT_F=5°F`; observed max is always a floor.
+
+Optional Polymarket-discovery line via `projected_market_lookup.lookup_projected_binary` — finds the active binary closest to the projected max and prints its operator/threshold/YES price. Tunables live as module-level constants in `forecast_exceedance.py` (no config plumbing); edit + restart.
 
 ### Edge calculator (`src/signals/edge_calculator.py`)
 
@@ -136,15 +219,28 @@ Per-ICAO rolling mean of `observed_daily_max_c - forecast_peak_c` over `STATION_
 5. Orderbook depth cap: `DEPTH_POSITION_CAP_PCT=20%` of visible depth
 6. Minimum viable trade: `MIN_TRADE_USD=5` (below returns 0)
 
-The drawdown monitor multiplier (`DrawdownMonitor.check`) is applied on top of the Kelly stake in the scheduler loop before the `MIN_STAKE_USD` check.
+The drawdown monitor multiplier (`DrawdownMonitor.check`) is applied on top of the Kelly stake in the scheduler loop before the `MIN_STAKE_USD` check. The lock-rule path (`size_locked_position`) uses fixed sizing instead of Kelly: `LOCK_POSITION_PCT=2%` of bankroll, capped at `MAX_POSITION_USD/2=$100` and 15% of depth — but the same `MAX_EXPOSURE_PCT`, `MIN_TRADE_USD`, and drawdown multiplier still apply.
+
+#### Drawdown state machine (`src/risk/drawdown.py`)
+
+Four states, not three. Multipliers in parentheses:
+
+| State | When | Multiplier |
+|---|---|---|
+| `NORMAL` (1.0) | `current_bankroll ≥ peak`, OR `dd_pct < CAUTION_THRESHOLD (10%)` while previously NORMAL |
+| `CAUTION` (0.5) | `dd_pct ≤ PAUSE_THRESHOLD (20%)` |
+| `PAUSED` (0.0) | `dd_pct > PAUSE_THRESHOLD` |
+| `RECOVERY` (0.5) | `dd_pct < CAUTION_THRESHOLD` AND previous level was CAUTION/PAUSED/RECOVERY — provides hysteresis so the bot doesn't snap back to full size on a single up-tick |
+
+Exit `RECOVERY` → `NORMAL` only when `current_bankroll >= peak`.
 
 ### Circuit breakers (`src/risk/circuit_breakers.py`)
 
-Checked once per unified pipeline tick, before any city is evaluated:
-- Daily loss stop: halt when today's P&L < `-DAILY_LOSS_STOP_USD` (-$200)
-- Consecutive loss stop: 3 LOST trades in a row → pause `CONSECUTIVE_LOSS_PAUSE_HOURS` (2h), state held in process memory (`_paused_until`)
+Checked once per unified pipeline tick *and* every fast-poll tick, before any city is evaluated:
+- Daily loss stop: halt when today's P&L < `-DAILY_LOSS_STOP_USD` (-$200).
+- Consecutive loss stop: `CONSECUTIVE_LOSS_PAUSE_COUNT` LOST trades in a row (default 3) → pause `CONSECUTIVE_LOSS_PAUSE_HOURS` (2h). `_paused_until` lives in process memory; consecutive losses are re-queried from the DB each check, so the pause re-engages on restart if the streak still holds.
 
-Per-city routine-count and bias-runaway checks live in the aggregator and edge filter, not here.
+Both counts are configurable via `settings`. Per-city routine-count and bias-runaway checks live in the aggregator and edge filter, not here. The fast-poll dedup state (`_locked_markets_fired_today`, `_last_routine_seen`) is also in-process and reset at 22:00 UTC settlement.
 
 ## How To: Common Tasks
 
@@ -152,8 +248,9 @@ Per-city routine-count and bias-runaway checks live in the aggregator and edge f
 
 1. Add `"city name": (lat, lon)` to `CITIES` in `src/signals/mapper.py`.
 2. Add `"city name": "ICAO"` to `CITY_ICAO`.
-3. If the city uses °C in its market title, make sure the regex in `src/ingestion/polymarket.py` captures it (°C/CELSIUS handled by `_market_unit` in `scheduler.py`).
-4. Seed `StationBias` if you have historical data — otherwise the default +1.0°C bias applies until enough settlements accumulate.
+3. Confirm the ICAO is **not** in `_EXCLUDED_ICAOS` in `src/scheduler.py` (currently `{"VHHH", "LLBG"}` for Hong Kong / Tel Aviv where Polymarket's resolution source diverges from the routine METAR feed). Removing an entry from that set requires verifying the actual resolver station first.
+4. If the city uses °C in its market title, make sure the regex in `src/ingestion/polymarket.py` captures it (°C/CELSIUS handled by `_market_unit` in `scheduler.py`).
+5. Seed `StationBias` if you have historical data — otherwise the default +1.0°C bias applies until enough settlements accumulate.
 
 ### Tune trade filters
 
@@ -162,6 +259,8 @@ Everything is in `src/config.py` (Pydantic `Settings`, overridable via `.env`):
 - `MIN_PROBABILITY`, `MIN_ENTRY_PRICE`, `MAX_ENTRY_PRICE`
 - `MIN_DEPTH_USD`, `MIN_ROUTINE_COUNT`, `MARKET_CLOSE_BUFFER_MINUTES`
 - Kelly caps: `KELLY_FRACTION`, `MAX_POSITION_PCT`, `MAX_POSITION_USD`, `DEPTH_POSITION_CAP_PCT`
+
+The lock-rule path has its **own** knob set (`LOCK_RULE_*`, `LOCK_MARGIN_F`, `LOCK_POSITION_PCT`, `FAST_LOCK_POLL_*`) — changing the directional `MIN_EDGE` etc. does not affect it. The ensemble σ knobs (`ENSEMBLE_*`) only affect Phase 1 σ in the probability engine.
 
 ### Change pipeline cadence
 
@@ -189,27 +288,35 @@ Signals live in `src/signals/probability_engine.py` as `_apply_*` helpers. Each 
 
 | File | Purpose | Key exports |
 |------|---------|-------------|
-| `src/scheduler.py` | APScheduler jobs + health server + binary/bracket edge helpers | `job_scan_markets`, `job_unified_pipeline`, `job_daily_settlement`, `run_scheduler` |
-| `src/signals/state_aggregator.py` | Per-ICAO weather state snapshot | `WeatherState`, `aggregate_state` |
+| `src/scheduler.py` | APScheduler jobs + health server + binary/bracket edge helpers + lock-rule executor | `job_scan_markets`, `job_unified_pipeline`, `job_fast_lock_poll`, `job_daily_settlement`, `_try_lock_rule_trade`, `_is_binary_market`, `_binary_market_edge`, `_should_skip_future_day`, `_EXCLUDED_ICAOS`, `run_scheduler` |
+| `src/signals/state_aggregator.py` | Per-ICAO weather state snapshot, deterministic + ensemble forecast blend | `WeatherState`, `aggregate_state`, `build_state_from_metars`, `_blend_forecasts` |
 | `src/signals/probability_engine.py` | Signal-based bucket distribution | `BucketDistribution`, `compute_distribution` |
 | `src/signals/edge_calculator.py` | Per-bucket edge + filter checks | `BucketEdge`, `compute_edges`, `_check_filters`, `MIN_EDGE` |
-| `src/signals/mapper.py` | Geocoding, ICAO lookup, operator/date/threshold normalisation | `CITIES`, `CITY_ICAO`, `icao_for_location`, `cities_for_icao`, `geocode`, `normalize_operator`, `convert_threshold` |
-| `src/signals/consensus.py` | Linear recalibration from resolved signals (weekly) | `get_calibration_coefficients`, `MIN_CALIBRATION_SAMPLES` |
+| `src/signals/lock_rules.py` | Deterministic physical-lock decisions | `LockDecision`, `evaluate_lock` |
+| `src/signals/forecast_exceedance.py` | "Daily max set to beat forecast" alerts + DB calibration history | `check_and_record_daily_max_alert`, `_project_daily_max` |
+| `src/signals/projected_market_lookup.py` | Find the active binary closest to a projected daily max | `lookup_projected_binary` |
+| `src/signals/mapper.py` | Geocoding, ICAO lookup, operator/date/threshold normalisation, station-local timezones | `CITIES`, `CITY_ICAO`, `icao_for_location`, `cities_for_icao`, `geocode`, `icao_timezone`, `unit_for_station`, `normalize_operator`, `convert_threshold`, `f_to_c` |
+| `src/signals/consensus.py` | Linear recalibration from resolved signals (weekly, not applied live) | `get_calibration_coefficients`, `MIN_CALIBRATION_SAMPLES` |
 | `src/signals/reverse_lookup.py` | Find markets by city/station/observation | `find_markets_for_city`, `find_markets_for_station`, `find_markets_for_observation`, `find_markets_for_event` |
-| `src/ingestion/polymarket.py` | Gamma API scanner + question parser | `scan_and_ingest`, `ingest_markets`, `get_active_weather_markets`, `parse_question`, `is_weather_market` |
-| `src/ingestion/openmeteo.py` | Hourly forecast + solar/cloud/dewpoint helpers | `OpenMeteoForecast`, `fetch_forecast`, `solar_declining`, `cloud_rising`, `dewpoint_trend` |
-| `src/ingestion/aviation/` | Multi-provider METAR/TAF/PIREP/SIGMET | `fetch_metar_history`, `fetch_latest_metars`, `get_routine_daily_max`, `detect_metar_cycle`, `get_temp_trend`, `taf_amendment_count`, `has_severe_weather_reports`, `alerts_affecting_location` |
-| `src/ingestion/station_bias.py` | Per-station forecast bias tracking | `get_bias`, `record_daily_outcome`, `is_bias_runaway` |
+| `src/ingestion/polymarket.py` | Gamma API scanner + question parser | `scan_and_ingest`, `ingest_markets`, `get_active_weather_markets`, `parse_question`, `is_weather_market`, `parse_temperature_brackets` |
+| `src/ingestion/openmeteo.py` | Deterministic + ensemble hourly forecast, solar/cloud/dewpoint helpers | `OpenMeteoForecast`, `fetch_deterministic_forecast`, `fetch_ensemble_forecast`, `solar_declining`, `cloud_rising`, `dewpoint_trend` |
+| `src/ingestion/aviation/` | Multi-provider METAR/TAF/PIREP/SIGMET | `fetch_metar_history`, `fetch_latest_metars`, `get_routine_daily_max`, `detect_metar_cycle`, `get_temp_trend`, `taf_amendment_count`, `has_severe_weather_reports`, `alerts_affecting_location`, `get_aviation_weather_picture` |
+| `src/ingestion/station_bias.py` | Per-station forecast bias tracking (anchored to deterministic peak) | `get_bias`, `record_daily_outcome`, `is_bias_runaway` |
 | `src/ingestion/wx.py` | Weather.com v3 observations (optional) | gated by `WX_API_KEY` |
 | `src/execution/polymarket_client.py` | CLOB client, orderbook, orders | `is_live`, `get_token_ids`, `place_order`, `check_order_status`, `cancel_order`, `get_best_bid_ask`, `get_orderbook_depth`, `get_daily_spend` |
-| `src/execution/alerter.py` | Telegram notification queue + inline buttons | `Alerter`, `get_alerter` |
-| `src/risk/kelly.py` | Fractional Kelly with cascading caps | `PositionSize`, `size_position` |
-| `src/risk/drawdown.py` | Drawdown state machine (NORMAL/CAUTION/PAUSED) | `DrawdownMonitor`, `DrawdownLevel` |
+| `src/execution/alerter.py` | Telegram notification queue + inline buttons (exec/skip/detail) + market-discovery alerts | `Alerter`, `AlertType`, `get_alerter`, `_escape_md2` |
+| `src/risk/kelly.py` | Fractional Kelly + lock-rule fixed sizing | `PositionSize`, `size_position`, `size_locked_position`, `MIN_TRADE_USD`, `MAX_EXPOSURE_PCT` |
+| `src/risk/drawdown.py` | Four-state drawdown machine with hysteresis | `DrawdownMonitor`, `DrawdownLevel` (`NORMAL`/`CAUTION`/`PAUSED`/`RECOVERY`) |
 | `src/risk/circuit_breakers.py` | Daily loss + consecutive loss halts | `check_circuit_breakers`, `CircuitBreakerState` |
+| `src/risk/simulate.py` | Paper-trade simulator | used by `cli paper-trade` |
 | `src/resolution.py` | Trade settlement, bankroll, exposure | `resolve_trades`, `get_current_bankroll`, `get_current_exposure`, `calculate_daily_pnl` |
-| `src/db/models.py` | SQLAlchemy ORM | `Market`, `Signal`, `Trade`, `StationBias`, `MetarObservation`, `TafForecast`, `Pirep`, `WxObservation`, `AviationAlert` |
+| `src/db/models.py` | SQLAlchemy ORM | `Market`, `Signal`, `Trade`, `StationBias`, `MetarObservation`, `TafForecast`, `Pirep`, `WxObservation`, `AviationAlert`, `ForecastExceedanceAlert` |
 | `src/config.py` | Pydantic settings | `settings` |
-| `src/cli.py` | CLI entry points | `scan`, `run`, `backfill`, bet helpers |
+| `src/cli.py` | CLI entry points | `run`, `scan`, `backfill`, `status`, `paper-trade`, `backtest-v2`, `migrate`, `approve`, `test-trade`, `bet {place,info,search,find,cancel,orders,portfolio,redeem}` |
+| `scripts/backtest_lock_rule.py` | Replay the lock-rule trader against resolved markets + DB METARs | standalone CLI |
+| `scripts/debug_pipeline.py` | Trace the unified pipeline for one market/station, no orders | standalone CLI |
+| `scripts/inspect_loss.py` | Post-mortem drilldown for a single losing trade | standalone CLI |
+| `scripts/backfill_station_bias_tz.py` | Idempotent recompute of station bias from DB METARs (timezone-correct windows) | one-shot |
 
 ## Live Execution
 
@@ -226,7 +333,8 @@ Orders are placed via `py-clob-client` in `src/execution/polymarket_client.py::p
 - `POLYMARKET_PRIVATE_KEY` empty → dry-run mode; `py_clob_client` never imported.
 - `DAILY_SPEND_CAP_USD=200` — hard 24h rolling cap, checked before every order.
 - `MIN_STAKE_USD=5` — orders below this skipped after drawdown multiplier.
-- `DrawdownMonitor` multiplies stake by a level-dependent factor (NORMAL=1.0, CAUTION<1.0, PAUSED=0).
+- `DrawdownMonitor` multiplies stake by a level-dependent factor (`NORMAL=1.0`, `CAUTION=0.5`, `PAUSED=0.0`, `RECOVERY=0.5`).
+- Lock-rule auto-disable: `LOCK_RULE_LOSS_DISABLE_COUNT=3` lock losses within `LOCK_RULE_LOSS_WINDOW_HOURS=72` flip the path off until manually re-enabled.
 
 **Going live:**
 1. Fund a Polygon wallet with USDC.
@@ -239,14 +347,21 @@ Orders are placed via `py-clob-client` in `src/execution/polymarket_client.py::p
 
 ## Gotchas
 
-- **Orderbook fetching is not disabled.** `job_unified_pipeline` calls `get_best_bid_ask` and `get_orderbook_depth` for every market with token IDs; 404s on resolved tokens produce the `Could not fetch orderbook for token X after 3 attempts` warning twice per market (once per call, since the failed fetch isn't cached). The subsequent skip comes from the `price <= 0.05 or price >= 0.95` check using the stale DB price.
+- **Near-resolved skip is 0.99 / 0.01**, not 0.95. Threshold was raised so the lock-rule path can evaluate prices in the 0.90–0.99 zone (where Wunderground UI hasn't yet caught up to a freshly-published METAR).
+- **Lock-rule fires before the near-resolved skip.** Phase 2 runs `_try_lock_rule_trade` first; only if it returns `None` does the probability path see the market. A lock that's "fired but rejected" (price out of `[0.05, 0.95]`, depth too thin, close-buffer breach) returns `0.0` and the market is skipped for the rest of this tick.
+- **Fast-poll dedup is in-process and aggressive.** `_locked_markets_fired_today` blocks a market for the rest of the day even if the lock got *filtered out* (depth, close buffer). By design — re-trying every 30 s wouldn't change the rejection cause. Cleared at 22:00 UTC settlement and on restart.
+- **Bias is recorded against the deterministic single-source peak**, not the ensemble blend (`job_daily_settlement` step 5). Reason: keep the bias reference frame stable when the ensemble model list changes. The pipeline still trades on the bias-adjusted ensemble peak.
+- **Hong Kong (VHHH) and Tel Aviv (LLBG) are silently skipped** even though they're in `CITIES`/`CITY_ICAO`. `_EXCLUDED_ICAOS` in `scheduler.py` filters them at the grouping step because their Polymarket resolution station diverges from the routine METAR feed we consume.
+- **`Signal.aviation_prob` is still read by the alerter** (inline-button "detail" view) — it's NULL for unified-pipeline signals, so the detail view shows a stale dash. Surprising but not a bug.
+- **Orderbook fetching is not disabled.** `job_unified_pipeline` calls `get_best_bid_ask` and `get_orderbook_depth` for every market with token IDs; 404s on resolved tokens produce the `Could not fetch orderbook for token X after 3 attempts` warning twice per market (once per call, since the failed fetch isn't cached). The subsequent skip comes from the `price >= 0.99 or price <= 0.01` check using the stale DB price.
 - `py_clob_client` and `eth_account` are imported **inside** functions in `polymarket_client.py`, not at module level, so the system runs in dry-run mode without those deps installed.
 - `_fetch_orderbook` caches only **successful** fetches for 30s. Failures are not negative-cached, so two back-to-back calls to a dead token retry 3×3×throttle delay.
-- `WeatherState` is produced **even if Open-Meteo fails** — in that case `forecast_peak_f = current_max_f`, `hours_until_peak = 0`, and solar/cloud signals are False. Distribution will degenerate to a narrow band around current max.
+- `WeatherState` is produced **even if Open-Meteo fails** — in that case `forecast_peak_f = current_max_f`, `hours_until_peak = 0`, solar/cloud signals are False, `forecast_sigma_f = None`, `has_forecast = False`. Probability distribution degenerates to a narrow band around current max; lock rule's HARD direction is disabled.
 - Dewpoint trend in `state_aggregator.py` uses recent METARs (6h window), not Open-Meteo. `openmeteo.dewpoint_trend` exists but isn't wired into the pipeline.
-- `consensus.py` is a vestigial filename — it no longer blends multi-model forecasts; it only fits linear calibration coefficients (`slope*predicted + intercept`) from resolved signals, logged on Sundays. Not applied to live probabilities.
+- `consensus.py` is a vestigial filename — it no longer blends multi-model forecasts; it only fits linear calibration coefficients (`slope*predicted + intercept`) from resolved signals, logged on Sundays. **Not applied to live probabilities.**
 - `MIN_EDGE` is defined twice: `edge_calculator.MIN_EDGE = 0.05` (used by the unified pipeline) and `settings.MIN_EDGE = 0.10` (unused today; legacy).
 - `gfs.py`/`ecmwf.py`/`detector.py`/old `mapper.py` signal-generation paths are gone. The `Signal.gfs_prob`/`ecmwf_prob` columns remain in the schema but are always NULL.
+- **Backtest harnesses exist as standalone scripts**, not as a module in the pipeline: `python -m src.cli backtest-v2` (probability path) and `python scripts/backtest_lock_rule.py` (lock path). Earlier docs claimed there was no backtest — that's stale.
 - Token IDs are refetched from Gamma per order and per price call. High-frequency trading would benefit from caching on the `Market` row, but current 5-min cadence makes it a non-issue.
 - FOK orders fully fill or cancel — no partial fills; thin books leave trades in `PENDING`.
 - Aviation has its own rate-limit semaphores per provider (`_RATE_LIMIT_RPS` constants) independent of the pipeline semaphore (`_UNIFIED_CONCURRENCY=8`).
