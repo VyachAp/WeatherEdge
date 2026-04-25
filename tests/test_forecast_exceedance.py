@@ -520,6 +520,14 @@ class _FakeSession:
 
 
 class TestCheckAndRecordDailyMaxAlert:
+    @pytest.fixture(autouse=True)
+    def _stub_polymarket_lookup(self):
+        with patch(
+            "src.signals.forecast_exceedance.lookup_projected_binary",
+            new=AsyncMock(return_value=None),
+        ):
+            yield
+
     @pytest.mark.asyncio
     async def test_pushes_when_projection_beats_forecast(self):
         observed_at = datetime(2026, 4, 22, 18, 53, tzinfo=timezone.utc)
@@ -768,7 +776,7 @@ class TestCheckAndRecordDailyMaxAlert:
         alerter._enqueue.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_cooldown_suppresses_second_push_within_60min(self):
+    async def test_cooldown_suppresses_second_push_within_window(self):
         # Same push-happy scenario as test_pushes_when_projection_beats_forecast,
         # but the cooldown query returns a recent alerted row. Expectation: DB
         # row still written (alerted=False), but no Telegram enqueue.

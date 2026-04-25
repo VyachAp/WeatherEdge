@@ -168,14 +168,13 @@ class TestFetchForecast:
 class TestFetchForecastEnsemble:
     @pytest.mark.asyncio
     async def test_parses_multi_model(self):
-        """5 models with spread → peak_temp_std_c > 0, model_count == 5."""
+        """4 models with spread → peak_temp_std_c > 0, model_count == 4."""
         base = [20.0 + i for i in range(24)]
         body = _build_ensemble_response({
-            "ecmwf_ifs04":           [t + 0.0 for t in base],
-            "gfs_seamless":          [t + 0.5 for t in base],
-            "icon_seamless":         [t - 0.5 for t in base],
-            "gem_seamless":          [t + 1.0 for t in base],
-            "meteofrance_seamless":  [t - 0.3 for t in base],
+            "ecmwf_ifs025":  [t + 0.0 for t in base],
+            "gfs_seamless":  [t + 0.5 for t in base],
+            "icon_seamless": [t - 0.5 for t in base],
+            "gem_seamless":  [t + 1.0 for t in base],
         })
 
         with patch("src.ingestion.openmeteo.httpx.AsyncClient") as mock_client_cls:
@@ -183,18 +182,18 @@ class TestFetchForecastEnsemble:
             result = await fetch_forecast(40.0, -74.0)
 
         assert result is not None
-        assert result.model_count == 5
+        assert result.model_count == 4
         assert result.peak_temp_std_c > 0.3       # non-trivial spread
         assert result.peak_temp_std_c < 1.0       # and not absurd
-        # Hourly mean = average of offsets 0, 0.5, -0.5, 1.0, -0.3 = 0.14
-        assert result.peak_temp_c == pytest.approx(base[-1] + 0.14, abs=0.01)
+        # Median of offsets [-0.5, 0.0, 0.5, 1.0] = 0.25 (mean of two middle vals).
+        assert result.peak_temp_c == pytest.approx(base[-1] + 0.25, abs=0.01)
         assert len(result.hourly_temps_std_c) == 24
 
     @pytest.mark.asyncio
     async def test_falls_back_when_insufficient_models(self):
         """Only 2 models in response → deterministic fallback kicks in."""
         ensemble_body = _build_ensemble_response({
-            "ecmwf_ifs04": [20.0 + i for i in range(24)],
+            "ecmwf_ifs025": [20.0 + i for i in range(24)],
             "gfs_seamless": [20.0 + i for i in range(24)],
         })
         deterministic_body = {
@@ -225,13 +224,13 @@ class TestFetchForecastEnsemble:
         """Wider inter-model spread → larger peak_temp_std_c."""
         base = [20.0 + i for i in range(24)]
         tight = _build_ensemble_response({
-            "ecmwf_ifs04":  base,
-            "gfs_seamless": base,
+            "ecmwf_ifs025":  base,
+            "gfs_seamless":  base,
             "icon_seamless": [t + 0.1 for t in base],
             "gem_seamless":  [t - 0.1 for t in base],
         })
         wide = _build_ensemble_response({
-            "ecmwf_ifs04":   base,
+            "ecmwf_ifs025":  base,
             "gfs_seamless":  [t + 3.0 for t in base],
             "icon_seamless": [t - 2.5 for t in base],
             "gem_seamless":  [t + 1.5 for t in base],
@@ -249,22 +248,21 @@ class TestFetchForecastEnsemble:
 
     @pytest.mark.asyncio
     async def test_handles_null_values(self):
-        """Null entries for some hours should be dropped from mean/std."""
+        """Null entries for some hours should be dropped from median/std."""
         base = [20.0 + i for i in range(24)]
         body = _build_ensemble_response({
-            "ecmwf_ifs04":           base,
-            "gfs_seamless":          [None] * 24,       # offline
-            "icon_seamless":         [t - 0.5 for t in base],
-            "gem_seamless":          [None if i < 6 else t + 0.5
-                                      for i, t in enumerate(base)],
-            "meteofrance_seamless":  [t - 0.3 for t in base],
+            "ecmwf_ifs025":  base,
+            "gfs_seamless":  [None] * 24,       # offline
+            "icon_seamless": [t - 0.5 for t in base],
+            "gem_seamless":  [None if i < 6 else t + 0.5
+                              for i, t in enumerate(base)],
         })
 
         with patch("src.ingestion.openmeteo.httpx.AsyncClient") as mock_client_cls:
             mock_client_cls.return_value = _mock_async_client([body])
             result = await fetch_forecast(40.0, -74.0)
 
-        # gfs is null throughout so it's dropped entirely; remaining 4 models.
+        # gfs is null throughout so it's dropped entirely; remaining 3 models.
         assert result is not None
-        assert result.model_count == 4
+        assert result.model_count == 3
         assert result.peak_temp_std_c > 0

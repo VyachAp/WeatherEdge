@@ -40,6 +40,7 @@ from src.db.models import ForecastExceedanceAlert
 from src.execution.alerter import _escape_md2, get_alerter
 from src.ingestion.openmeteo import OpenMeteoForecast
 from src.signals.mapper import f_to_c, unit_for_station
+from src.signals.projected_market_lookup import lookup_projected_binary
 
 if TYPE_CHECKING:
     from src.signals.state_aggregator import WeatherState
@@ -54,7 +55,7 @@ PEAK_TOLERANCE_F = 0.5        # current_max within this of forecast_peak = "reac
 EXTRAPOLATION_HALFLIFE_H = 2.0  # α = exp(-h/halflife); trust extrapolation near peak
 MAX_OVERSHOOT_F = 5.0           # ≈ 2.8°C plausibility ceiling vs forecast_peak
 DEWPOINT_NUDGE_F = 0.5
-ALERT_COOLDOWN = timedelta(minutes=60)  # one Telegram push per station per hour
+ALERT_COOLDOWN = timedelta(minutes=30)  # one Telegram push per station per 30 min
 # Residual-carry tunables — how much of the observed-vs-forecast gap to carry
 # forward to the forecast peak. Halflife controls how quickly the level
 # residual fades toward zero with distance to peak; K is the fraction of a
@@ -241,9 +242,9 @@ async def check_and_record_daily_max_alert(
         and projection_delta_f > DELTA_THRESHOLD_F
     )
 
-    # Cooldown: at most one Telegram push per station per hour. The DB row is
-    # still written (alerted=False) so calibration history and this query
-    # continue to reflect reality on the next tick.
+    # Cooldown: at most one Telegram push per station per ALERT_COOLDOWN
+    # window. The DB row is still written (alerted=False) so calibration
+    # history and this query continue to reflect reality on the next tick.
     if push:
         async with async_session() as cooldown_session:
             recent = await cooldown_session.execute(
@@ -326,7 +327,36 @@ async def check_and_record_daily_max_alert(
         f"Projected: {e(f'{projected:.1f}')}{unit} "
         f"\\({e(f'{proj_delta:+.1f}')}{unit} vs forecast\\)"
     )
+
+    pm_line = await _format_polymarket_line(icao, projected_max_f, unit)
+    if pm_line:
+        text += f"\n{pm_line}"
+
     try:
         await get_alerter()._enqueue(text)
     except Exception:
         logger.warning("daily-max alert enqueue failed for %s", icao, exc_info=True)
+
+
+_OP_SYMBOL = {
+    "above": "≥", "at_least": "≥", "exceed": "≥",
+    "below": "≤", "at_most": "≤",
+}
+
+
+async def _format_polymarket_line(
+    icao: str, projected_max_f: float, unit: str,
+) -> str | None:
+    """Return a MarkdownV2-escaped 'Polymarket: ...' line, or None."""
+    result = await lookup_projected_binary(icao, projected_max_f)
+    if result is None:
+        return None
+    _, threshold_f, operator, yes_price = result
+
+    threshold_disp = f_to_c(threshold_f) if unit == "°C" else threshold_f
+    op_symbol = _OP_SYMBOL.get(operator, operator)
+    e = _escape_md2
+    return (
+        f"Polymarket: {e(op_symbol)}{e(f'{threshold_disp:.0f}')}{unit} today "
+        f"@ {e(f'{yes_price:.2f}')} \\(closest to projected\\)"
+    )

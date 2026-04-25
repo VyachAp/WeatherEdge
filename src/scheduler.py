@@ -749,7 +749,7 @@ async def job_daily_settlement() -> None:
             try:
                 from src.ingestion.station_bias import record_daily_outcome
                 from src.ingestion.aviation import get_routine_daily_max
-                from src.ingestion.openmeteo import fetch_forecast
+                from src.ingestion.openmeteo import fetch_deterministic_forecast
                 from src.signals.mapper import icao_for_location, geocode, CITY_ICAO
 
                 # Only markets that resolved in the last ~36h. Settlement runs
@@ -789,7 +789,14 @@ async def job_daily_settlement() -> None:
                     if not coords:
                         continue
 
-                    forecast = await fetch_forecast(coords[0], coords[1])
+                    # Bias is anchored to the deterministic single-source
+                    # peak — not the aggregated ensemble — so the recorded
+                    # offset stays stable when the ensemble model list or
+                    # aggregation function changes (e.g. swapping mean→median,
+                    # adding/removing a model). The pipeline still trades on
+                    # the bias-corrected ensemble peak; this just keeps the
+                    # correction reference frame fixed.
+                    forecast = await fetch_deterministic_forecast(coords[0], coords[1])
                     if forecast is None:
                         continue
 

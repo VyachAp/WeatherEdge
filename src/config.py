@@ -99,8 +99,12 @@ class Settings(BaseSettings):
     # Multi-model ensemble (Open-Meteo models= param). Spread across these
     # models drives the probability-engine sigma instead of the hardcoded
     # hours-based schedule.
+    # `ecmwf_ifs04` returns no data on Open-Meteo's current /v1/forecast — use
+    # `ecmwf_ifs025`. `meteofrance_seamless` is a Europe-domain regional model
+    # and returns severely cold-biased peaks outside Europe (e.g. -8°C vs ECMWF
+    # at OPKC/OMDB), so it's excluded by default.
     ENSEMBLE_MODELS: str = (
-        "ecmwf_ifs04,gfs_seamless,icon_seamless,gem_seamless,meteofrance_seamless"
+        "ecmwf_ifs025,gfs_seamless,icon_seamless,gem_seamless"
     )
     # Inflate raw inter-model spread — NWP ensembles are under-dispersive vs
     # actual forecast error, ~20-30% for surface T.

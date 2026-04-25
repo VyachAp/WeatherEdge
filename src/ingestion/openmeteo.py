@@ -3,11 +3,14 @@
 Fetches hourly temperature, dewpoint, cloud cover, solar radiation, and wind
 from the Open-Meteo API. No API key required.
 
-Default mode is multi-model ensemble (ECMWF, GFS, ICON, GEM, MeteoFrance):
-the arithmetic mean across models drives the central forecast, and the
-standard deviation at peak hour (``peak_temp_std_c``) quantifies synoptic
-uncertainty. Falls back to the deterministic single-source endpoint when
-fewer than ``ENSEMBLE_MIN_MODELS`` return usable peak-hour data.
+Default mode is multi-model ensemble (ECMWF, GFS, ICON, GEM):
+the median across models drives the central forecast, and the standard
+deviation at peak hour (``peak_temp_std_c``) quantifies synoptic
+uncertainty. Median (not mean) so a single regional model running outside
+its valid domain — historically MeteoFrance ARPEGE returning ~-8°C of bias
+in the Middle East / South Asia — can't drag the central forecast off.
+Falls back to the deterministic single-source endpoint when fewer than
+``ENSEMBLE_MIN_MODELS`` return usable peak-hour data.
 """
 
 from __future__ import annotations
@@ -38,9 +41,10 @@ HOURLY_PARAMS = ",".join(HOURLY_VARS)
 class OpenMeteoForecast:
     """Parsed hourly forecast for a single day.
 
-    When ``model_count > 1`` the hourly arrays carry the cross-model mean and
-    ``peak_temp_std_c`` / ``hourly_temps_std_c`` expose the spread. When the
-    deterministic fallback ran, ``model_count == 1`` and std fields are 0 / [].
+    When ``model_count > 1`` the hourly arrays carry the cross-model median
+    and ``peak_temp_std_c`` / ``hourly_temps_std_c`` expose the spread. When
+    the deterministic fallback ran, ``model_count == 1`` and std fields are
+    0 / [].
     """
 
     peak_temp_c: float
@@ -66,13 +70,21 @@ async def fetch_forecast(lat: float, lon: float) -> OpenMeteoForecast | None:
     endpoint when fewer than ``settings.ENSEMBLE_MIN_MODELS`` models returned
     data (or on ensemble-fetch failure). Returns None only if both paths fail.
     """
-    ensemble = await _fetch_ensemble(lat, lon)
+    ensemble = await fetch_ensemble_forecast(lat, lon)
     if ensemble is not None:
         return ensemble
-    return await _fetch_deterministic(lat, lon)
+    return await fetch_deterministic_forecast(lat, lon)
 
 
-async def _fetch_ensemble(lat: float, lon: float) -> OpenMeteoForecast | None:
+async def fetch_ensemble_forecast(lat: float, lon: float) -> OpenMeteoForecast | None:
+    """Multi-model ensemble forecast (median across configured models).
+
+    Returns None if fewer than ``ENSEMBLE_MIN_MODELS`` models came back with
+    data, leaving the caller to decide on a fallback. The pipeline uses this
+    purely as a spread source — ``peak_temp_std_c`` / ``hourly_temps_std_c``
+    feed the probability engine's σ; central tendency comes from the
+    deterministic forecast so the bias-correction frame stays stable.
+    """
     models = [m.strip() for m in settings.ENSEMBLE_MODELS.split(",") if m.strip()]
     if not models:
         return None
@@ -144,7 +156,7 @@ def _parse_ensemble_response(
     # Determine hourly length from the first model; skip hours where no model
     # reports (shouldn't happen for 24h UTC day, but defensive).
     n_hours = max(len(v) for v in per_model_temps.values())
-    mean_temps: list[float] = []
+    median_temps: list[float] = []
     std_temps: list[float] = []
     for h in range(n_hours):
         vals = [
@@ -153,15 +165,15 @@ def _parse_ensemble_response(
             if h < len(temps) and temps[h] is not None
         ]
         if not vals:
-            # Hole in data; carry forward last mean or use 0 — but flag.
-            mean_temps.append(mean_temps[-1] if mean_temps else 0.0)
+            # Hole in data; carry forward last median or use 0 — but flag.
+            median_temps.append(median_temps[-1] if median_temps else 0.0)
             std_temps.append(0.0)
             continue
-        mean_temps.append(statistics.fmean(vals))
+        median_temps.append(statistics.median(vals))
         std_temps.append(statistics.pstdev(vals) if len(vals) > 1 else 0.0)
 
-    peak_temp = max(mean_temps)
-    peak_hour = mean_temps.index(peak_temp)
+    peak_temp = max(median_temps)
+    peak_hour = median_temps.index(peak_temp)
     # Std at peak hour across models that have data at that exact hour.
     peak_hour_vals = [
         temps[peak_hour]
@@ -172,8 +184,8 @@ def _parse_ensemble_response(
         statistics.pstdev(peak_hour_vals) if len(peak_hour_vals) > 1 else 0.0
     )
 
-    # Hourly means for auxiliary variables — one per model column, null-safe.
-    def _mean_across_models(var: str, cast: type) -> list:
+    # Hourly medians for auxiliary variables — one per model column, null-safe.
+    def _median_across_models(var: str, cast: type) -> list:
         series: list[list[float | None]] = []
         for m in per_model_temps.keys():
             col = hourly.get(f"{var}_{m}")
@@ -191,35 +203,42 @@ def _parse_ensemble_response(
             if not vals:
                 out.append(cast(0))
                 continue
-            out.append(cast(statistics.fmean(vals)))
+            out.append(cast(statistics.median(vals)))
         return out
 
-    dewpoints = _mean_across_models("dewpoint_2m", float)
-    clouds = _mean_across_models("cloudcover", int)
-    solar = _mean_across_models("shortwave_radiation", float)
-    winds = _mean_across_models("windspeed_10m", float)
+    dewpoints = _median_across_models("dewpoint_2m", float)
+    clouds = _median_across_models("cloudcover", int)
+    solar = _median_across_models("shortwave_radiation", float)
+    winds = _median_across_models("windspeed_10m", float)
 
     logger.info(
-        "Open-Meteo ensemble: %d models, peak=%.1f°C ± %.2f°C at hour %d",
+        "Open-Meteo ensemble: %d models, median peak=%.1f°C ± %.2f°C at hour %d",
         len(per_model_temps), peak_temp, peak_std, peak_hour,
     )
 
     return OpenMeteoForecast(
         peak_temp_c=peak_temp,
         peak_hour_utc=peak_hour,
-        hourly_temps_c=mean_temps,
+        hourly_temps_c=median_temps,
         hourly_cloud_cover=clouds,
         hourly_solar_radiation=solar,
         hourly_dewpoint_c=dewpoints,
         hourly_wind_speed=winds,
-        hourly_temps_std_c=std_temps,
+        hourly_temps_std_c=std_temps,  # std around median (peak hour included)
         peak_temp_std_c=peak_std,
         model_count=len(per_model_temps),
     )
 
 
-async def _fetch_deterministic(lat: float, lon: float) -> OpenMeteoForecast | None:
-    """Single-source fallback (no ``models=`` param)."""
+async def fetch_deterministic_forecast(lat: float, lon: float) -> OpenMeteoForecast | None:
+    """Single-source forecast (no ``models=`` param).
+
+    Used both as the in-process fallback for ``fetch_forecast`` when the
+    ensemble can't muster ``ENSEMBLE_MIN_MODELS`` and as the bias-recording
+    reference at settlement time — pinning bias measurement to a stable
+    forecast definition that doesn't shift when the ensemble model list or
+    aggregation function changes.
+    """
     params = {
         "latitude": lat,
         "longitude": lon,

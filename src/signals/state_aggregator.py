@@ -321,19 +321,36 @@ async def aggregate_state(
 
     Returns None if insufficient data (no routine METARs available).
 
-    Performance: fetches METAR history and Open-Meteo forecast concurrently.
-    METAR history is fetched once (24h) and reused for daily max, trend, and
-    cycle detection — no redundant AWC calls.
+    Performance: fetches METAR history, deterministic Open-Meteo, and
+    ensemble Open-Meteo concurrently. METAR history is fetched once (24h)
+    and reused for daily max, trend, and cycle detection — no redundant
+    AWC calls.
+
+    Forecast composition: deterministic single-source provides the central
+    forecast (peak, hourly arrays) — same reference frame as
+    ``record_daily_outcome``, so the stored bias_c applies cleanly. The
+    ensemble contributes the spread-at-peak-hour for σ. When the ensemble
+    fails, σ falls back to the hours-based schedule in the probability
+    engine; when deterministic fails, ensemble is used alone (lossy bias
+    frame, but better than no forecast).
     """
-    from src.ingestion.openmeteo import fetch_forecast
+    from src.ingestion.openmeteo import (
+        fetch_deterministic_forecast,
+        fetch_ensemble_forecast,
+    )
     from src.ingestion.station_bias import get_bias
 
     metar_task = _safe_fetch_metar(icao)
-    forecast_task = fetch_forecast(lat, lon)
-    history, forecast = await asyncio.gather(metar_task, forecast_task)
+    deterministic_task = fetch_deterministic_forecast(lat, lon)
+    ensemble_task = fetch_ensemble_forecast(lat, lon)
+    history, deterministic, ensemble = await asyncio.gather(
+        metar_task, deterministic_task, ensemble_task,
+    )
 
     if history is None:
         return None
+
+    forecast = _blend_forecasts(deterministic, ensemble)
 
     if forecast is not None:
         try:
@@ -382,3 +399,42 @@ async def _safe_fetch_metar(icao: str) -> list[dict[str, Any]] | None:
     except Exception:
         logger.warning("METAR history fetch failed for %s", icao, exc_info=True)
         return None
+
+
+def _blend_forecasts(deterministic: Any, ensemble: Any) -> Any:
+    """Combine deterministic central forecast with ensemble spread.
+
+    Returns an ``OpenMeteoForecast`` whose temperatures, hourly arrays, and
+    peak hour come from the deterministic single-source response, while
+    ``peak_temp_std_c`` / ``hourly_temps_std_c`` / ``model_count`` come from
+    the ensemble. ``peak_temp_std_c`` is read from the ensemble's hourly
+    spread *at the deterministic peak hour* — disagreement at the time we
+    expect the peak, which is what the σ estimate should reflect.
+
+    Falls back to whichever forecast is available when one fetch failed.
+    """
+    from src.ingestion.openmeteo import OpenMeteoForecast
+
+    if deterministic is None:
+        return ensemble  # No central — ensemble alone (bias frame mismatch noted in caller).
+    if ensemble is None or not ensemble.hourly_temps_std_c:
+        return deterministic  # No spread — sigma will fall back to hours-based.
+
+    peak_hour = deterministic.peak_hour_utc
+    if 0 <= peak_hour < len(ensemble.hourly_temps_std_c):
+        peak_std = ensemble.hourly_temps_std_c[peak_hour]
+    else:
+        peak_std = ensemble.peak_temp_std_c
+
+    return OpenMeteoForecast(
+        peak_temp_c=deterministic.peak_temp_c,
+        peak_hour_utc=deterministic.peak_hour_utc,
+        hourly_temps_c=deterministic.hourly_temps_c,
+        hourly_cloud_cover=deterministic.hourly_cloud_cover,
+        hourly_solar_radiation=deterministic.hourly_solar_radiation,
+        hourly_dewpoint_c=deterministic.hourly_dewpoint_c,
+        hourly_wind_speed=deterministic.hourly_wind_speed,
+        hourly_temps_std_c=ensemble.hourly_temps_std_c,
+        peak_temp_std_c=peak_std,
+        model_count=ensemble.model_count,
+    )
