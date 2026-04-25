@@ -3,6 +3,13 @@
 Used by the forecast-exceedance Telegram alert to enrich the message with the
 live YES price for the binary "≥X°F today" market whose threshold is closest
 to the projected daily max.
+
+Only operator-aligned markets are returned: for ``above``/``at_least``/``exceed``
+operators the threshold must sit at or below the projection (so YES would
+resolve TRUE under our model); for ``below``/``at_most`` it must sit at or
+above. Markets whose threshold is farther than ``MAX_THRESHOLD_DISTANCE_F``
+(≈2°C) from the projection are also dropped — at that distance the alert
+isn't actionable and the line just adds noise.
 """
 
 from __future__ import annotations
@@ -17,7 +24,25 @@ from src.signals.reverse_lookup import find_markets_for_station
 
 logger = logging.getLogger(__name__)
 
-_BINARY_OPS = {"above", "at_least", "exceed", "below", "at_most"}
+_ABOVE_OPS = {"above", "at_least", "exceed"}
+_BELOW_OPS = {"below", "at_most"}
+_BINARY_OPS = _ABOVE_OPS | _BELOW_OPS
+
+MAX_THRESHOLD_DISTANCE_F = 3.6  # ≈2°C plausibility band around the projection
+
+
+def _is_operator_aligned(operator: str, threshold_f: float, projected_f: float) -> bool:
+    """True when buying YES on this market is consistent with our projection.
+
+    For ``above``/``at_least``/``exceed``: projection must reach or exceed the
+    threshold (YES resolves TRUE). For ``below``/``at_most``: projection must
+    sit at or below the threshold.
+    """
+    if operator in _ABOVE_OPS:
+        return projected_f >= threshold_f
+    if operator in _BELOW_OPS:
+        return projected_f <= threshold_f
+    return False
 
 
 async def lookup_projected_binary(
@@ -25,12 +50,14 @@ async def lookup_projected_binary(
     projected_max_f: float,
 ) -> tuple[Market, float, str, float] | None:
     """Return (market, threshold_f, operator, yes_price) for the binary market
-    resolving today at *icao* whose threshold is closest to *projected_max_f*.
+    resolving today at *icao* whose threshold is closest to *projected_max_f*
+    *and* whose operator direction is consistent with that projection.
 
     *yes_price* is the live best ask from the CLOB orderbook (the price you'd
     pay to buy YES). Falls back to ``market.current_yes_price`` if the CLOB
-    call fails. Returns None when no qualifying market exists or the lookup
-    raises — the alert is sent without a Polymarket line in that case.
+    call fails. Returns None when no operator-aligned market sits within
+    ``MAX_THRESHOLD_DISTANCE_F`` of the projection or the lookup raises —
+    the alert is sent without a Polymarket line in that case.
     """
     try:
         async with async_session() as session:
@@ -39,13 +66,21 @@ async def lookup_projected_binary(
             )
 
             today = datetime.now(timezone.utc).date()
-            candidates: list[Market] = [
-                m for m in markets
-                if m.parsed_threshold is not None
-                and (m.parsed_operator or "").lower() in _BINARY_OPS
-                and m.end_date is not None
-                and m.end_date.date() == today
-            ]
+            candidates: list[Market] = []
+            for m in markets:
+                if m.parsed_threshold is None or m.end_date is None:
+                    continue
+                if m.end_date.date() != today:
+                    continue
+                operator = (m.parsed_operator or "").lower()
+                if operator not in _BINARY_OPS:
+                    continue
+                threshold = float(m.parsed_threshold)
+                if not _is_operator_aligned(operator, threshold, projected_max_f):
+                    continue
+                if abs(threshold - projected_max_f) > MAX_THRESHOLD_DISTANCE_F:
+                    continue
+                candidates.append(m)
             if not candidates:
                 return None
 

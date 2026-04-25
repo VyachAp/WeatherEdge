@@ -304,15 +304,18 @@ async def check_and_record_daily_max_alert(
 
     e = _escape_md2
     unit = unit_for_station(icao)
+    # Display the same trend the projection actually used (short-window when
+    # available, 6h regression as fallback) — see _effective_trend.
+    effective_trend_f_per_hr = _effective_trend(state)
     if unit == "°C":
         obs_max = f_to_c(state.current_max_f)
-        trend = state.metar_trend_rate * 5.0 / 9.0
+        trend = effective_trend_f_per_hr * 5.0 / 9.0
         forecast_peak = f_to_c(state.forecast_peak_f)
         projected = f_to_c(projected_max_f)
         proj_delta = projection_delta_f * 5.0 / 9.0
     else:
         obs_max = state.current_max_f
-        trend = state.metar_trend_rate
+        trend = effective_trend_f_per_hr
         forecast_peak = state.forecast_peak_f
         projected = projected_max_f
         proj_delta = projection_delta_f

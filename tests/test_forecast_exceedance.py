@@ -611,6 +611,36 @@ class TestCheckAndRecordDailyMaxAlert:
         assert "+1.0°C/hr" in unescaped
 
     @pytest.mark.asyncio
+    async def test_alert_displays_short_window_trend_when_present(self):
+        # 6h trend +5°F/hr but short-window trend +3°F/hr (curve already bending
+        # toward peak). The projection uses the short trend (_effective_trend),
+        # and the rendered alert text must report the same number — otherwise
+        # the user reads a slope that doesn't match the projection math.
+        observed_at = datetime(2026, 4, 22, 18, 53, tzinfo=timezone.utc)
+        history = [_metar(observed_at, 78.5)]
+        forecast = _make_forecast([24.0] * 24)
+        state = _state(
+            current_max_f=78.5,
+            metar_trend_rate=5.0,
+            metar_trend_rate_short=3.0,
+            forecast_peak_f=79.0, hours_until_peak=1.5,
+            routine_count_today=4,
+        )
+
+        fake_session = _FakeSession(existing_id=None)
+        alerter = MagicMock()
+        alerter._enqueue = AsyncMock()
+
+        with patch("src.signals.forecast_exceedance.async_session", return_value=fake_session), \
+             patch("src.signals.forecast_exceedance.get_alerter", return_value=alerter):
+            await check_and_record_daily_max_alert("KLAX", state, history, forecast)
+
+        alerter._enqueue.assert_awaited_once()
+        sent = alerter._enqueue.await_args.args[0].replace("\\", "")
+        assert "+3.0°F/hr" in sent
+        assert "+5.0°F/hr" not in sent
+
+    @pytest.mark.asyncio
     async def test_peak_passed_records_but_no_push(self):
         observed_at = datetime(2026, 4, 22, 20, 53, tzinfo=timezone.utc)
         history = [_metar(observed_at, 79.0)]
