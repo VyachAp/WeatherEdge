@@ -139,5 +139,14 @@ class Settings(BaseSettings):
     # forecast rather than anchor it.
     CLIMATE_PRIOR_MAX_SIGMA_F: float = 8.0
 
+    # Residual-slope projection (lever A in the projection-latency redesign).
+    # When enabled and the station has at least 3 routine METARs in the 6h
+    # window with same-hour forecast cells, ``_project_daily_max`` projects
+    # the residual forward at the observed hourly slope instead of decaying
+    # the level residual with a 2h halflife. Captures "forecast falling
+    # further behind every hour" 1-2 hours earlier than the legacy path.
+    # Falls back to the halflife decay when fewer than 3 points are available.
+    PROJECTION_RESIDUAL_SLOPE_ENABLED: bool = True
+
 
 settings = Settings()

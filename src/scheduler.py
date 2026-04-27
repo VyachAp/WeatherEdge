@@ -846,6 +846,9 @@ async def _try_lock_rule_trade(
     # Reuse the existing filter helper for routine-count / close-buffer / depth.
     # Pass stub prob/edge/price values that will pass those specific checks; we're
     # not edge-gating here, only piggy-backing on the shared sanity filters.
+    # The lock-rule already gates routine_count per its own rules (allowing
+    # 2 routines for super-margin EASY locks), so the filter just guards
+    # the floor of 2 here — preventing single-METAR fluke trades regardless.
     reject = _check_filters(
         edge=1.0,
         prob=1.0,
@@ -853,6 +856,7 @@ async def _try_lock_rule_trade(
         routine_count=state.routine_count_today,
         minutes_to_close=minutes_to_close,
         depth=buy_depth,
+        min_routine_count=2,
     )
     if reject is not None:
         logger.info(
@@ -1095,6 +1099,8 @@ async def job_daily_settlement() -> None:
             # 6. Reset fast-lock-poll dedup so the next trading day starts clean.
             _locked_markets_fired_today.clear()
             _last_routine_seen.clear()
+            from src.signals.state_aggregator import clear_state_cache
+            clear_state_cache()
 
             # 7. Weekly calibration check (Sundays)
             if datetime.now(timezone.utc).weekday() == 6:
@@ -1242,6 +1248,62 @@ def _minimal_state_for_easy_lock(
     )
 
 
+async def _fast_poll_projection_check(
+    *,
+    icao: str,
+    station_metars: list[dict],
+) -> None:
+    """Run forecast-exceedance projection from fast-poll using cached inputs.
+
+    Closes the 5-minute cadence gap on projection alerts: when a new routine
+    METAR lands at HH:51, the fast-poll loop catches it within 30s instead
+    of waiting for the next unified tick. No extra HTTP — reuses the
+    forecast / bias / climate-normal snapshot from the last unified tick.
+
+    No-op when no cache exists (unified pipeline hasn't run for this station
+    yet, or the cache aged past the 30-min window).
+    """
+    from src.signals.state_aggregator import (
+        build_state_from_metars,
+        get_cached_aggregation_inputs,
+    )
+    from src.signals.forecast_exceedance import check_and_record_daily_max_alert
+
+    cached = get_cached_aggregation_inputs(icao)
+    if cached is None:
+        return
+
+    seen_at: set[datetime] = set()
+    for m in cached.history:
+        obs = m.get("observed_at")
+        if isinstance(obs, datetime):
+            seen_at.add(obs)
+    merged = list(cached.history)
+    for m in station_metars:
+        obs = m.get("observed_at")
+        if isinstance(obs, datetime) and obs not in seen_at:
+            merged.append(m)
+            seen_at.add(obs)
+
+    new_state = build_state_from_metars(
+        icao, merged, cached.forecast, cached.bias_c,
+        datetime.now(timezone.utc),
+        climate_prior_mean_f=cached.climate_prior_mean_f,
+        climate_prior_std_f=cached.climate_prior_std_f,
+    )
+    if new_state is None:
+        return
+
+    try:
+        await check_and_record_daily_max_alert(
+            icao, new_state, merged, cached.forecast,
+        )
+    except Exception:
+        logger.warning(
+            "[fast-poll %s] projection check failed", icao, exc_info=True,
+        )
+
+
 async def job_fast_lock_poll() -> None:
     """Between-tick lock-rule check. Catches new routine METARs seconds after
     publication so the order lands before Polymarket market-makers react.
@@ -1349,6 +1411,16 @@ async def job_fast_lock_poll() -> None:
                     "[fast-poll %s] new routine METAR obs=%s temp=%.1f°F max=%.1f°F | %d market(s)",
                     icao, latest_obs["observed_at"].isoformat(),
                     latest_obs["temp_f"], state.current_max_f, len(city_markets),
+                )
+
+                # Re-run forecast-exceedance projection with the fresh METAR.
+                # Reuses cached forecast/bias/normals from the last unified
+                # tick — same call signature as the unified path, so the DB
+                # row + Telegram cooldown logic dedupe correctly when both
+                # fast-poll and unified see the same observation.
+                await _fast_poll_projection_check(
+                    icao=icao,
+                    station_metars=station_metars,
                 )
 
                 for market in city_markets:

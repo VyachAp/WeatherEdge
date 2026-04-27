@@ -181,10 +181,20 @@ class TestRejections:
         state = _state(current_max_f=100.0)
         assert _eval(state, mkt).side is None
 
-    def test_routine_count_guard(self):
-        # Even a clear lock is rejected if we don't have enough METARs to trust.
+    def test_routine_count_guard_for_standard_margin(self):
+        # Standard EASY margin (1°F over threshold + 2°F lock margin) is
+        # rejected with only 2 routines — needs MIN_ROUTINE_COUNT=3.
         mkt = _FakeMarket(parsed_threshold=80.0, parsed_operator="above")
-        state = _state(current_max_f=90.0, routine_count=2)
+        # current_max=83 → overshoot=3°F → between LOCK_MARGIN_F (2°F)
+        # and super_margin (4°F). Standard rules: needs 3 routines.
+        state = _state(current_max_f=83.0, routine_count=2)
+        assert _eval(state, mkt).side is None
+
+    def test_routine_count_floor_blocks_single_metar(self):
+        # Hard floor: even a 10°F super-margin overshoot is rejected at
+        # routine_count=1 to prevent single-METAR fluke trades.
+        mkt = _FakeMarket(parsed_threshold=80.0, parsed_operator="above")
+        state = _state(current_max_f=90.0, routine_count=1)
         assert _eval(state, mkt).side is None
 
     def test_hard_direction_requires_forecast(self):
@@ -209,6 +219,45 @@ class TestRejections:
         mkt = _FakeMarket(parsed_threshold=80.0, parsed_operator="above", end_date=None)
         state = _state(current_max_f=90.0)
         assert _eval(state, mkt).side is None
+
+
+class TestSuperMarginEarlyLock:
+    """EASY direction with overshoot >= 2× LOCK_MARGIN_F locks at routine #2.
+
+    Daily max is monotonic — two confirming obs already 4°F+ over threshold
+    cannot be undone by a third observation. Cuts ~30-60 min of morning lag
+    on hot days where the threshold is clearly exceeded by the second routine.
+    """
+
+    def test_super_margin_above_locks_at_two_routines(self):
+        mkt = _FakeMarket(parsed_threshold=80.0, parsed_operator="above")
+        # Overshoot 5°F (>= super margin = 2 × 2 = 4°F) at count=2 → YES.
+        state = _state(current_max_f=85.0, routine_count=2)
+        decision = _eval(state, mkt)
+        assert decision.side == "YES"
+        assert decision.margin_f == 5.0
+
+    def test_super_margin_below_locks_at_two_routines(self):
+        mkt = _FakeMarket(parsed_threshold=80.0, parsed_operator="below")
+        state = _state(current_max_f=85.0, routine_count=2)
+        decision = _eval(state, mkt)
+        assert decision.side == "NO"
+        assert decision.margin_f == 5.0
+
+    def test_borderline_super_margin_locks_at_two_routines(self):
+        # Exactly threshold + super_margin (= threshold + 4°F) is the boundary.
+        mkt = _FakeMarket(parsed_threshold=80.0, parsed_operator="above")
+        state = _state(current_max_f=84.0, routine_count=2)
+        assert _eval(state, mkt).side == "YES"
+
+    def test_just_under_super_margin_requires_three_routines(self):
+        # Overshoot 3°F (between standard margin 2°F and super margin 4°F)
+        # still needs 3 routines.
+        mkt = _FakeMarket(parsed_threshold=80.0, parsed_operator="above")
+        state_two = _state(current_max_f=83.0, routine_count=2)
+        state_three = _state(current_max_f=83.0, routine_count=3)
+        assert _eval(state_two, mkt).side is None
+        assert _eval(state_three, mkt).side == "YES"
 
 
 class TestPerMarketWindow:

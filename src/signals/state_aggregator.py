@@ -53,6 +53,13 @@ class WeatherState:
     forecast_temp_now_f: float | None = None
     forecast_slope_to_peak_f_per_hr: float | None = None
     forecast_residual_f: float | None = None
+    # d(residual)/dt fit over routines in the last 6h. Captures "forecast
+    # falling further behind hour-over-hour" — invisible to the point-residual
+    # field above. Used by `_project_daily_max` (v2 path) when we have at
+    # least RESIDUAL_SLOPE_MIN_POINTS confirming routines; falls back to the
+    # halflife decay otherwise. None when forecast or routines insufficient.
+    forecast_residual_slope_f_per_hr: float | None = None
+    forecast_residual_count: int = 0
     # Ensemble-derived σ in °F (std at peak hour across NWP models, already
     # converted from °C via ×1.8). None when fewer than ENSEMBLE_MIN_MODELS
     # returned data → probability engine falls back to hours-based σ.
@@ -65,6 +72,46 @@ class WeatherState:
     # engine then degrades to its pre-prior baseline.
     climate_prior_mean_f: float | None = None
     climate_prior_std_f: float | None = None
+
+
+@dataclass(frozen=True)
+class CachedAggregationInputs:
+    """Snapshot of build_state_from_metars inputs from the last successful
+    aggregate_state call for a station.
+
+    The fast-poll loop reuses these to rebuild state with a fresh METAR
+    appended, without re-paying the forecast / bias / climate-normal HTTP
+    cost. Forecast and bias drift slowly within the cache window, so this
+    is safe inside ~30 minutes; older entries are rejected by
+    ``get_cached_aggregation_inputs``.
+    """
+
+    cached_at_utc: datetime
+    history: list[dict[str, Any]]
+    forecast: Any | None
+    bias_c: float
+    climate_prior_mean_f: float | None
+    climate_prior_std_f: float | None
+
+
+_state_cache: dict[str, CachedAggregationInputs] = {}
+_STATE_CACHE_MAX_AGE = timedelta(minutes=30)
+
+
+def get_cached_aggregation_inputs(icao: str) -> CachedAggregationInputs | None:
+    """Return cached inputs from the last successful aggregate_state for
+    ``icao``, or None when absent or older than ``_STATE_CACHE_MAX_AGE``."""
+    cached = _state_cache.get(icao)
+    if cached is None:
+        return None
+    if datetime.now(timezone.utc) - cached.cached_at_utc > _STATE_CACHE_MAX_AGE:
+        return None
+    return cached
+
+
+def clear_state_cache() -> None:
+    """Drop all cached inputs (called at daily settlement)."""
+    _state_cache.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -132,6 +179,55 @@ def _routine_daily_max(
     if not routine_temps:
         return None, 0
     return max(routine_temps), len(routine_temps)
+
+
+def _compute_residual_slope(
+    history: list[dict[str, Any]],
+    hourly_temps_c: list[float],
+    bias_c: float,
+    now_utc: datetime,
+) -> tuple[float | None, int]:
+    """Fit linear slope of (obs − same-hour forecast) °F over routines in
+    the last 6h (the same window as the trend regression).
+
+    Returns ``(slope_f_per_hr, n_points)``. ``slope`` is None when fewer
+    than 2 routine METARs fall in the window with valid temps. The slope
+    captures "forecast falling further behind hour-over-hour" — invisible
+    to a single-point residual snapshot.
+    """
+    if not hourly_temps_c:
+        return None, 0
+
+    cutoff = now_utc - timedelta(hours=6)
+    pairs: list[tuple[float, float]] = []
+    for m in history:
+        if m.get("is_speci"):
+            continue
+        obs_at = m.get("observed_at")
+        temp_f = m.get("temp_f")
+        if not isinstance(obs_at, datetime) or temp_f is None:
+            continue
+        if obs_at < cutoff or obs_at > now_utc:
+            continue
+        hour_idx = _closest_hour_index(obs_at, len(hourly_temps_c))
+        forecast_f = _c_to_f(hourly_temps_c[hour_idx] + bias_c)
+        residual = float(temp_f) - forecast_f
+        hours_from_cutoff = (obs_at - cutoff).total_seconds() / 3600.0
+        pairs.append((hours_from_cutoff, residual))
+
+    if len(pairs) < 2:
+        return None, len(pairs)
+
+    n = len(pairs)
+    sum_x = sum(x for x, _ in pairs)
+    sum_y = sum(y for _, y in pairs)
+    sum_xy = sum(x * y for x, y in pairs)
+    sum_x2 = sum(x * x for x, _ in pairs)
+    denom = n * sum_x2 - sum_x * sum_x
+    if denom == 0:
+        return 0.0, n
+    slope = (n * sum_xy - sum_x * sum_y) / denom
+    return slope, n
 
 
 def _compute_trend(
@@ -238,6 +334,8 @@ def build_state_from_metars(
     forecast_temp_now_f: float | None = None
     forecast_slope_to_peak_f_per_hr: float | None = None
     forecast_residual_f: float | None = None
+    forecast_residual_slope_f_per_hr: float | None = None
+    forecast_residual_count: int = 0
     forecast_sigma_f: float | None = None
     ensemble_model_count: int = 1
     if has_forecast:
@@ -275,6 +373,12 @@ def build_state_from_metars(
             latest_obs_temp_f = _latest_routine_temp_f(recent_history)
             if latest_obs_temp_f is not None:
                 forecast_residual_f = latest_obs_temp_f - forecast_temp_now_f
+
+            slope, count = _compute_residual_slope(
+                recent_history, hourly, bias_c, now_utc,
+            )
+            forecast_residual_slope_f_per_hr = slope
+            forecast_residual_count = count
 
         # Ensemble spread → σ (°C × 1.8 = °F; peak_temp_std_c is 0 when the
         # deterministic fallback ran).
@@ -328,6 +432,8 @@ def build_state_from_metars(
         forecast_temp_now_f=forecast_temp_now_f,
         forecast_slope_to_peak_f_per_hr=forecast_slope_to_peak_f_per_hr,
         forecast_residual_f=forecast_residual_f,
+        forecast_residual_slope_f_per_hr=forecast_residual_slope_f_per_hr,
+        forecast_residual_count=forecast_residual_count,
         forecast_sigma_f=forecast_sigma_f,
         ensemble_model_count=ensemble_model_count,
         climate_prior_mean_f=climate_prior_mean_f,
@@ -426,6 +532,17 @@ async def aggregate_state(
     if state is None:
         logger.debug("No routine METARs yet for %s, skipping", icao)
         return None
+
+    # Cache inputs so the fast-poll loop can rebuild state from a fresh
+    # routine METAR without re-fetching forecast / bias / climate normals.
+    _state_cache[icao] = CachedAggregationInputs(
+        cached_at_utc=now_utc,
+        history=history,
+        forecast=forecast,
+        bias_c=bias_c,
+        climate_prior_mean_f=climate_prior_mean_f,
+        climate_prior_std_f=climate_prior_std_f,
+    )
 
     sigma_desc = (
         f"σ={state.forecast_sigma_f:.2f}°F (n={state.ensemble_model_count})"

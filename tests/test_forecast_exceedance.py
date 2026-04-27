@@ -61,6 +61,8 @@ def _state(
     forecast_temp_now_f: float | None = None,
     forecast_slope_to_peak_f_per_hr: float | None = None,
     forecast_residual_f: float | None = None,
+    forecast_residual_slope_f_per_hr: float | None = None,
+    forecast_residual_count: int = 0,
 ) -> WeatherState:
     return WeatherState(
         station_icao=icao,
@@ -79,6 +81,8 @@ def _state(
         forecast_temp_now_f=forecast_temp_now_f,
         forecast_slope_to_peak_f_per_hr=forecast_slope_to_peak_f_per_hr,
         forecast_residual_f=forecast_residual_f,
+        forecast_residual_slope_f_per_hr=forecast_residual_slope_f_per_hr,
+        forecast_residual_count=forecast_residual_count,
     )
 
 
@@ -354,6 +358,125 @@ class TestProjectDailyMaxResidual:
         )
         # overshoot-cap = 89.6 + 5.0 = 94.6 → floored at current_max 96.8.
         assert _project_daily_max(s) == pytest.approx(96.8)
+
+
+class TestProjectDailyMaxResidualSlope:
+    """Lever A — slope-extrapolated residual replaces the halflife decay
+    when the slope and at least RESIDUAL_SLOPE_MIN_POINTS routines are
+    available. Captures forecast falling further behind hour-over-hour.
+    """
+
+    def _slope_state(
+        self,
+        *,
+        slope: float | None,
+        count: int,
+        residual: float = 3.0,
+        hours_until_peak: float = 2.0,
+        forecast_peak_f: float = 80.0,
+        current_max_f: float = 78.0,
+        solar_declining: bool = False,
+        solar_decline_magnitude: float = 0.0,
+        cloud_rising: bool = False,
+        cloud_rise_magnitude: float = 0.0,
+    ):
+        return _state(
+            current_max_f=current_max_f, metar_trend_rate=1.0,
+            forecast_peak_f=forecast_peak_f, hours_until_peak=hours_until_peak,
+            latest_obs_temp_f=current_max_f,
+            forecast_temp_now_f=current_max_f - residual,
+            forecast_slope_to_peak_f_per_hr=1.0,
+            forecast_residual_f=residual,
+            forecast_residual_slope_f_per_hr=slope,
+            forecast_residual_count=count,
+            solar_declining=solar_declining,
+            solar_decline_magnitude=solar_decline_magnitude,
+            cloud_rising=cloud_rising,
+            cloud_rise_magnitude=cloud_rise_magnitude,
+        )
+
+    def test_slope_extrapolates_residual_to_peak(self):
+        # residual +3°F now, slope +0.5°F/hr, h=2 → projected residual
+        # at peak = 3 + 0.5·2 = 4 → projection = forecast_peak + 4 = 84°F.
+        s = self._slope_state(slope=0.5, count=4, residual=3.0,
+                              hours_until_peak=2.0, forecast_peak_f=80.0)
+        assert _project_daily_max(s) == pytest.approx(84.0, abs=0.01)
+
+    def test_v2_strictly_above_v1_when_slope_positive(self):
+        # Same state, run both branches via _project_with_residual: v2 > v1
+        # when slope is positive (v1 decays the level residual; v2 grows it).
+        from src.signals.forecast_exceedance import _project_with_residual
+
+        s = self._slope_state(slope=0.8, count=4, residual=2.0,
+                              hours_until_peak=2.0, forecast_peak_f=80.0)
+        v1 = _project_with_residual(s, prefer_slope=False)
+        v2 = _project_with_residual(s, prefer_slope=True)
+        assert v2 > v1
+
+    def test_falls_back_to_v1_when_count_below_min(self):
+        # 2 routines < min 3 → halflife branch (v1) runs.
+        s = self._slope_state(slope=0.5, count=2, residual=3.0,
+                              hours_until_peak=2.0, forecast_peak_f=80.0)
+        # v1: alpha=exp(-1)=0.368 → 80 + 0.368·3 ≈ 81.10. No trend-residual
+        # carry because observed_slope (1.0) == forecast_slope (1.0).
+        assert _project_daily_max(s) == pytest.approx(81.10, abs=0.05)
+
+    def test_falls_back_to_v1_when_slope_none(self):
+        # Slope unavailable → v1 path even with high count.
+        s = self._slope_state(slope=None, count=5, residual=3.0,
+                              hours_until_peak=2.0, forecast_peak_f=80.0)
+        assert _project_daily_max(s) == pytest.approx(81.10, abs=0.05)
+
+    def test_setting_disables_v2(self):
+        from src.signals import forecast_exceedance as fe
+
+        s = self._slope_state(slope=0.5, count=5, residual=3.0,
+                              hours_until_peak=2.0, forecast_peak_f=80.0)
+        # Force v2 off via the runtime setting; should match v1 result.
+        original = fe.settings.PROJECTION_RESIDUAL_SLOPE_ENABLED
+        fe.settings.PROJECTION_RESIDUAL_SLOPE_ENABLED = False
+        try:
+            assert _project_daily_max(s) == pytest.approx(81.10, abs=0.05)
+        finally:
+            fe.settings.PROJECTION_RESIDUAL_SLOPE_ENABLED = original
+
+    def test_negative_slope_pulls_projection_down(self):
+        # Residual currently +3°F but slope -1°F/hr (forecast catching up).
+        # Projection = 80 + (3 + -1·2) = 81°F (vs v1 ~81.10°F, very close
+        # by coincidence; the value matters less than the sign behavior).
+        s = self._slope_state(slope=-1.0, count=4, residual=3.0,
+                              hours_until_peak=2.0, forecast_peak_f=80.0)
+        assert _project_daily_max(s) == pytest.approx(81.0, abs=0.01)
+
+    def test_slope_clipped_at_max(self):
+        # Slope +5°F/hr clipped at RESIDUAL_SLOPE_MAX_F_PER_HR (1.5°F/hr).
+        # projected = 80 + (3 + 1.5·2) = 86°F → clipped at 80 + 5 = 85°F.
+        s = self._slope_state(slope=5.0, count=4, residual=3.0,
+                              hours_until_peak=2.0, forecast_peak_f=80.0)
+        assert _project_daily_max(s) == pytest.approx(85.0, abs=0.01)
+
+    def test_solar_decline_damps_slope_contribution(self):
+        # 50% solar decline → slope hours halved (1h instead of 2h).
+        # projected = 80 + (3 + 0.8·1) = 83.8°F.
+        s = self._slope_state(slope=0.8, count=4, residual=3.0,
+                              hours_until_peak=2.0, forecast_peak_f=80.0,
+                              solar_declining=True, solar_decline_magnitude=0.5)
+        assert _project_daily_max(s) == pytest.approx(83.8, abs=0.05)
+
+    def test_cloud_rise_damps_slope_contribution(self):
+        # 50% cloud rise → same 50% damping.
+        s = self._slope_state(slope=0.8, count=4, residual=3.0,
+                              hours_until_peak=2.0, forecast_peak_f=80.0,
+                              cloud_rising=True, cloud_rise_magnitude=0.5)
+        assert _project_daily_max(s) == pytest.approx(83.8, abs=0.05)
+
+    def test_overshoot_cap_still_applied(self):
+        # Capped slope still pushed past MAX_OVERSHOOT_F should clip.
+        s = self._slope_state(slope=1.5, count=4, residual=10.0,
+                              hours_until_peak=3.0, forecast_peak_f=80.0,
+                              current_max_f=78.0)
+        # raw = 80 + (10 + 1.5·3) = 94.5 → clipped at 80 + 5 = 85°F.
+        assert _project_daily_max(s) == pytest.approx(85.0, abs=0.01)
 
 
 class TestProjectDailyMaxPostPeak:
@@ -830,6 +953,66 @@ class TestCheckAndRecordDailyMaxAlert:
         assert len(fake_session.added) == 1
         assert fake_session.added[0].alerted is False
         assert fake_session.committed is True
+        alerter._enqueue.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_strong_residual_pushes_at_two_routines(self):
+        # Strong-residual fast path: when the latest obs is already running
+        # > 1°F over its same-hour forecast, allow the push at routine #2
+        # instead of waiting for #3. Cuts ~30-60 min of morning lag.
+        observed_at = datetime(2026, 4, 22, 18, 53, tzinfo=timezone.utc)
+        # Obs 80°F at hour 19 vs forecast 24°C (75.2°F) → same-hour delta
+        # 4.8°F (well past STRONG_RESIDUAL_DELTA_F = 1.0°F).
+        history = [_metar(observed_at, 80.0)]
+        forecast = _make_forecast([24.0] * 24)
+        # Trend +2°F/hr for 1.5h with forecast_peak=76 → projection ~79.3°F,
+        # delta_to_forecast ~3.3°F well above 1°F push threshold.
+        state = _state(
+            current_max_f=80.0, metar_trend_rate=2.0,
+            forecast_peak_f=76.0, hours_until_peak=1.5,
+            routine_count_today=2,
+        )
+
+        fake_session = _FakeSession(existing_id=None)
+        alerter = MagicMock()
+        alerter._enqueue = AsyncMock()
+
+        with patch("src.signals.forecast_exceedance.async_session", return_value=fake_session), \
+             patch("src.signals.forecast_exceedance.get_alerter", return_value=alerter):
+            await check_and_record_daily_max_alert("KLAX", state, history, forecast)
+
+        assert len(fake_session.added) == 1
+        assert fake_session.added[0].alerted is True
+        alerter._enqueue.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_weak_residual_blocked_at_two_routines(self):
+        # Same routine count, but the same-hour residual is weak (<= 1°F).
+        # Standard MIN_ROUTINE_COUNT_FOR_PUSH=3 still applies — DB row is
+        # written for calibration but no Telegram push.
+        observed_at = datetime(2026, 4, 22, 18, 53, tzinfo=timezone.utc)
+        # Obs 76°F at hour 19 vs forecast 24°C (75.2°F) → same-hour delta
+        # 0.8°F (above recording gate 0.5°F, below strong threshold 1.0°F).
+        history = [_metar(observed_at, 76.0)]
+        forecast = _make_forecast([24.0] * 24)
+        # Trend +3°F/hr for 1.5h with forecast_peak=76 → projection ~78.1°F,
+        # delta_to_forecast ~2.1°F (would push at routine_count >= 3).
+        state = _state(
+            current_max_f=76.0, metar_trend_rate=3.0,
+            forecast_peak_f=76.0, hours_until_peak=1.5,
+            routine_count_today=2,
+        )
+
+        fake_session = _FakeSession(existing_id=None)
+        alerter = MagicMock()
+        alerter._enqueue = AsyncMock()
+
+        with patch("src.signals.forecast_exceedance.async_session", return_value=fake_session), \
+             patch("src.signals.forecast_exceedance.get_alerter", return_value=alerter):
+            await check_and_record_daily_max_alert("KLAX", state, history, forecast)
+
+        assert len(fake_session.added) == 1
+        assert fake_session.added[0].alerted is False
         alerter._enqueue.assert_not_awaited()
 
     @pytest.mark.asyncio

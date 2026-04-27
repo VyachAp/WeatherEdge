@@ -157,6 +157,44 @@ class TestMultipleBuckets:
         assert any(e.bucket_value == 78 for e in failing)
 
 
+class TestCheckFiltersMinRoutineOverride:
+    """`_check_filters` accepts a `min_routine_count` override so the
+    lock-rule path can fire on 2 routines for super-margin EASY locks
+    without the scheduler-side gate undoing the relaxation."""
+
+    def test_default_uses_settings_min_routine_count(self):
+        from src.signals.edge_calculator import _check_filters
+
+        # routine_count=2 with default min (3) → rejected.
+        reason = _check_filters(
+            edge=0.2, prob=0.7, price=0.5,
+            routine_count=2, minutes_to_close=120, depth=100.0,
+        )
+        assert reason is not None
+        assert "routine count" in reason
+
+    def test_override_to_two_allows_two_routines(self):
+        from src.signals.edge_calculator import _check_filters
+
+        reason = _check_filters(
+            edge=0.2, prob=0.7, price=0.5,
+            routine_count=2, minutes_to_close=120, depth=100.0,
+            min_routine_count=2,
+        )
+        assert reason is None
+
+    def test_override_still_rejects_below_override(self):
+        from src.signals.edge_calculator import _check_filters
+
+        reason = _check_filters(
+            edge=0.2, prob=0.7, price=0.5,
+            routine_count=1, minutes_to_close=120, depth=100.0,
+            min_routine_count=2,
+        )
+        assert reason is not None
+        assert "routine count 1 < 2" in reason
+
+
 class TestBucketEdgeDirection:
     """`BucketEdge.direction` is BUY_YES by default (back-compat) but is
     set explicitly by `_binary_market_edge` based on which side of the

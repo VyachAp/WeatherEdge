@@ -146,13 +146,18 @@ def evaluate_lock(
     current_max_f, routine_count = _market_daily_max(state, market.end_date, now_utc)
     if current_max_f is None:
         return _NO_LOCK
-    if routine_count < settings.MIN_ROUTINE_COUNT:
+    # Hard floor: even a super-margin lock needs at least 2 routines so the
+    # max isn't a single-METAR fluke. Standard EASY/HARD still need
+    # `MIN_ROUTINE_COUNT` (3 by default) — see per-branch gates below.
+    if routine_count < 2:
         return _NO_LOCK
 
     # ---- Range / "exactly" markets ----
     if op in ("range", "bracket", "exactly"):
         from src.scheduler import market_range_f
 
+        if routine_count < settings.MIN_ROUTINE_COUNT:
+            return _NO_LOCK
         rng = market_range_f(market)
         if rng is None:
             return _NO_LOCK
@@ -169,32 +174,49 @@ def evaluate_lock(
     threshold_f = float(market.parsed_threshold)
 
     # EASY: observed max already clears threshold by margin (monotonic lock).
+    # Super-margin (>= 2× LOCK_MARGIN_F) is mathematically bulletproof at
+    # routine_count=2 — daily max is monotonic, so two confirming obs
+    # already overshooting by 4°F can't be undone by a third.
+    super_margin = 2.0 * margin
+    easy_overshoot = current_max_f - threshold_f
+    easy_min_routines = (
+        2 if easy_overshoot >= super_margin else settings.MIN_ROUTINE_COUNT
+    )
     if op in ("above", "at_least"):
-        if current_max_f >= threshold_f + margin:
+        if (
+            current_max_f >= threshold_f + margin
+            and routine_count >= easy_min_routines
+        ):
             return LockDecision(
                 side="YES",
                 reasons=[
                     f"market-day max {current_max_f:.1f}°F >= threshold "
                     f"{threshold_f:.0f}°F + {margin:.1f}°F margin ({op})",
-                    f"routine_count={routine_count}",
+                    f"routine_count={routine_count} (min {easy_min_routines})",
                 ],
-                margin_f=current_max_f - threshold_f,
+                margin_f=easy_overshoot,
             )
     elif op in ("below", "at_most"):
-        if current_max_f >= threshold_f + margin:
+        if (
+            current_max_f >= threshold_f + margin
+            and routine_count >= easy_min_routines
+        ):
             return LockDecision(
                 side="NO",
                 reasons=[
                     f"market-day max {current_max_f:.1f}°F exceeds threshold "
                     f"{threshold_f:.0f}°F by {margin:.1f}°F ({op} already violated)",
-                    f"routine_count={routine_count}",
+                    f"routine_count={routine_count} (min {easy_min_routines})",
                 ],
-                margin_f=current_max_f - threshold_f,
+                margin_f=easy_overshoot,
             )
     else:
         return _NO_LOCK
 
     # HARD: max is well below threshold AND no more heating possible.
+    # Forecast-dependent — requires the standard MIN_ROUTINE_COUNT.
+    if routine_count < settings.MIN_ROUTINE_COUNT:
+        return _NO_LOCK
     if current_max_f >= threshold_f - margin:
         return _NO_LOCK
     has_headroom, evidence = _no_more_heating(state, threshold_f)

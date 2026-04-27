@@ -111,6 +111,7 @@ def _check_filters(
     routine_count: int,
     minutes_to_close: float,
     depth: float,
+    min_routine_count: int | None = None,
 ) -> str | None:
     """Return rejection reason or None if all filters pass.
 
@@ -120,6 +121,10 @@ def _check_filters(
     and ``depth`` is the depth on the buy book of that side's token. The
     same gate works symmetrically for YES and NO trades because the math
     is identical once expressed in the chosen side's units.
+
+    ``min_routine_count`` overrides ``settings.MIN_ROUTINE_COUNT`` for
+    callers that have their own routine-count gate (e.g. the lock-rule path
+    can fire on 2 routines for super-margin EASY locks).
     """
     if edge < MIN_EDGE:
         return f"edge {edge:.4f} < {MIN_EDGE}"
@@ -133,8 +138,12 @@ def _check_filters(
     if price > settings.MAX_ENTRY_PRICE:
         return f"price {price:.2f} > {settings.MAX_ENTRY_PRICE}"
 
-    if routine_count < settings.MIN_ROUTINE_COUNT:
-        return f"routine count {routine_count} < {settings.MIN_ROUTINE_COUNT}"
+    routine_min = (
+        settings.MIN_ROUTINE_COUNT if min_routine_count is None
+        else min_routine_count
+    )
+    if routine_count < routine_min:
+        return f"routine count {routine_count} < {routine_min}"
 
     if minutes_to_close < settings.MARKET_CLOSE_BUFFER_MINUTES:
         return f"market closing in {minutes_to_close:.0f}m < {settings.MARKET_CLOSE_BUFFER_MINUTES}m"

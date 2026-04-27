@@ -93,3 +93,174 @@ class TestHoursUntilPeakMidnightWraparound:
                                         bias_c=0.0, now_utc=now)
         assert state is not None
         assert state.hours_until_peak == pytest.approx(5.0, abs=0.1)
+
+
+class TestResidualSlope:
+    """build_state_from_metars populates the residual-slope fields used by
+    the v2 projection path. Slope is the linear regression of
+    (obs - same-hour forecast) over the last 6h of routine METARs."""
+
+    def _forecast(self, hourly_temps_c: list[float]) -> _FakeForecast:
+        return _FakeForecast(
+            peak_temp_c=max(hourly_temps_c),
+            peak_hour_utc=hourly_temps_c.index(max(hourly_temps_c)),
+            hourly_temps_c=hourly_temps_c,
+            hourly_cloud_cover=[20] * 24,
+            hourly_solar_radiation=[500.0] * 24,
+            hourly_dewpoint_c=[15.0] * 24,
+            hourly_wind_speed=[5.0] * 24,
+        )
+
+    def test_growing_residual_yields_positive_slope(self):
+        # Forecast is flat at 24°C (~75.2°F) all day. Obs starts at 76°F
+        # (residual +0.8°F) and rises 1°F/hr → residual slope ≈ +1°F/hr.
+        now = datetime(2026, 4, 22, 18, 0, tzinfo=timezone.utc)
+        forecast = self._forecast([24.0] * 24)
+        history = [
+            {"observed_at": now - timedelta(hours=h),
+             "temp_f": 76.0 + (5 - h),  # h=5→76, h=4→77, ..., h=0→81
+             "is_speci": False}
+            for h in range(5, -1, -1)
+        ]
+        state = build_state_from_metars(
+            "KLAX", history, forecast, bias_c=0.0, now_utc=now,
+        )
+        assert state is not None
+        assert state.forecast_residual_count == 6
+        assert state.forecast_residual_slope_f_per_hr == pytest.approx(1.0, abs=0.05)
+
+    def test_flat_residual_yields_zero_slope(self):
+        # Obs and forecast move in lockstep → constant residual → slope 0.
+        now = datetime(2026, 4, 22, 18, 0, tzinfo=timezone.utc)
+        # Forecast climbs 1°C per hour (1.8°F).
+        hourly = [10.0 + h * 1.0 for h in range(24)]
+        forecast = self._forecast(hourly)
+        # Obs always +1.8°F over the same-hour forecast cell.
+        history = []
+        for h in range(5, -1, -1):
+            obs_at = now - timedelta(hours=h)
+            forecast_f = (hourly[obs_at.hour] * 9.0 / 5.0) + 32.0
+            history.append({
+                "observed_at": obs_at,
+                "temp_f": forecast_f + 1.8,
+                "is_speci": False,
+            })
+        state = build_state_from_metars(
+            "KLAX", history, forecast, bias_c=0.0, now_utc=now,
+        )
+        assert state is not None
+        assert state.forecast_residual_slope_f_per_hr == pytest.approx(0.0, abs=0.05)
+
+    def test_single_routine_yields_none_slope(self):
+        now = datetime(2026, 4, 22, 18, 0, tzinfo=timezone.utc)
+        forecast = self._forecast([24.0] * 24)
+        history = [
+            {"observed_at": now - timedelta(hours=1), "temp_f": 80.0, "is_speci": False},
+        ]
+        state = build_state_from_metars(
+            "KLAX", history, forecast, bias_c=0.0, now_utc=now,
+        )
+        assert state is not None
+        assert state.forecast_residual_slope_f_per_hr is None
+        assert state.forecast_residual_count == 1
+
+    def test_no_forecast_yields_none_slope(self):
+        now = datetime(2026, 4, 22, 18, 0, tzinfo=timezone.utc)
+        history = [
+            {"observed_at": now - timedelta(hours=h), "temp_f": 80.0 - h, "is_speci": False}
+            for h in range(5, -1, -1)
+        ]
+        state = build_state_from_metars(
+            "KLAX", history, None, bias_c=0.0, now_utc=now,
+        )
+        assert state is not None
+        assert state.forecast_residual_slope_f_per_hr is None
+        assert state.forecast_residual_count == 0
+
+    def test_speci_excluded_from_slope_fit(self):
+        # Three routines with constant +1.8°F residual; one SPECI in the middle
+        # with a wildly different value. Slope should still be ≈0.
+        now = datetime(2026, 4, 22, 18, 0, tzinfo=timezone.utc)
+        forecast = self._forecast([24.0] * 24)  # forecast = 75.2°F
+        history = [
+            {"observed_at": now - timedelta(hours=4), "temp_f": 77.0, "is_speci": False},
+            {"observed_at": now - timedelta(hours=3), "temp_f": 95.0, "is_speci": True},
+            {"observed_at": now - timedelta(hours=2), "temp_f": 77.0, "is_speci": False},
+            {"observed_at": now - timedelta(hours=1), "temp_f": 77.0, "is_speci": False},
+            {"observed_at": now, "temp_f": 77.0, "is_speci": False},
+        ]
+        state = build_state_from_metars(
+            "KLAX", history, forecast, bias_c=0.0, now_utc=now,
+        )
+        assert state is not None
+        assert state.forecast_residual_count == 4  # SPECI excluded
+        assert state.forecast_residual_slope_f_per_hr == pytest.approx(0.0, abs=0.05)
+
+
+class TestAggregationCache:
+    """Module-level cache fed by aggregate_state, consumed by the fast-poll
+    projection check. Lets fast-poll rebuild state from a fresh METAR
+    without re-fetching forecast / bias / climate normals.
+    """
+
+    def test_get_returns_none_when_absent(self):
+        from src.signals.state_aggregator import (
+            clear_state_cache,
+            get_cached_aggregation_inputs,
+        )
+
+        clear_state_cache()
+        assert get_cached_aggregation_inputs("KJFK") is None
+
+    def test_round_trip_within_window(self):
+        from src.signals.state_aggregator import (
+            CachedAggregationInputs,
+            _state_cache,
+            clear_state_cache,
+            get_cached_aggregation_inputs,
+        )
+
+        clear_state_cache()
+        now = datetime.now(timezone.utc)
+        cached = CachedAggregationInputs(
+            cached_at_utc=now, history=[], forecast=None, bias_c=1.0,
+            climate_prior_mean_f=None, climate_prior_std_f=None,
+        )
+        _state_cache["KSFO"] = cached
+        result = get_cached_aggregation_inputs("KSFO")
+        assert result is cached
+
+    def test_stale_entry_rejected(self):
+        from src.signals.state_aggregator import (
+            CachedAggregationInputs,
+            _STATE_CACHE_MAX_AGE,
+            _state_cache,
+            clear_state_cache,
+            get_cached_aggregation_inputs,
+        )
+
+        clear_state_cache()
+        # 1 second past the max age → rejected.
+        stale_at = datetime.now(timezone.utc) - _STATE_CACHE_MAX_AGE - timedelta(seconds=1)
+        _state_cache["KSEA"] = CachedAggregationInputs(
+            cached_at_utc=stale_at, history=[], forecast=None, bias_c=0.0,
+            climate_prior_mean_f=None, climate_prior_std_f=None,
+        )
+        assert get_cached_aggregation_inputs("KSEA") is None
+
+    def test_clear_state_cache_drops_all(self):
+        from src.signals.state_aggregator import (
+            CachedAggregationInputs,
+            _state_cache,
+            clear_state_cache,
+            get_cached_aggregation_inputs,
+        )
+
+        now = datetime.now(timezone.utc)
+        _state_cache["KORD"] = CachedAggregationInputs(
+            cached_at_utc=now, history=[], forecast=None, bias_c=0.5,
+            climate_prior_mean_f=None, climate_prior_std_f=None,
+        )
+        clear_state_cache()
+        assert get_cached_aggregation_inputs("KORD") is None
+        assert _state_cache == {}
