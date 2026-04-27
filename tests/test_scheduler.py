@@ -248,3 +248,106 @@ class TestBinaryMarketEdgeSideSelection:
         assert edge.direction == TradeDirection.BUY_NO
         assert edge.our_probability == 0.70  # NO frame
         assert edge.passes is True
+
+
+class TestBinaryMarketEdgeAsymmetricPricing:
+    """When a real (yes_bid, yes_ask) quote is supplied, each side must
+    be evaluated against its own BUY-side cost (yes_ask for YES,
+    1-yes_bid for NO). Without this, a wide post-move spread (e.g. dust
+    bid=0.20 + dust ask=0.55 on a market trading near YES≈0) makes the
+    arithmetic mid look mid-priced and invents a phantom edge that
+    wouldn't fill in live mode.
+
+    Regression for the 2026-04-26 Taipei "exactly 28°C" incident: the
+    bot logged P(NO)=0.807 vs mkt=0.625 / edge=+0.182 and queued a
+    BUY_NO at limit 0.645, but real NO ask was ~0.999 (Gamma reported
+    NO outcomePrice=0.9995, YES bestAsk=0.001).
+    """
+
+    @staticmethod
+    def _eval(*, our_prob_yes, yes_bid, yes_ask, op="exactly", threshold=82,
+              depth_yes=100.0, depth_no=100.0):
+        from src.scheduler import _binary_market_edge
+        from src.signals.probability_engine import BucketDistribution
+
+        market = SimpleNamespace(
+            id="m1",
+            question="Will the highest temperature in Taipei be 28°C on April 26",
+            parsed_threshold=threshold, parsed_operator=op,
+            current_yes_price=(yes_bid + yes_ask) / 2,  # legacy mid path
+            end_date=None, outcomes=["Yes", "No"],
+        )
+        # For the "exactly 82°F" market, range_f = (82, 82). Put 19.3% mass
+        # inside the range and 80.7% outside, mirroring the Taipei log line.
+        dist = BucketDistribution(
+            current_max_f=78,
+            probabilities={threshold: our_prob_yes, threshold - 1: 1.0 - our_prob_yes},
+            reasoning=["test"],
+        )
+        end_time = datetime.now(timezone.utc) + timedelta(hours=5)
+        return _binary_market_edge(
+            dist, market, end_time, routine_count=5,
+            depth_yes=depth_yes, depth_no_fn=lambda: depth_no,
+            yes_bid=yes_bid, yes_ask=yes_ask,
+        )
+
+    def test_wide_spread_kills_phantom_no_edge(self):
+        # Reproduces the Taipei incident: dust spread 0.20/0.55, model
+        # P(NO)=0.807, mid-derived NO=0.625 would suggest +0.182 edge.
+        # Real NO buy cost = 1 - 0.20 = 0.80 → edge = 0.807 - 0.80 ≈ 0.007
+        # → fails MIN_EDGE=0.05 and the trade is correctly rejected.
+        edge = self._eval(our_prob_yes=0.193, yes_bid=0.20, yes_ask=0.55)
+        # Direction will still be NO (it's the higher-edge side), but the
+        # tiny real edge must fail the gate.
+        assert edge.market_price == 0.80, (
+            f"NO buy price should be 1 - yes_bid = 0.80, got {edge.market_price}"
+        )
+        assert abs(edge.edge - 0.007) < 0.001
+        assert edge.passes is False
+        assert "edge" in (edge.reject_reason or "")
+
+    def test_yes_side_uses_ask_not_mid(self):
+        # YES bid=0.40, ask=0.55 (tighter spread). With model P(YES)=0.70:
+        #   - Mid-based: edge = 0.70 - 0.475 = +0.225 (passes)
+        #   - Asymmetric (real ask): edge = 0.70 - 0.55 = +0.15 (still passes,
+        #     but smaller and accurate)
+        edge = self._eval(
+            our_prob_yes=0.70, yes_bid=0.40, yes_ask=0.55,
+            op="at_least", threshold=82,
+        )
+        from src.db.models import TradeDirection
+        assert edge.direction == TradeDirection.BUY_YES
+        assert edge.market_price == 0.55
+        assert abs(edge.edge - 0.15) < 0.001
+        assert edge.passes is True
+
+    def test_omitting_quote_falls_back_to_mid(self):
+        # Backward-compat: when the caller doesn't pass yes_bid/yes_ask,
+        # the function still works against current_yes_price (the mid
+        # legacy callers were storing). Same scenario as the Taipei one
+        # but without the quote — phantom edge IS reported. This test
+        # documents the fallback so we know if it ever changes.
+        from src.scheduler import _binary_market_edge
+        from src.signals.probability_engine import BucketDistribution
+
+        market = SimpleNamespace(
+            id="m1", question="Will the highest temp be 82°F or higher",
+            parsed_threshold=82, parsed_operator="at_least",
+            current_yes_price=0.375, end_date=None, outcomes=["Yes", "No"],
+        )
+        dist = BucketDistribution(
+            current_max_f=78,
+            probabilities={82: 0.193, 81: 0.807},
+            reasoning=["test"],
+        )
+        end_time = datetime.now(timezone.utc) + timedelta(hours=5)
+        edge = _binary_market_edge(
+            dist, market, end_time, routine_count=5,
+            depth_yes=100.0, depth_no_fn=lambda: 100.0,
+            # no yes_bid / yes_ask — legacy path
+        )
+        # NO frame: prob=0.807, price=1-0.375=0.625, edge=+0.182 (legacy
+        # phantom). Documented behavior — callers that want correctness
+        # MUST pass the quote.
+        assert edge.market_price == 0.625
+        assert abs(edge.edge - 0.182) < 0.001

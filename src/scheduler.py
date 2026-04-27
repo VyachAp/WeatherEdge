@@ -285,14 +285,20 @@ async def job_unified_pipeline() -> None:
                         )
                         continue
 
-                    # Orderbook depth at market YES price; refresh live price from CLOB
+                    # Orderbook depth at market YES price; refresh live price from CLOB.
+                    # We keep the mid as `current_yes_price` for display + the
+                    # near-resolved skip below, but downstream edge/lock evaluation
+                    # uses the per-side BUY price (yes_ask for BUY YES, 1-yes_bid
+                    # for BUY NO) so wide post-move spreads don't invent fake edges.
                     mkt_depth = 0.0
+                    yes_bid: float | None = None
+                    yes_ask: float | None = None
                     token_ids = await get_token_ids(market.id)
                     if token_ids:
                         quote = get_best_bid_ask(token_ids[0])
                         if quote:
-                            best_bid, best_ask = quote
-                            live_price = (best_bid + best_ask) / 2
+                            yes_bid, yes_ask = quote
+                            live_price = (yes_bid + yes_ask) / 2
                             market.current_yes_price = live_price
                         if market.current_yes_price:
                             mkt_depth = get_orderbook_depth(token_ids[0], market.current_yes_price)
@@ -314,6 +320,7 @@ async def job_unified_pipeline() -> None:
                             yes_depth=mkt_depth, end_time=end_time,
                             bankroll=bankroll, exposure=exposure,
                             monitor=monitor, alerter=alerter, icao=icao,
+                            yes_bid=yes_bid, yes_ask=yes_ask,
                         )
                         if lock_executed is not None:
                             if lock_executed:
@@ -322,12 +329,20 @@ async def job_unified_pipeline() -> None:
                             continue
 
                     # Skip near-resolved markets — any "edge" at the tails is noise.
-                    # Threshold raised from 0.95 to 0.99 so the lock-rule path above
-                    # can evaluate high-price markets first.
-                    if price >= 0.99 or (price > 0 and price <= 0.01):
+                    # Prefer bid/ask over mid: a dust order on the dead side can
+                    # leave mid in the middle of the book even when bid≈1.0 or
+                    # ask≈0.0 already locks the outcome.
+                    near_yes_lock = yes_bid is not None and yes_bid >= 0.99
+                    near_no_lock = (
+                        yes_ask is not None and 0.0 < yes_ask <= 0.01
+                    )
+                    if near_yes_lock or near_no_lock or price >= 0.99 or (price > 0 and price <= 0.01):
                         logger.info(
-                            "[%s] skip %s: market effectively resolved (price=%.2f)",
+                            "[%s] skip %s: market effectively resolved "
+                            "(mid=%.2f bid=%s ask=%s)",
                             icao, market.id[:12], price,
+                            f"{yes_bid:.3f}" if yes_bid is not None else "?",
+                            f"{yes_ask:.3f}" if yes_ask is not None else "?",
                         )
                         continue
 
@@ -345,10 +360,19 @@ async def job_unified_pipeline() -> None:
                     # _binary_market_edge actually picks the NO side, so
                     # we don't pay an extra CLOB call on the (more common)
                     # YES branch.
-                    def _no_depth_for_market(market=market, token_ids=token_ids, price=price):
+                    def _no_depth_for_market(
+                        market=market, token_ids=token_ids,
+                        price=price, yes_bid=yes_bid,
+                    ):
                         if not token_ids:
                             return 0.0
-                        no_price = max(0.001, 1.0 - price)
+                        # Use the actual NO buy price (1 - yes_bid) when we
+                        # have a quote — measures depth at the price we'd
+                        # really pay, not at the dust-spread mid.
+                        if yes_bid is not None and yes_bid > 0:
+                            no_price = max(0.001, 1.0 - yes_bid)
+                        else:
+                            no_price = max(0.001, 1.0 - price)
                         return get_orderbook_depth(token_ids[1], no_price)
 
                     edge_result = _binary_market_edge(
@@ -356,6 +380,7 @@ async def job_unified_pipeline() -> None:
                         state.routine_count_today,
                         depth_yes=mkt_depth,
                         depth_no_fn=_no_depth_for_market,
+                        yes_bid=yes_bid, yes_ask=yes_ask,
                     )
                     if edge_result is None:
                         logger.info(
@@ -636,21 +661,30 @@ def _binary_market_edge(
     routine_count,
     depth_yes: float,
     depth_no_fn=None,
+    yes_bid: float | None = None,
+    yes_ask: float | None = None,
 ):
     """Pick the best side (YES or NO) of a binary market and gate it.
 
     Computes ``our_prob_yes`` from the distribution under the operator,
-    then evaluates *both* sides:
+    then evaluates *both* sides at their actual BUY-side cost:
 
-      * YES: prob = our_prob_yes, price = yes_price, edge = prob - price
-      * NO:  prob = 1 - our_prob_yes, price = 1 - yes_price, edge = prob - price
+      * YES: price = ``yes_ask`` (what a YES buyer pays)
+      * NO:  price = ``1 - yes_bid`` (what a NO buyer pays; equivalent to
+             the NO-token ask given the ``YES + NO = 1`` constraint)
 
-    For a binary market ``edge_NO == -edge_YES``, so picking the side
-    with positive edge is equivalent to picking the side that the model
-    disagrees with the market on. Each side is gated through
-    ``_check_filters`` in its own price/probability frame so the
-    ``MIN_ENTRY_PRICE``/``MIN_PROBABILITY`` thresholds are correct for
-    a NO trade as well as a YES trade.
+    The (yes_bid, yes_ask) quote is optional. When omitted, both sides
+    fall back to ``market.current_yes_price`` symmetrically — preserves
+    legacy behavior for callers (and tests) that don't have a quote.
+
+    Why asymmetric pricing matters: after a sharp move the orderbook can
+    have stale dust on the dead side (e.g. bid=0.20, ask=0.55 on a
+    market that's actually trading near YES=0). The arithmetic mid then
+    invents a phantom "edge" that wouldn't fill. Charging each side its
+    real ask cost makes both sides correctly fail the MIN_EDGE filter.
+
+    For a binary market ``edge_NO == -edge_YES`` only when the spread is
+    zero; with a real spread the two sides see independent edges.
 
     ``depth_no_fn`` is an optional zero-arg callable returning NO-side
     orderbook depth in USD; only invoked when the chosen direction is
@@ -665,7 +699,11 @@ def _binary_market_edge(
     from src.signals.edge_calculator import BucketEdge, _check_filters
 
     op = market.parsed_operator
-    yes_price = market.current_yes_price or 0.0
+    mid_price = market.current_yes_price or 0.0
+    # Per-side BUY costs. Fall back to the symmetric mid when a real
+    # quote isn't supplied (keeps legacy callers + tests working).
+    yes_buy_price = yes_ask if (yes_ask is not None and yes_ask > 0) else mid_price
+    no_buy_price = (1.0 - yes_bid) if (yes_bid is not None and yes_bid > 0) else (1.0 - mid_price)
     bucket_value: int
 
     if op in ("above", "at_least"):
@@ -687,10 +725,13 @@ def _binary_market_edge(
         return None
 
     our_prob_yes = round(our_prob_yes, 4)
-    yes_edge = round(our_prob_yes - yes_price, 4)
+    yes_edge = round(our_prob_yes - yes_buy_price, 4)
     no_prob = round(1.0 - our_prob_yes, 4)
-    no_price = round(1.0 - yes_price, 4)
+    no_price = round(no_buy_price, 4)
     no_edge = round(no_prob - no_price, 4)
+    # Keep the variable name `yes_price` for the BucketEdge.market_price
+    # field on the YES branch — reads as "what a YES buyer pays".
+    yes_price = round(yes_buy_price, 4)
 
     now = datetime.now(timezone.utc)
     minutes_to_close = (end_time - now).total_seconds() / 60.0
@@ -743,8 +784,17 @@ async def _try_lock_rule_trade(
     monitor: DrawdownMonitor,
     alerter,
     icao: str,
+    yes_bid: float | None = None,
+    yes_ask: float | None = None,
 ) -> float | None:
     """Evaluate lock-rule conditions and place order if triggered.
+
+    ``yes_bid`` / ``yes_ask``: optional live quote. When supplied, the
+    side we're buying is charged its real ask cost (yes_ask for YES,
+    1-yes_bid for NO) instead of the symmetric mid carried in
+    ``yes_price``. This prevents a wide post-move spread from making a
+    locked market look mid-priced and slipping through the
+    ``LOCK_RULE_MAX_PRICE`` guard.
 
     Returns:
       None — no lock fired; caller should fall through to probability path.
@@ -760,7 +810,15 @@ async def _try_lock_rule_trade(
     if decision.side is None or decision.direction is None:
         return None
 
-    effective_price = yes_price if decision.side == "YES" else (1.0 - yes_price)
+    if decision.side == "YES":
+        effective_price = (
+            yes_ask if (yes_ask is not None and yes_ask > 0) else yes_price
+        )
+    else:
+        effective_price = (
+            (1.0 - yes_bid) if (yes_bid is not None and yes_bid > 0)
+            else (1.0 - yes_price)
+        )
     if not (
         settings.LOCK_RULE_MIN_PRICE
         <= effective_price
@@ -1316,8 +1374,8 @@ async def job_fast_lock_poll() -> None:
                             icao, decision.side, market.id[:12],
                         )
                         continue
-                    best_bid, best_ask = quote
-                    yes_price = (best_bid + best_ask) / 2
+                    yes_bid, yes_ask = quote
+                    yes_price = (yes_bid + yes_ask) / 2
                     market.current_yes_price = yes_price
 
                     yes_depth = get_orderbook_depth(token_ids[0], yes_price) if yes_price > 0 else 0.0
@@ -1329,6 +1387,7 @@ async def job_fast_lock_poll() -> None:
                         yes_depth=yes_depth, end_time=end_time,
                         bankroll=bankroll, exposure=exposure,
                         monitor=monitor, alerter=alerter, icao=icao,
+                        yes_bid=yes_bid, yes_ask=yes_ask,
                     )
                     if stake is None:
                         continue
