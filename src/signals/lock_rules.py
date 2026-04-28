@@ -137,6 +137,12 @@ def evaluate_lock(
     """
     if market.parsed_operator is None or market.end_date is None:
         return _NO_LOCK
+    # Defense-in-depth: drop lowest/minimum-temperature markets even if a
+    # stale Market row from a pre-fix ingestion still has parsed_operator set.
+    # Primary filter is in polymarket.parse_question.
+    q = (getattr(market, "question", None) or "").lower()
+    if "lowest temperature" in q or "minimum temperature" in q:
+        return _NO_LOCK
     if now_utc is None:
         now_utc = datetime.now(timezone.utc)
 

@@ -305,8 +305,22 @@ def _extract_date_from_text(text: str) -> str | None:
     return None
 
 
+_LOWEST_TEMP_RE = re.compile(
+    r"\b(lowest|minimum|min)\s+temperature\b", re.IGNORECASE
+)
+
+
 def parse_question(question: str) -> ParsedQuestion:
     """Parse a Polymarket weather-market question into structured fields."""
+    # Reject lowest/minimum-temperature markets — the daily-max pipeline
+    # has no way to evaluate them and would compare unrelated quantities
+    # (see lock_rules._evaluate_range_lock vs current_max_f).
+    if question and _LOWEST_TEMP_RE.search(question):
+        return ParsedQuestion(
+            matched=False,
+            raw=question,
+            target_date=_extract_date_from_text(question),
+        )
     for pat_idx, (pattern, defaults) in enumerate(_PATTERNS):
         m = pattern.search(question)
         if not m:

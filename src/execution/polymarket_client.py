@@ -471,13 +471,24 @@ def _throttle_clob() -> None:
 
 
 def _compute_depth(book: object, price: float) -> float:
-    bids = book.bids if hasattr(book, "bids") else book.get("bids", [])  # type: ignore[union-attr]
+    """USD of liquidity available to a market BUY at limit *price*.
+
+    For a BUY we take the ASK side: any ask with `ask_price <= price`
+    is fillable at our limit. Cost is `price * size` per level. Summing
+    across all matching asks gives the total USDC we could spend if we
+    swept the book at-or-below the limit.
+
+    Verified against py_clob_client semantics 2026-04-28: bids are buy
+    orders, asks are sell orders, and the binary CLOB invariant
+    `YES.bid + NO.ask = 1.0` holds. See `scripts/inspect_orderbook.py`.
+    """
+    asks = book.asks if hasattr(book, "asks") else book.get("asks", [])  # type: ignore[union-attr]
     depth = 0.0
-    for bid in bids or []:
-        bid_price = float(bid.price if hasattr(bid, "price") else bid.get("price", 0))
-        bid_size = float(bid.size if hasattr(bid, "size") else bid.get("size", 0))
-        if bid_price >= price:
-            depth += bid_price * bid_size
+    for ask in asks or []:
+        ask_price = float(ask.price if hasattr(ask, "price") else ask.get("price", 0))
+        ask_size = float(ask.size if hasattr(ask, "size") else ask.get("size", 0))
+        if 0 < ask_price <= price:
+            depth += ask_price * ask_size
     return depth
 
 
@@ -487,7 +498,11 @@ def _compute_depth(book: object, price: float) -> float:
 
 
 def get_orderbook_depth(token_id: str, price: float) -> float:
-    """Return total USD depth at or better than *price* on the buy side.
+    """Return USD of ask-side liquidity fillable by a market BUY at *price*.
+
+    Sums asks where `ask_price <= price` (cost = ask_price * size per level).
+    Use the side we'd actually take when buying: e.g., to BUY NO at 0.45,
+    pass `(no_token, 0.45)` and we read NO.asks <= 0.45.
 
     Uses the CLOB client's ``get_order_book`` method with a 30-second TTL
     cache, inter-request throttling, and retry with backoff.  Returns 0.0

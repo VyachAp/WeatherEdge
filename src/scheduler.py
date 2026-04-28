@@ -919,22 +919,37 @@ async def _try_lock_rule_trade(
         )
         return 0.0
 
-    # FAK orders may fill partially or not at all when liquidity is thin.
-    # ``_update_fill_details`` already replaced trade.stake_usd with the
-    # actual filled cost (zeroed when nothing matched). Use that value as
-    # the source of truth for exposure / dedup so we don't book an order
-    # that never landed.
-    actual_stake = trade.stake_usd or 0.0
-    if actual_stake <= 0:
-        trade.status = TradeStatus.PENDING
-        logger.info(
-            "[%s] LOCK %s %s: order posted but no fill (book empty at limit); "
-            "leaving open for next-tick retry",
-            icao, decision.side, market.id[:12],
-        )
-        return 0.0
+    # In dry-run, ``place_order`` is a no-op and never updates fill fields.
+    # Don't pretend the trade opened: keep status PENDING, zero stake_usd
+    # so DB-backed exposure/PnL stays clean, and emit a clearly-labelled
+    # indicative alert. We still return a positive value so the caller's
+    # in-process dedup blocks repeat firings on the same market today.
+    is_dry_run = trade.exchange_status == "dry_run"
 
-    trade.status = TradeStatus.OPEN
+    if is_dry_run:
+        indicative_stake = stake
+        indicative_price = trade.entry_price or effective_price
+        trade.stake_usd = 0.0
+        trade.status = TradeStatus.PENDING
+    else:
+        # FAK orders may fill partially or not at all when liquidity is thin.
+        # ``_update_fill_details`` already replaced trade.stake_usd with the
+        # actual filled cost (zeroed when nothing matched). Use that value as
+        # the source of truth for exposure / dedup so we don't book an order
+        # that never landed.
+        actual_stake = trade.stake_usd or 0.0
+        if actual_stake <= 0:
+            trade.status = TradeStatus.PENDING
+            logger.info(
+                "[%s] LOCK %s %s: order posted but no fill (book empty at limit); "
+                "leaving open for next-tick retry",
+                icao, decision.side, market.id[:12],
+            )
+            return 0.0
+        trade.status = TradeStatus.OPEN
+        indicative_stake = actual_stake
+        indicative_price = trade.fill_price or effective_price
+
     unit = _market_unit(market)
     rng = market_range_f(market)
     if rng is not None and rng[0] != rng[1]:
@@ -952,15 +967,19 @@ async def _try_lock_rule_trade(
     else:
         threshold_disp = "?"
         op_symbol = "?"
-    fill_price = trade.fill_price or effective_price
+    header = (
+        "\U0001f512 *LOCK trade (dry-run)*" if is_dry_run
+        else "\U0001f512 *LOCK trade*"
+    )
+    fill_label = "Indicative" if is_dry_run else "Filled"
     await alerter._enqueue(
-        f"\U0001f512 *LOCK trade* [{icao}] {decision.side}\n"
+        f"{header} [{icao}] {decision.side}\n"
         f"Threshold: {op_symbol}{threshold_disp}{unit} | Margin: {decision.margin_f:+.1f}°F\n"
-        f"Filled: ${actual_stake:.2f} (req ${stake:.2f}) @ {fill_price:.3f}\n"
+        f"{fill_label}: ${indicative_stake:.2f} (req ${stake:.2f}) @ {indicative_price:.3f}\n"
         f"Reason: {decision.reasons[0] if decision.reasons else 'locked'}\n"
         f"Market: {market.question[:60]}",
     )
-    return actual_stake
+    return indicative_stake
 
 
 def _extract_bracket_buckets(market) -> list[int]:

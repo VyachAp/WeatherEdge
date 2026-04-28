@@ -185,13 +185,37 @@ class TestParseQuestion:
         assert p.matched
         assert p.threshold == 115.0
 
-    def test_celsius_lowest_temperature(self):
+    def test_rejects_lowest_temperature(self):
+        # Lowest-temperature markets are filtered upstream — the daily-max
+        # pipeline cannot evaluate them. Must parse as unmatched.
         p = parse_question(
             "Will the lowest temperature in Seoul be 5°C or lower on April 12?"
         )
+        assert not p.matched
+        assert p.operator is None
+        assert p.threshold is None
+
+    def test_rejects_lowest_temperature_exactly(self):
+        p = parse_question(
+            "Will the lowest temperature in Paris be 10°C on April 28?"
+        )
+        assert not p.matched
+        assert p.operator is None
+        assert p.threshold is None
+
+    def test_rejects_minimum_temperature(self):
+        p = parse_question("Minimum temperature in Seoul on April 12?")
+        assert not p.matched
+        assert p.operator is None
+
+    def test_accepts_highest_exactly(self):
+        # Regression guard — highest-temperature parsing must keep working.
+        p = parse_question(
+            "Will the highest temperature in Paris be 22°C on April 11?"
+        )
         assert p.matched
-        assert p.threshold == pytest.approx(41.0)  # 5°C = 41°F
-        assert p.operator in ("below", "at_most")
+        assert p.operator == "exactly"
+        assert p.threshold == pytest.approx(71.6)
 
     def test_celsius_generic_above(self):
         p = parse_question(
