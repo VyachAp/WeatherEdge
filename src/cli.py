@@ -871,20 +871,20 @@ def bet_diagnose(post_test: bool, rotate_api_key: bool) -> None:
     from eth_account import Account as _Acct
     from eth_utils import keccak
     from poly_eip712_structs import make_domain
+    # Apply the same monkey-patch build_clob_client uses BEFORE importing
+    # ClobClient or the order builder — those modules capture
+    # get_contract_config via ``from ... import`` at import time.
+    from src.execution.polymarket_client import apply_new_exchange_patch
+    apply_new_exchange_patch()
+    from py_clob_client import config as _clob_config
     from py_clob_client.client import ClobClient
     from py_clob_client.clob_types import MarketOrderArgs, OrderType
-    from py_clob_client.config import get_contract_config
     from py_clob_client.order_builder.constants import BUY
     from py_order_utils.model.order import Order
 
     if not settings.POLYMARKET_PRIVATE_KEY:
         click.echo("  (no client; POLYMARKET_PRIVATE_KEY missing)")
         return
-
-    # Apply the same monkey-patch build_clob_client uses, so this diagnostic
-    # signs for the active (old vs new) exchange set.
-    from src.execution.polymarket_client import apply_new_exchange_patch
-    apply_new_exchange_patch()
 
     # Build client with optional fresh API creds
     temp_client = ClobClient(
@@ -975,7 +975,7 @@ def bet_diagnose(post_test: bool, rotate_api_key: bool) -> None:
             click.echo(f"\n  -- {'NEG-RISK' if nr_flag else 'REGULAR'}: no tradeable market found --")
             continue
         info = found[nr_flag]
-        cfg = get_contract_config(settings.POLYMARKET_CHAIN_ID, nr_flag)
+        cfg = _clob_config.get_contract_config(settings.POLYMARKET_CHAIN_ID, nr_flag)
         click.echo(f"\n  -- {'NEG-RISK' if nr_flag else 'REGULAR'} test market --")
         click.echo(f"    Question:      {info['question'][:70]}")
         click.echo(f"    Token id:      {info['token'][:32]}...")

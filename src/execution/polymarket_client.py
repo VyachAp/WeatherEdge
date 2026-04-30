@@ -67,13 +67,21 @@ def apply_new_exchange_patch() -> None:
 
     Idempotent — repeated calls are no-ops. Only patches when the flag is set
     and chain_id is mainnet (137); other chains (testnet) are passed through.
+
+    Patches the function in *every* module that has already imported it via
+    ``from py_clob_client.config import get_contract_config``. Without that,
+    the order builder keeps its original reference (Python ``from x import y``
+    binds at import time) and orders still get signed for the OLD exchanges
+    even though the canonical name in ``py_clob_client.config`` is patched.
     """
     global _new_exchange_patch_applied  # noqa: PLW0603
     if _new_exchange_patch_applied or not settings.POLYMARKET_USE_NEW_EXCHANGES:
         return
 
+    from py_clob_client import client as _client_mod
     from py_clob_client import config as _cfg
     from py_clob_client.clob_types import ContractConfig
+    from py_clob_client.order_builder import builder as _builder_mod
 
     _orig = _cfg.get_contract_config
 
@@ -86,7 +94,11 @@ def apply_new_exchange_patch() -> None:
             conditional_tokens=NEW_EXCHANGES["ctf"],
         )
 
+    # Patch all sites that captured the function via `from ... import ...`
     _cfg.get_contract_config = _patched
+    _client_mod.get_contract_config = _patched
+    _builder_mod.get_contract_config = _patched
+
     _new_exchange_patch_applied = True
     logger.warning(
         "Patched py_clob_client to use NEW Polymarket exchanges "
