@@ -768,6 +768,99 @@ def bet_place(market: str, side: str, amount: float, skip_confirm: bool, ignore_
     asyncio.run(_place())
 
 
+@bet.command("diagnose")
+def bet_diagnose() -> None:
+    """Diagnose the wallet/signature setup against Polymarket.
+
+    Prints the EOA, configured funder, signature_type, USDC.e balance at
+    each, and the proxy address Polymarket has registered for the EOA (if
+    any). Useful for triaging ``order_version_mismatch`` errors.
+    """
+    import httpx
+    from eth_account import Account
+    from web3 import Web3
+
+    if not settings.POLYMARKET_PRIVATE_KEY:
+        click.echo("Error: POLYMARKET_PRIVATE_KEY not set in .env")
+        raise SystemExit(1)
+
+    eoa = Account.from_key(settings.POLYMARKET_PRIVATE_KEY).address
+    configured_funder = settings.POLYMARKET_FUNDER_ADDRESS or eoa
+    sig_type = settings.POLYMARKET_SIGNATURE_TYPE
+
+    click.echo("=== Configured ===")
+    click.echo(f"  EOA:           {eoa}")
+    click.echo(f"  Funder:        {configured_funder}{' (= EOA)' if configured_funder.lower() == eoa.lower() else ''}")
+    click.echo(f"  sig_type:      {sig_type}  ({'EOA' if sig_type == 0 else 'POLY_PROXY' if sig_type == 1 else 'POLY_GNOSIS_SAFE' if sig_type == 2 else 'unknown'})")
+
+    USDC_E = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+    BAL_ABI = [{"inputs": [{"name": "account", "type": "address"}], "name": "balanceOf", "outputs": [{"name": "", "type": "uint256"}], "stateMutability": "view", "type": "function"}]
+
+    w3 = Web3(Web3.HTTPProvider("https://polygon-bor-rpc.publicnode.com", request_kwargs={"timeout": 10}))
+    usdc = w3.eth.contract(address=Web3.to_checksum_address(USDC_E), abi=BAL_ABI)
+
+    click.echo("\n=== USDC.e on-chain balances ===")
+    for label, addr in [("EOA", eoa), ("Funder", configured_funder)]:
+        if addr.lower() == eoa.lower() and label == "Funder":
+            continue
+        try:
+            bal = usdc.functions.balanceOf(Web3.to_checksum_address(addr)).call() / 1e6
+            click.echo(f"  {label} ({addr}): ${bal:.2f}")
+        except Exception as exc:
+            click.echo(f"  {label} ({addr}): lookup failed ({exc})")
+
+    click.echo("\n=== Polymarket proxy lookup ===")
+    proxy_endpoints = [
+        ("CLOB proxy-wallet-address", f"https://clob.polymarket.com/proxy-wallet-address?address={eoa}"),
+        ("Gamma get-account", f"https://gamma-api.polymarket.com/account?address={eoa}"),
+    ]
+    discovered_proxies: list[tuple[str, str]] = []
+    with httpx.Client(timeout=10) as http:
+        for label, url in proxy_endpoints:
+            try:
+                r = http.get(url)
+                click.echo(f"  {label}: HTTP {r.status_code}")
+                if r.status_code == 200:
+                    body = r.text.strip()
+                    click.echo(f"    body: {body[:300]}")
+                    try:
+                        data = r.json()
+                        candidates: list[str] = []
+                        if isinstance(data, dict):
+                            for key in ("proxyAddress", "proxy_address", "proxy", "address", "smartWalletAddress"):
+                                v = data.get(key)
+                                if isinstance(v, str) and v.startswith("0x") and len(v) == 42:
+                                    candidates.append(v)
+                        elif isinstance(data, str) and data.startswith("0x") and len(data) == 42:
+                            candidates.append(data)
+                        for c in candidates:
+                            if c.lower() != eoa.lower() and c != "0x0000000000000000000000000000000000000000":
+                                discovered_proxies.append((label, c))
+                    except Exception:
+                        pass
+            except Exception as exc:
+                click.echo(f"  {label}: request failed ({exc})")
+
+    if discovered_proxies:
+        click.echo("\n=== Discovered proxies (different from EOA) ===")
+        for label, addr in discovered_proxies:
+            try:
+                bal = usdc.functions.balanceOf(Web3.to_checksum_address(addr)).call() / 1e6
+                click.echo(f"  {label}: {addr}  USDC.e=${bal:.2f}")
+            except Exception:
+                click.echo(f"  {label}: {addr}  (balance lookup failed)")
+        click.echo("\nIf one of these holds your real Polymarket balance, set:")
+        addr = discovered_proxies[0][1]
+        click.echo(f"  POLYMARKET_FUNDER_ADDRESS={addr}")
+        click.echo("  POLYMARKET_SIGNATURE_TYPE=2   # try 1 if 2 still fails")
+    else:
+        click.echo("\nNo proxy discovered via public endpoints. The wallet may be a")
+        click.echo("raw EOA on Polymarket, or the proxy lookup endpoint name has changed.")
+        click.echo("Open polymarket.com -> Profile -> Settings while logged in with this wallet")
+        click.echo("and look for the 'Deposit address' / 'Smart contract wallet' field. That")
+        click.echo("address is what POLYMARKET_FUNDER_ADDRESS should be set to.")
+
+
 @bet.command("info")
 @click.argument("market")
 def bet_info(market: str) -> None:
