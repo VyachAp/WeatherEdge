@@ -62,7 +62,7 @@ def current_exchange_config() -> dict[str, str]:
 _new_exchange_patch_applied = False
 
 
-def _apply_new_exchange_patch() -> None:
+def apply_new_exchange_patch() -> None:
     """Monkey-patch py_clob_client to sign for the new exchange addresses.
 
     Idempotent — repeated calls are no-ops. Only patches when the flag is set
@@ -121,7 +121,7 @@ def build_clob_client():
     if not settings.POLYMARKET_PRIVATE_KEY:
         return None
 
-    _apply_new_exchange_patch()
+    apply_new_exchange_patch()
 
     from eth_account import Account
     from py_clob_client.client import ClobClient

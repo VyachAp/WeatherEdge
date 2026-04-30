@@ -881,6 +881,11 @@ def bet_diagnose(post_test: bool, rotate_api_key: bool) -> None:
         click.echo("  (no client; POLYMARKET_PRIVATE_KEY missing)")
         return
 
+    # Apply the same monkey-patch build_clob_client uses, so this diagnostic
+    # signs for the active (old vs new) exchange set.
+    from src.execution.polymarket_client import apply_new_exchange_patch
+    apply_new_exchange_patch()
+
     # Build client with optional fresh API creds
     temp_client = ClobClient(
         settings.POLYMARKET_HOST,
