@@ -780,6 +780,8 @@ def bet_diagnose() -> None:
     from eth_account import Account
     from web3 import Web3
 
+    from src.config import settings
+
     if not settings.POLYMARKET_PRIVATE_KEY:
         click.echo("Error: POLYMARKET_PRIVATE_KEY not set in .env")
         raise SystemExit(1)
