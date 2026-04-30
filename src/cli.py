@@ -433,28 +433,14 @@ def approve() -> None:
 
     # --- Notify CLOB server ---
     click.echo("\nNotifying Polymarket CLOB server...")
-    from eth_account import Account
-    from py_clob_client.client import ClobClient
     from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
 
-    account = Account.from_key(settings.POLYMARKET_PRIVATE_KEY)
-    funder_address = account.address
+    from src.execution.polymarket_client import build_clob_client
 
-    temp_client = ClobClient(
-        settings.POLYMARKET_HOST,
-        key=settings.POLYMARKET_PRIVATE_KEY,
-        chain_id=settings.POLYMARKET_CHAIN_ID,
-    )
-    creds = temp_client.create_or_derive_api_creds()
-
-    client = ClobClient(
-        settings.POLYMARKET_HOST,
-        key=settings.POLYMARKET_PRIVATE_KEY,
-        chain_id=settings.POLYMARKET_CHAIN_ID,
-        creds=creds,
-        signature_type=0,
-        funder=funder_address,
-    )
+    client = build_clob_client()
+    if client is None:
+        click.echo("Error: POLYMARKET_PRIVATE_KEY not set in .env")
+        raise SystemExit(1)
     client.update_balance_allowance(BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
     click.echo("Done! You can now trade on Polymarket.")
 
@@ -475,42 +461,36 @@ def test_trade(amount: float) -> None:
             raise SystemExit(1)
 
         from eth_account import Account
-        from py_clob_client.client import ClobClient
         from py_clob_client.clob_types import MarketOrderArgs, OrderType
+
+        from src.execution.polymarket_client import build_clob_client
 
         account = Account.from_key(settings.POLYMARKET_PRIVATE_KEY)
         funder_address = account.address
 
-        temp_client = ClobClient(
-            settings.POLYMARKET_HOST,
-            key=settings.POLYMARKET_PRIVATE_KEY,
-            chain_id=settings.POLYMARKET_CHAIN_ID,
-        )
-        creds = temp_client.create_or_derive_api_creds()
-
-        client = ClobClient(
-            settings.POLYMARKET_HOST,
-            key=settings.POLYMARKET_PRIVATE_KEY,
-            chain_id=settings.POLYMARKET_CHAIN_ID,
-            creds=creds,
-            signature_type=0,
-            funder=funder_address,
-        )
+        client = build_clob_client()
+        if client is None:
+            click.echo("Error: POLYMARKET_PRIVATE_KEY not set in .env")
+            raise SystemExit(1)
 
         import httpx
         from web3 import Web3
 
         # --- Diagnostic: check on-chain USDC.e balance ---
+        # For UI-onboarded wallets, funds live on the configured funder
+        # (proxy/safe), not on the EOA. Check the configured funder.
+        configured_funder = settings.POLYMARKET_FUNDER_ADDRESS or funder_address
         USDC_E = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
         USDC_NATIVE = "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359"
         BAL_ABI = [{"inputs": [{"name": "account", "type": "address"}], "name": "balanceOf", "outputs": [{"name": "", "type": "uint256"}], "stateMutability": "view", "type": "function"}]
 
         w3 = Web3(Web3.HTTPProvider("https://polygon-bor-rpc.publicnode.com", request_kwargs={"timeout": 10}))
-        addr = Web3.to_checksum_address(funder_address)
+        addr = Web3.to_checksum_address(configured_funder)
         usdc_e_bal = w3.eth.contract(address=Web3.to_checksum_address(USDC_E), abi=BAL_ABI).functions.balanceOf(addr).call()
         usdc_n_bal = w3.eth.contract(address=Web3.to_checksum_address(USDC_NATIVE), abi=BAL_ABI).functions.balanceOf(addr).call()
 
-        click.echo(f"Wallet: {funder_address}")
+        click.echo(f"EOA:    {funder_address}")
+        click.echo(f"Funder: {configured_funder}  (sig_type={settings.POLYMARKET_SIGNATURE_TYPE})")
         click.echo(f"USDC.e balance:      ${usdc_e_bal / 1e6:.2f}  (required by Polymarket)")
         click.echo(f"Native USDC balance: ${usdc_n_bal / 1e6:.2f}")
 
@@ -519,7 +499,7 @@ def test_trade(amount: float) -> None:
             click.echo("Swap native USDC -> USDC.e on a DEX (e.g. Uniswap on Polygon).")
             raise SystemExit(1)
         if usdc_e_bal == 0:
-            click.echo("\nError: No USDC.e on this wallet. Deposit USDC.e to trade.")
+            click.echo("\nError: No USDC.e on the configured funder. Deposit USDC.e to trade.")
             raise SystemExit(1)
 
         click.echo("Finding a tradeable market...")

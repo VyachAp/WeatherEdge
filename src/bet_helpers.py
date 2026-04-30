@@ -176,7 +176,8 @@ def extract_token_ids(market: dict) -> tuple[str, str] | None:
 
 
 async def get_usdc_balance(private_key: str) -> tuple[float, float, float]:
-    """Check on-chain pUSD, USDC.e, and native USDC balances.
+    """Check on-chain pUSD, USDC.e, and native USDC balances at the funder
+    address (proxy/safe if configured, else the EOA).
 
     Returns (pusd_usd, usdc_e_usd, native_usdc_usd).
     """
@@ -197,7 +198,8 @@ async def get_usdc_balance(private_key: str) -> tuple[float, float, float]:
     ]
 
     account = Account.from_key(private_key)
-    addr = Web3.to_checksum_address(account.address)
+    funder = settings.POLYMARKET_FUNDER_ADDRESS or account.address
+    addr = Web3.to_checksum_address(funder)
 
     w3 = Web3(
         Web3.HTTPProvider(
@@ -295,28 +297,15 @@ def get_clob_client():
     """Initialise a ClobClient for manual bet placement.
 
     Only requires POLYMARKET_PRIVATE_KEY (AUTO_EXECUTE is irrelevant).
+    Honours POLYMARKET_SIGNATURE_TYPE / POLYMARKET_FUNDER_ADDRESS for
+    UI-onboarded wallets.
     """
-    from eth_account import Account
-    from py_clob_client.client import ClobClient
+    from src.execution.polymarket_client import build_clob_client
 
-    account = Account.from_key(settings.POLYMARKET_PRIVATE_KEY)
-    funder_address = account.address
-
-    temp_client = ClobClient(
-        settings.POLYMARKET_HOST,
-        key=settings.POLYMARKET_PRIVATE_KEY,
-        chain_id=settings.POLYMARKET_CHAIN_ID,
-    )
-    creds = temp_client.create_or_derive_api_creds()
-
-    return ClobClient(
-        settings.POLYMARKET_HOST,
-        key=settings.POLYMARKET_PRIVATE_KEY,
-        chain_id=settings.POLYMARKET_CHAIN_ID,
-        creds=creds,
-        signature_type=0,
-        funder=funder_address,
-    )
+    client = build_clob_client()
+    if client is None:
+        raise RuntimeError("POLYMARKET_PRIVATE_KEY is not set")
+    return client
 
 
 # ---------------------------------------------------------------------------

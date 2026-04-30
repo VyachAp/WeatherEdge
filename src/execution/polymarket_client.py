@@ -30,24 +30,29 @@ _client = None
 _api_creds_set = False
 
 
-def _get_client():
-    """Lazily initialise the CLOB client singleton."""
-    global _client, _api_creds_set  # noqa: PLW0603
+def build_clob_client():
+    """Build a fresh ClobClient using the configured signature_type / funder.
 
-    if _client is not None:
-        return _client
+    Returns None when ``POLYMARKET_PRIVATE_KEY`` is empty (dry-run mode).
 
+    The funder + signature_type pair must match what Polymarket has registered
+    for this wallet. For a wallet that has never logged into polymarket.com,
+    leave the defaults (``POLYMARKET_SIGNATURE_TYPE=0`` and an empty
+    ``POLYMARKET_FUNDER_ADDRESS``) — funder is then derived from the EOA. For
+    a wallet that has been UI-onboarded, set ``POLYMARKET_SIGNATURE_TYPE=2``
+    and ``POLYMARKET_FUNDER_ADDRESS=<proxy address>``; otherwise the CLOB
+    rejects every order with ``order_version_mismatch``.
+    """
     if not settings.POLYMARKET_PRIVATE_KEY:
         return None
 
     from eth_account import Account
     from py_clob_client.client import ClobClient
 
-    # Derive wallet address from private key for funder parameter
-    account = Account.from_key(settings.POLYMARKET_PRIVATE_KEY)
-    funder_address = account.address
+    eoa_address = Account.from_key(settings.POLYMARKET_PRIVATE_KEY).address
+    funder_address = settings.POLYMARKET_FUNDER_ADDRESS or eoa_address
+    signature_type = settings.POLYMARKET_SIGNATURE_TYPE
 
-    # Step 1: temporary client to derive API creds
     temp_client = ClobClient(
         settings.POLYMARKET_HOST,
         key=settings.POLYMARKET_PRIVATE_KEY,
@@ -55,17 +60,37 @@ def _get_client():
     )
     creds = temp_client.create_or_derive_api_creds()
 
-    # Step 2: full client with creds, signature_type, and funder
-    _client = ClobClient(
+    return ClobClient(
         settings.POLYMARKET_HOST,
         key=settings.POLYMARKET_PRIVATE_KEY,
         chain_id=settings.POLYMARKET_CHAIN_ID,
         creds=creds,
-        signature_type=0,  # EOA wallet
+        signature_type=signature_type,
         funder=funder_address,
     )
+
+
+def _get_client():
+    """Lazily initialise the CLOB client singleton."""
+    global _client, _api_creds_set  # noqa: PLW0603
+
+    if _client is not None:
+        return _client
+
+    _client = build_clob_client()
+    if _client is None:
+        return None
+
     _api_creds_set = True
-    logger.info("Polymarket CLOB client initialised (wallet: %s)", funder_address)
+    from eth_account import Account
+    eoa_address = Account.from_key(settings.POLYMARKET_PRIVATE_KEY).address
+    funder = settings.POLYMARKET_FUNDER_ADDRESS or eoa_address
+    logger.info(
+        "Polymarket CLOB client initialised (eoa=%s funder=%s sig_type=%d)",
+        eoa_address,
+        funder,
+        settings.POLYMARKET_SIGNATURE_TYPE,
+    )
 
     return _client
 

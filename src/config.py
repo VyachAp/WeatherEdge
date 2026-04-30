@@ -46,6 +46,13 @@ class Settings(BaseSettings):
     POLYMARKET_PRIVATE_KEY: str = ""  # Polygon wallet private key; empty = dry-run
     POLYMARKET_HOST: str = "https://clob.polymarket.com"
     POLYMARKET_CHAIN_ID: int = 137  # Polygon mainnet
+    # 0=EOA (raw wallet), 1=Polymarket-Proxy, 2=Gnosis-safe-style proxy.
+    # If your wallet has ever logged into polymarket.com, the API expects
+    # signature_type=2 and POLYMARKET_FUNDER_ADDRESS set to the proxy
+    # address (not the EOA). Leaving these at their defaults works only
+    # for fresh wallets that have never touched the Polymarket UI.
+    POLYMARKET_SIGNATURE_TYPE: int = 0
+    POLYMARKET_FUNDER_ADDRESS: str = ""  # Empty = derive EOA from private key
     AUTO_EXECUTE: bool = False  # Set True to place orders automatically
     DAILY_SPEND_CAP_USD: float = 200.0  # Max total spend per 24h
     MIN_STAKE_USD: float = 5.0  # Skip orders below this amount
