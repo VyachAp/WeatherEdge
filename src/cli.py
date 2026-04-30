@@ -799,19 +799,24 @@ def bet_diagnose(post_test: bool, rotate_api_key: bool) -> None:
     click.echo(f"  Funder:        {configured_funder}{' (= EOA)' if configured_funder.lower() == eoa.lower() else ''}")
     click.echo(f"  sig_type:      {sig_type}  ({'EOA' if sig_type == 0 else 'POLY_PROXY' if sig_type == 1 else 'POLY_GNOSIS_SAFE' if sig_type == 2 else 'unknown'})")
 
-    USDC_E = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+    from src.execution.polymarket_client import OLD_EXCHANGES, NEW_EXCHANGES
     BAL_ABI = [{"inputs": [{"name": "account", "type": "address"}], "name": "balanceOf", "outputs": [{"name": "", "type": "uint256"}], "stateMutability": "view", "type": "function"}]
 
     w3 = Web3(Web3.HTTPProvider("https://polygon-bor-rpc.publicnode.com", request_kwargs={"timeout": 10}))
-    usdc = w3.eth.contract(address=Web3.to_checksum_address(USDC_E), abi=BAL_ABI)
+    usdc_e = w3.eth.contract(address=Web3.to_checksum_address(OLD_EXCHANGES["collateral"]), abi=BAL_ABI)
+    pusd = w3.eth.contract(address=Web3.to_checksum_address(NEW_EXCHANGES["collateral"]), abi=BAL_ABI)
 
-    click.echo("\n=== USDC.e on-chain balances ===")
+    click.echo("\n=== On-chain collateral balances ===")
     for label, addr in [("EOA", eoa), ("Funder", configured_funder)]:
         if addr.lower() == eoa.lower() and label == "Funder":
             continue
+        cs = Web3.to_checksum_address(addr)
         try:
-            bal = usdc.functions.balanceOf(Web3.to_checksum_address(addr)).call() / 1e6
-            click.echo(f"  {label} ({addr}): ${bal:.2f}")
+            usdc_bal = usdc_e.functions.balanceOf(cs).call() / 1e6
+            pusd_bal = pusd.functions.balanceOf(cs).call() / 1e6
+            click.echo(f"  {label} ({addr}):")
+            click.echo(f"    USDC.e (old collateral):  ${usdc_bal:.2f}")
+            click.echo(f"    pUSD   (new collateral):  ${pusd_bal:.2f}")
         except Exception as exc:
             click.echo(f"  {label} ({addr}): lookup failed ({exc})")
 
@@ -851,7 +856,7 @@ def bet_diagnose(post_test: bool, rotate_api_key: bool) -> None:
         click.echo("\n=== Discovered proxies (different from EOA) ===")
         for label, addr in discovered_proxies:
             try:
-                bal = usdc.functions.balanceOf(Web3.to_checksum_address(addr)).call() / 1e6
+                bal = usdc_e.functions.balanceOf(Web3.to_checksum_address(addr)).call() / 1e6
                 click.echo(f"  {label}: {addr}  USDC.e=${bal:.2f}")
             except Exception:
                 click.echo(f"  {label}: {addr}  (balance lookup failed)")
