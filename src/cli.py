@@ -288,16 +288,18 @@ def approve() -> None:
     ]
     CHAIN_ID = 137
 
-    # Token contracts
-    USDC = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
-    CTF = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
+    # Token + spender contracts (active set depends on POLYMARKET_USE_NEW_EXCHANGES)
+    from src.execution.polymarket_client import current_exchange_config
+    cfg = current_exchange_config()
+    USDC = cfg["collateral"]   # USDC.e on the old exchanges, pUSD on the new
+    CTF = cfg["ctf"]
 
-    # Spender contracts that need approval
     SPENDERS = {
-        "CTF Exchange": "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E",
-        "Neg Risk CTF Exchange": "0xC5d563A36AE78145C45a50134d48A1215220f80a",
-        "Neg Risk Adapter": "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296",
+        "CTF Exchange": cfg["regular"],
+        "Neg Risk CTF Exchange": cfg["neg_risk"],
+        "Neg Risk Adapter": cfg["neg_risk_adapter"],
     }
+    click.echo(f"Approving {('NEW' if settings.POLYMARKET_USE_NEW_EXCHANGES else 'OLD')} exchange set")
 
     ERC20_ABI = [
         {

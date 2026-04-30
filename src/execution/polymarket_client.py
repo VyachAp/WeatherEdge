@@ -23,11 +23,86 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# Polymarket exchange contract addresses
+# ---------------------------------------------------------------------------
+#
+# Polymarket migrated to new exchange contracts using pUSD as collateral some
+# time before 2026-04. The ``OLD_*`` set ships in py-clob-client 0.34.6 and is
+# what the SDK signs orders for by default. The ``NEW_*`` set is what
+# Polymarket's API actually routes to today; signing for the OLD set produces
+# ``order_version_mismatch``.
+#
+# When ``settings.POLYMARKET_USE_NEW_EXCHANGES`` is True, ``build_clob_client``
+# monkey-patches ``py_clob_client.config.get_contract_config`` to return the
+# new addresses + pUSD collateral. The user must already have pUSD on the
+# funder address before flipping the flag (deposit via polymarket.com UI).
+
+OLD_EXCHANGES = {
+    "regular": "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E",
+    "neg_risk": "0xC5d563A36AE78145C45a50134d48A1215220f80a",
+    "collateral": "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174",  # USDC.e
+    "ctf": "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045",
+    "neg_risk_adapter": "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296",
+}
+
+NEW_EXCHANGES = {
+    "regular": "0xE111180000d2663C0091e4f400237545B87B996B",
+    "neg_risk": "0xe2222d279d744050d28e00520010520000310F59",
+    "collateral": "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB",  # pUSD
+    "ctf": "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045",
+    "neg_risk_adapter": "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296",
+}
+
+
+def current_exchange_config() -> dict[str, str]:
+    """Return the active exchange address dict (old or new) per the feature flag."""
+    return NEW_EXCHANGES if settings.POLYMARKET_USE_NEW_EXCHANGES else OLD_EXCHANGES
+
+
+_new_exchange_patch_applied = False
+
+
+def _apply_new_exchange_patch() -> None:
+    """Monkey-patch py_clob_client to sign for the new exchange addresses.
+
+    Idempotent — repeated calls are no-ops. Only patches when the flag is set
+    and chain_id is mainnet (137); other chains (testnet) are passed through.
+    """
+    global _new_exchange_patch_applied  # noqa: PLW0603
+    if _new_exchange_patch_applied or not settings.POLYMARKET_USE_NEW_EXCHANGES:
+        return
+
+    from py_clob_client import config as _cfg
+    from py_clob_client.clob_types import ContractConfig
+
+    _orig = _cfg.get_contract_config
+
+    def _patched(chain_id: int, neg_risk: bool = False) -> ContractConfig:
+        if chain_id != 137:
+            return _orig(chain_id, neg_risk)
+        return ContractConfig(
+            exchange=NEW_EXCHANGES["neg_risk"] if neg_risk else NEW_EXCHANGES["regular"],
+            collateral=NEW_EXCHANGES["collateral"],
+            conditional_tokens=NEW_EXCHANGES["ctf"],
+        )
+
+    _cfg.get_contract_config = _patched
+    _new_exchange_patch_applied = True
+    logger.warning(
+        "Patched py_clob_client to use NEW Polymarket exchanges "
+        "(regular=%s neg_risk=%s collateral=pUSD)",
+        NEW_EXCHANGES["regular"],
+        NEW_EXCHANGES["neg_risk"],
+    )
+
+
+# ---------------------------------------------------------------------------
 # Module-level client singleton
 # ---------------------------------------------------------------------------
 
 _client = None
 _api_creds_set = False
+_version_mismatch_alerted = False  # one-shot alert dedup per process
 
 
 def build_clob_client():
@@ -45,6 +120,8 @@ def build_clob_client():
     """
     if not settings.POLYMARKET_PRIVATE_KEY:
         return None
+
+    _apply_new_exchange_patch()
 
     from eth_account import Account
     from py_clob_client.client import ClobClient
@@ -368,12 +445,49 @@ async def place_order(
         error_msg = resp.get("errorMsg", "unknown error")
         logger.error("Order failed: market=%s error=%s", trade.market_id, error_msg)
         trade.exchange_status = f"failed: {error_msg}"
+        await _maybe_alert_version_mismatch(error_msg, trade.market_id)
         return False
 
-    except Exception:
+    except Exception as exc:
         logger.exception("Order execution error for market %s", trade.market_id)
         trade.exchange_status = "exception"
+        await _maybe_alert_version_mismatch(str(exc), trade.market_id)
         return False
+
+
+async def _maybe_alert_version_mismatch(message: str, market_id: str) -> None:
+    """Fire a one-shot Telegram alert when Polymarket rejects with
+    ``order_version_mismatch``.
+
+    This error means the SDK is signing for an exchange contract Polymarket no
+    longer routes to — typically because Polymarket migrated and the locally
+    pinned addresses are stale. With AUTO_EXECUTE on, every signal would be
+    silently rejected; the alert exists so the operator can flip
+    ``POLYMARKET_USE_NEW_EXCHANGES`` (or ship a patched address set) before
+    the next trading day.
+    """
+    global _version_mismatch_alerted  # noqa: PLW0603
+    if _version_mismatch_alerted or "order_version_mismatch" not in message.lower():
+        return
+    _version_mismatch_alerted = True
+
+    try:
+        from src.execution.alerter import get_alerter
+
+        alerter = get_alerter()
+        cfg = "NEW" if settings.POLYMARKET_USE_NEW_EXCHANGES else "OLD"
+        regular = current_exchange_config()["regular"]
+        neg_risk = current_exchange_config()["neg_risk"]
+        err = RuntimeError(
+            f"Polymarket rejected order with order_version_mismatch on market {market_id}. "
+            f"Bot is signing for {cfg} exchange addresses (regular={regular}, neg_risk={neg_risk}). "
+            f"This usually means Polymarket migrated exchange contracts. "
+            f"Run `python -m src.cli bet diagnose` to inspect, then flip "
+            f"POLYMARKET_USE_NEW_EXCHANGES or update the address constants."
+        )
+        await alerter.send_system_error(err, context="Polymarket exchange version mismatch")
+    except Exception:
+        logger.exception("Failed to send order_version_mismatch alert")
 
 
 async def _update_fill_details(trade: Trade, client) -> None:

@@ -53,6 +53,12 @@ class Settings(BaseSettings):
     # for fresh wallets that have never touched the Polymarket UI.
     POLYMARKET_SIGNATURE_TYPE: int = 0
     POLYMARKET_FUNDER_ADDRESS: str = ""  # Empty = derive EOA from private key
+    # Polymarket migrated to new exchange contracts (collateral=pUSD) in 2026.
+    # Set True after depositing to pUSD via the polymarket.com UI. The flag
+    # monkey-patches py-clob-client to sign for the new exchanges instead of
+    # the old USDC.e ones; without it every order is rejected with
+    # ``order_version_mismatch``.
+    POLYMARKET_USE_NEW_EXCHANGES: bool = False
     AUTO_EXECUTE: bool = False  # Set True to place orders automatically
     DAILY_SPEND_CAP_USD: float = 200.0  # Max total spend per 24h
     MIN_STAKE_USD: float = 5.0  # Skip orders below this amount
