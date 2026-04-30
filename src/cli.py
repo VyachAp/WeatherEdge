@@ -902,6 +902,32 @@ def bet_diagnose(post_test: bool, rotate_api_key: bool) -> None:
         funder=funder,
     )
 
+    # Polymarket-side state for this wallet
+    click.echo("\n=== Polymarket-side state for this wallet ===")
+    try:
+        addr_seen_by_clob = client.get_address()
+        click.echo(f"  client.get_address():     {addr_seen_by_clob}")
+    except Exception as exc:  # noqa: BLE001
+        click.echo(f"  get_address(): {type(exc).__name__}: {exc}")
+    try:
+        keys = client.get_api_keys()
+        click.echo(f"  get_api_keys():           {keys}")
+    except Exception as exc:  # noqa: BLE001
+        click.echo(f"  get_api_keys(): {type(exc).__name__}: {exc}")
+    try:
+        closed_only = client.get_closed_only_mode()
+        click.echo(f"  get_closed_only_mode():   {closed_only}")
+    except Exception as exc:  # noqa: BLE001
+        click.echo(f"  get_closed_only_mode(): {type(exc).__name__}: {exc}")
+    # Polymarket also exposes /balance-allowance which tells us what they think
+    # we have available — useful contrast with on-chain balance.
+    try:
+        from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
+        ba = client.get_balance_allowance(BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
+        click.echo(f"  get_balance_allowance():  {ba}")
+    except Exception as exc:  # noqa: BLE001
+        click.echo(f"  get_balance_allowance(): {type(exc).__name__}: {exc}")
+
     # Find one neg-risk and one non-neg-risk market to test side-by-side
     with httpx.Client(timeout=15) as http:
         r = http.get(
