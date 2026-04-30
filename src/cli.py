@@ -855,12 +855,114 @@ def bet_diagnose() -> None:
         addr = discovered_proxies[0][1]
         click.echo(f"  POLYMARKET_FUNDER_ADDRESS={addr}")
         click.echo("  POLYMARKET_SIGNATURE_TYPE=2   # try 1 if 2 still fails")
-    else:
-        click.echo("\nNo proxy discovered via public endpoints. The wallet may be a")
-        click.echo("raw EOA on Polymarket, or the proxy lookup endpoint name has changed.")
-        click.echo("Open polymarket.com -> Profile -> Settings while logged in with this wallet")
-        click.echo("and look for the 'Deposit address' / 'Smart contract wallet' field. That")
-        click.echo("address is what POLYMARKET_FUNDER_ADDRESS should be set to.")
+
+    # ----- Build & inspect a sample signed order -----
+    click.echo("\n=== Sample order signing (inspect what SDK actually sends) ===")
+    try:
+        from py_clob_client.clob_types import MarketOrderArgs, OrderType
+        from py_clob_client.config import get_contract_config
+        from py_clob_client.order_builder.constants import BUY
+
+        from src.execution.polymarket_client import build_clob_client
+
+        client = build_clob_client()
+        if client is None:
+            click.echo("  (no client; POLYMARKET_PRIVATE_KEY missing)")
+        else:
+            # Pick the most-liquid neg-risk weather market via Gamma to test signing
+            with httpx.Client(timeout=15) as http:
+                r = http.get(
+                    "https://gamma-api.polymarket.com/markets",
+                    params={"limit": 50, "active": "true", "order": "liquidity", "ascending": "false", "tag": "weather"},
+                )
+                markets = r.json() if r.status_code == 200 else []
+
+            sample_token = None
+            sample_neg_risk = None
+            sample_question = None
+            for m in markets:
+                token_ids = m.get("clobTokenIds") or []
+                if isinstance(token_ids, str):
+                    import json as _json
+                    token_ids = _json.loads(token_ids)
+                if len(token_ids) < 2 or not token_ids[0]:
+                    continue
+                try:
+                    nr = client.get_neg_risk(token_ids[0])
+                    sample_token = token_ids[0]
+                    sample_neg_risk = nr
+                    sample_question = m.get("question", "?")
+                    break
+                except Exception:
+                    continue
+
+            if not sample_token:
+                click.echo("  (no tradeable token found to test against)")
+            else:
+                click.echo(f"  Test market:   {sample_question[:70]}")
+                click.echo(f"  Token id:      {sample_token[:24]}...")
+                click.echo(f"  Neg-risk:      {sample_neg_risk}")
+                cfg = get_contract_config(settings.POLYMARKET_CHAIN_ID, sample_neg_risk)
+                click.echo(f"  Exchange addr: {cfg.exchange}")
+
+                # Build (but do NOT post) a $1 BUY YES order
+                args = MarketOrderArgs(token_id=sample_token, amount=1.0, side=BUY)
+                signed = client.create_market_order(args)
+                body = signed.dict()
+                click.echo("\n  Signed order body:")
+                for k, v in body.items():
+                    s = str(v)
+                    if len(s) > 90:
+                        s = s[:87] + "..."
+                    click.echo(f"    {k}: {s}")
+
+                # Recover signer locally to confirm the signature matches the EOA.
+                # Manually rebuild domain to confirm the verifyingContract matches.
+                from eth_utils import keccak
+                from poly_eip712_structs import make_domain
+                from py_order_utils.model.order import Order
+
+                domain = make_domain(
+                    name="Polymarket CTF Exchange",
+                    version="1",
+                    chainId=str(settings.POLYMARKET_CHAIN_ID),
+                    verifyingContract=cfg.exchange,
+                )
+                order_struct = Order(
+                    salt=int(body["salt"]),
+                    maker=body["maker"],
+                    signer=body["signer"],
+                    taker=body["taker"],
+                    tokenId=int(body["tokenId"]),
+                    makerAmount=int(body["makerAmount"]),
+                    takerAmount=int(body["takerAmount"]),
+                    expiration=int(body["expiration"]),
+                    nonce=int(body["nonce"]),
+                    feeRateBps=int(body["feeRateBps"]),
+                    side=0 if body["side"] == "BUY" else 1,
+                    signatureType=int(body["signatureType"]),
+                )
+                hash_to_sign = "0x" + keccak(order_struct.signable_bytes(domain=domain)).hex()
+                from eth_account import Account as _Acct
+                recovered = _Acct._recover_hash(hash_to_sign, signature=body["signature"])
+                ok = recovered.lower() == body["signer"].lower()
+                click.echo(f"\n  Hash signed:        {hash_to_sign}")
+                click.echo(f"  Recovered signer:   {recovered}")
+                click.echo(f"  Matches body.signer: {ok}")
+                click.echo(f"  Matches body.maker:  {recovered.lower() == body['maker'].lower()}")
+                if not ok:
+                    click.echo("\n  WARNING: signature does not recover to the order's signer field.")
+                    click.echo("  This is the kind of mismatch that produces order_version_mismatch.")
+                else:
+                    click.echo("\n  Local signature recovery succeeds.")
+                    click.echo("  If Polymarket still rejects with order_version_mismatch despite this,")
+                    click.echo("  the rejection is server-side state for this wallet/contract:")
+                    click.echo("    - maybe Polymarket has the wallet on a different exchange version internally")
+                    click.echo("    - try a non-neg-risk market: `bet info <id>` and check Neg-risk: False")
+                    click.echo("    - if all neg-risk markets fail, contact Polymarket support quoting the EOA address")
+
+    except Exception as exc:  # noqa: BLE001
+        click.echo(f"  Sample-signing failed: {type(exc).__name__}: {exc}")
 
 
 @bet.command("info")
