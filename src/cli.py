@@ -985,12 +985,16 @@ def bet_diagnose(post_test: bool, rotate_api_key: bool) -> None:
         except Exception as exc:  # noqa: BLE001
             click.echo(f"    Signing failed: {type(exc).__name__}: {exc}")
             continue
-        body = signed.dict() if hasattr(signed, "dict") else dict(signed)
-        # V2 Order body fields: salt, maker, signer, tokenId, makerAmount,
-        # takerAmount, side, signatureType, timestamp, metadata, builder
-        for k in ("signer", "maker", "signatureType", "salt", "timestamp", "metadata", "builder"):
+        # SignedOrderV2 is a plain dataclass with fields:
+        # salt, maker, signer, tokenId, makerAmount, takerAmount, side,
+        # signatureType, timestamp, metadata, builder, expiration, signature
+        import dataclasses as _dc
+        body = _dc.asdict(signed)
+        for k in ("signer", "maker", "signatureType", "salt", "timestamp", "metadata", "builder", "expiration"):
             if k in body:
                 click.echo(f"    {k}: {body[k]}")
+        sig = body.get("signature", "")
+        click.echo(f"    signature: {str(sig)[:24]}...")
 
         if not post_test:
             continue
