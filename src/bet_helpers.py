@@ -360,13 +360,13 @@ def format_market_info(market: dict) -> str:
 
 def get_trades_history(client) -> list[dict]:
     """Fetch all trade history from the CLOB API."""
-    from py_clob_client.clob_types import TradeParams
+    from py_clob_client_v2.clob_types import TradeParams
     return client.get_trades(TradeParams())
 
 
 def get_open_orders(client) -> list[dict]:
     """Fetch all open orders from the CLOB API."""
-    from py_clob_client.clob_types import OpenOrderParams
+    from py_clob_client_v2.clob_types import OpenOrderParams
     return client.get_orders(OpenOrderParams())
 
 

@@ -288,18 +288,21 @@ def approve() -> None:
     ]
     CHAIN_ID = 137
 
-    # Token + spender contracts (active set depends on POLYMARKET_USE_NEW_EXCHANGES)
-    from src.execution.polymarket_client import current_exchange_config
-    cfg = current_exchange_config()
-    USDC = cfg["collateral"]   # USDC.e on the old exchanges, pUSD on the new
-    CTF = cfg["ctf"]
+    # V2 SDK provides addresses for both V1 (legacy) and V2 (current) exchanges
+    # in one struct. Approve the V2 exchanges + the neg-risk adapter, since
+    # post-2026-04-28 only V2 routes orders.
+    from py_clob_client_v2.config import get_contract_config
+    cfg = get_contract_config(CHAIN_ID)
+    USDC = cfg.collateral  # pUSD post-migration; V2 SDK keeps this in `collateral`
+    CTF = cfg.conditional_tokens
 
     SPENDERS = {
-        "CTF Exchange": cfg["regular"],
-        "Neg Risk CTF Exchange": cfg["neg_risk"],
-        "Neg Risk Adapter": cfg["neg_risk_adapter"],
+        "CTF Exchange V2":       cfg.exchange_v2,
+        "Neg Risk Exchange V2":  cfg.neg_risk_exchange_v2,
+        "Neg Risk Adapter":      cfg.neg_risk_adapter,
     }
-    click.echo(f"Approving {('NEW' if settings.POLYMARKET_USE_NEW_EXCHANGES else 'OLD')} exchange set")
+    click.echo(f"Collateral: {USDC} (pUSD)")
+    click.echo(f"Spenders:   V2 exchanges + neg-risk adapter")
 
     ERC20_ABI = [
         {
@@ -435,7 +438,7 @@ def approve() -> None:
 
     # --- Notify CLOB server ---
     click.echo("\nNotifying Polymarket CLOB server...")
-    from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
+    from py_clob_client_v2.clob_types import AssetType, BalanceAllowanceParams
 
     from src.execution.polymarket_client import build_clob_client
 
@@ -463,7 +466,7 @@ def test_trade(amount: float) -> None:
             raise SystemExit(1)
 
         from eth_account import Account
-        from py_clob_client.clob_types import MarketOrderArgs, OrderType
+        from py_clob_client_v2.clob_types import MarketOrderArgsV2 as MarketOrderArgs, OrderType
 
         from src.execution.polymarket_client import build_clob_client
 
@@ -560,7 +563,7 @@ def test_trade(amount: float) -> None:
         click.echo(f"Tick size: {found_tick_size}, Neg risk: {found_neg_risk}")
         click.echo(f"Amount: ${amount:.2f}")
 
-        from py_clob_client.order_builder.constants import BUY
+        from py_clob_client_v2.order_builder.constants import BUY
 
         # Place a small FOK market buy on YES
         click.echo("Placing FOK market order...")
@@ -688,8 +691,8 @@ def bet_place(market: str, side: str, amount: float, skip_confirm: bool, ignore_
 
         click.echo(f"  Tick size: {tick_size}, Neg risk: {neg_risk}")
 
-        from py_clob_client.clob_types import MarketOrderArgs, OrderType
-        from py_clob_client.order_builder.constants import BUY
+        from py_clob_client_v2.clob_types import MarketOrderArgsV2 as MarketOrderArgs, OrderType
+        from py_clob_client_v2.order_builder.constants import BUY
 
         click.echo("Placing FOK market order...")
         market_order = MarketOrderArgs(token_id=token_id, amount=amount, side=BUY)
@@ -799,12 +802,14 @@ def bet_diagnose(post_test: bool, rotate_api_key: bool) -> None:
     click.echo(f"  Funder:        {configured_funder}{' (= EOA)' if configured_funder.lower() == eoa.lower() else ''}")
     click.echo(f"  sig_type:      {sig_type}  ({'EOA' if sig_type == 0 else 'POLY_PROXY' if sig_type == 1 else 'POLY_GNOSIS_SAFE' if sig_type == 2 else 'unknown'})")
 
-    from src.execution.polymarket_client import OLD_EXCHANGES, NEW_EXCHANGES
+    USDC_E_ADDR = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"  # legacy V1 collateral
+    from py_clob_client_v2.config import get_contract_config
+    pusd_addr = get_contract_config(settings.POLYMARKET_CHAIN_ID).collateral
     BAL_ABI = [{"inputs": [{"name": "account", "type": "address"}], "name": "balanceOf", "outputs": [{"name": "", "type": "uint256"}], "stateMutability": "view", "type": "function"}]
 
     w3 = Web3(Web3.HTTPProvider("https://polygon-bor-rpc.publicnode.com", request_kwargs={"timeout": 10}))
-    usdc_e = w3.eth.contract(address=Web3.to_checksum_address(OLD_EXCHANGES["collateral"]), abi=BAL_ABI)
-    pusd = w3.eth.contract(address=Web3.to_checksum_address(NEW_EXCHANGES["collateral"]), abi=BAL_ABI)
+    usdc_e = w3.eth.contract(address=Web3.to_checksum_address(USDC_E_ADDR), abi=BAL_ABI)
+    pusd = w3.eth.contract(address=Web3.to_checksum_address(pusd_addr), abi=BAL_ABI)
 
     click.echo("\n=== On-chain collateral balances ===")
     for label, addr in [("EOA", eoa), ("Funder", configured_funder)]:
@@ -868,29 +873,20 @@ def bet_diagnose(post_test: bool, rotate_api_key: bool) -> None:
     # ----- Build & inspect a sample signed order against BOTH neg-risk and regular -----
     click.echo("\n=== Sample order signing (inspect what SDK actually sends) ===")
 
-    from eth_account import Account as _Acct
-    from eth_utils import keccak
-    from poly_eip712_structs import make_domain
-    # Apply the same monkey-patch build_clob_client uses BEFORE importing
-    # ClobClient or the order builder — those modules capture
-    # get_contract_config via ``from ... import`` at import time.
-    from src.execution.polymarket_client import apply_new_exchange_patch
-    apply_new_exchange_patch()
-    from py_clob_client import config as _clob_config
-    from py_clob_client.client import ClobClient
-    from py_clob_client.clob_types import MarketOrderArgs, OrderType
-    from py_clob_client.order_builder.constants import BUY
-    from py_order_utils.model.order import Order
+    from py_clob_client_v2.client import ClobClient
+    from py_clob_client_v2.clob_types import MarketOrderArgsV2, OrderType
+    from py_clob_client_v2.config import get_contract_config as _v2_get_cfg
+    from py_clob_client_v2.order_builder.constants import BUY
 
     if not settings.POLYMARKET_PRIVATE_KEY:
         click.echo("  (no client; POLYMARKET_PRIVATE_KEY missing)")
         return
 
-    # Build client with optional fresh API creds
+    # V2 ClobClient: chain_id is positional arg #2.
     temp_client = ClobClient(
         settings.POLYMARKET_HOST,
+        settings.POLYMARKET_CHAIN_ID,
         key=settings.POLYMARKET_PRIVATE_KEY,
-        chain_id=settings.POLYMARKET_CHAIN_ID,
     )
     if rotate_api_key:
         click.echo("  Forcing fresh API key creation...")
@@ -899,20 +895,25 @@ def bet_diagnose(post_test: bool, rotate_api_key: bool) -> None:
             click.echo(f"    new api_key: {str(creds.api_key)[:8]}...")
         except Exception as exc:  # noqa: BLE001
             click.echo(f"    create_api_key failed ({exc}); falling back to derive")
-            creds = temp_client.create_or_derive_api_creds()
+            creds = temp_client.create_or_derive_api_key()
     else:
-        creds = temp_client.create_or_derive_api_creds()
+        creds = temp_client.create_or_derive_api_key()
         click.echo(f"  Derived api_key: {str(creds.api_key)[:8]}...")
 
     funder = settings.POLYMARKET_FUNDER_ADDRESS or eoa
     client = ClobClient(
         settings.POLYMARKET_HOST,
+        settings.POLYMARKET_CHAIN_ID,
         key=settings.POLYMARKET_PRIVATE_KEY,
-        chain_id=settings.POLYMARKET_CHAIN_ID,
         creds=creds,
         signature_type=settings.POLYMARKET_SIGNATURE_TYPE,
         funder=funder,
     )
+
+    v2_cfg = _v2_get_cfg(settings.POLYMARKET_CHAIN_ID)
+    click.echo(f"  V2 regular exchange:  {v2_cfg.exchange_v2}")
+    click.echo(f"  V2 neg-risk exchange: {v2_cfg.neg_risk_exchange_v2}")
+    click.echo(f"  V2 collateral (pUSD): {v2_cfg.collateral}")
 
     # Polymarket-side state for this wallet
     click.echo("\n=== Polymarket-side state for this wallet ===")
@@ -934,7 +935,7 @@ def bet_diagnose(post_test: bool, rotate_api_key: bool) -> None:
     # Polymarket also exposes /balance-allowance which tells us what they think
     # we have available — useful contrast with on-chain balance.
     try:
-        from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
+        from py_clob_client_v2.clob_types import AssetType, BalanceAllowanceParams
         ba = client.get_balance_allowance(BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
         click.echo(f"  get_balance_allowance():  {ba}")
     except Exception as exc:  # noqa: BLE001
@@ -975,49 +976,21 @@ def bet_diagnose(post_test: bool, rotate_api_key: bool) -> None:
             click.echo(f"\n  -- {'NEG-RISK' if nr_flag else 'REGULAR'}: no tradeable market found --")
             continue
         info = found[nr_flag]
-        cfg = _clob_config.get_contract_config(settings.POLYMARKET_CHAIN_ID, nr_flag)
         click.echo(f"\n  -- {'NEG-RISK' if nr_flag else 'REGULAR'} test market --")
         click.echo(f"    Question:      {info['question'][:70]}")
         click.echo(f"    Token id:      {info['token'][:32]}...")
-        click.echo(f"    Exchange addr: {cfg.exchange}")
         try:
-            args = MarketOrderArgs(token_id=info["token"], amount=1.0, side=BUY)
+            args = MarketOrderArgsV2(token_id=info["token"], amount=1.0, side=BUY)
             signed = client.create_market_order(args)
         except Exception as exc:  # noqa: BLE001
             click.echo(f"    Signing failed: {type(exc).__name__}: {exc}")
             continue
-        body = signed.dict()
-        click.echo(f"    signer:         {body['signer']}")
-        click.echo(f"    maker:          {body['maker']}")
-        click.echo(f"    signatureType:  {body['signatureType']}")
-        click.echo(f"    feeRateBps:     {body['feeRateBps']}")
-        click.echo(f"    salt:           {body['salt']}")
-
-        # Local signature recovery to confirm the SDK is producing internally-consistent orders
-        domain = make_domain(
-            name="Polymarket CTF Exchange",
-            version="1",
-            chainId=str(settings.POLYMARKET_CHAIN_ID),
-            verifyingContract=cfg.exchange,
-        )
-        order_struct = Order(
-            salt=int(body["salt"]),
-            maker=body["maker"],
-            signer=body["signer"],
-            taker=body["taker"],
-            tokenId=int(body["tokenId"]),
-            makerAmount=int(body["makerAmount"]),
-            takerAmount=int(body["takerAmount"]),
-            expiration=int(body["expiration"]),
-            nonce=int(body["nonce"]),
-            feeRateBps=int(body["feeRateBps"]),
-            side=0 if body["side"] == "BUY" else 1,
-            signatureType=int(body["signatureType"]),
-        )
-        hash_to_sign = "0x" + keccak(order_struct.signable_bytes(domain=domain)).hex()
-        recovered = _Acct._recover_hash(hash_to_sign, signature=body["signature"])
-        sig_ok = recovered.lower() == body["signer"].lower()
-        click.echo(f"    sig recovers to signer: {sig_ok}  (recovered={recovered})")
+        body = signed.dict() if hasattr(signed, "dict") else dict(signed)
+        # V2 Order body fields: salt, maker, signer, tokenId, makerAmount,
+        # takerAmount, side, signatureType, timestamp, metadata, builder
+        for k in ("signer", "maker", "signatureType", "salt", "timestamp", "metadata", "builder"):
+            if k in body:
+                click.echo(f"    {k}: {body[k]}")
 
         if not post_test:
             continue
@@ -1248,7 +1221,7 @@ def bet_orders(max_orders: int) -> None:
         click.echo("Fetching orders...")
         client = get_clob_client()
 
-        from py_clob_client.clob_types import OpenOrderParams
+        from py_clob_client_v2.clob_types import OpenOrderParams
         orders = client.get_orders(OpenOrderParams())
 
         if not orders:

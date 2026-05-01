@@ -23,90 +23,21 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Polymarket exchange contract addresses
+# Polymarket V2 migration
 # ---------------------------------------------------------------------------
 #
-# Polymarket migrated to new exchange contracts using pUSD as collateral some
-# time before 2026-04. The ``OLD_*`` set ships in py-clob-client 0.34.6 and is
-# what the SDK signs orders for by default. The ``NEW_*`` set is what
-# Polymarket's API actually routes to today; signing for the OLD set produces
-# ``order_version_mismatch``.
+# Polymarket migrated CLOB to V2 on 2026-04-28: new exchange contracts,
+# new collateral (pUSD instead of USDC.e), new EIP-712 domain version "2",
+# and a new Order struct (drops taker/expiration/nonce/feeRateBps; adds
+# timestamp/metadata/builder). The legacy ``py-clob-client`` v0.34.x is
+# permanently incompatible — every signed order is rejected with
+# ``order_version_mismatch``. The replacement SDK is the separate package
+# ``py-clob-client-v2``, which we now use everywhere.
 #
-# When ``settings.POLYMARKET_USE_NEW_EXCHANGES`` is True, ``build_clob_client``
-# monkey-patches ``py_clob_client.config.get_contract_config`` to return the
-# new addresses + pUSD collateral. The user must already have pUSD on the
-# funder address before flipping the flag (deposit via polymarket.com UI).
-
-OLD_EXCHANGES = {
-    "regular": "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E",
-    "neg_risk": "0xC5d563A36AE78145C45a50134d48A1215220f80a",
-    "collateral": "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174",  # USDC.e
-    "ctf": "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045",
-    "neg_risk_adapter": "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296",
-}
-
-NEW_EXCHANGES = {
-    "regular": "0xE111180000d2663C0091e4f400237545B87B996B",
-    "neg_risk": "0xe2222d279d744050d28e00520010520000310F59",
-    "collateral": "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB",  # pUSD
-    "ctf": "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045",
-    "neg_risk_adapter": "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296",
-}
-
-
-def current_exchange_config() -> dict[str, str]:
-    """Return the active exchange address dict (old or new) per the feature flag."""
-    return NEW_EXCHANGES if settings.POLYMARKET_USE_NEW_EXCHANGES else OLD_EXCHANGES
-
-
-_new_exchange_patch_applied = False
-
-
-def apply_new_exchange_patch() -> None:
-    """Monkey-patch py_clob_client to sign for the new exchange addresses.
-
-    Idempotent — repeated calls are no-ops. Only patches when the flag is set
-    and chain_id is mainnet (137); other chains (testnet) are passed through.
-
-    Patches the function in *every* module that has already imported it via
-    ``from py_clob_client.config import get_contract_config``. Without that,
-    the order builder keeps its original reference (Python ``from x import y``
-    binds at import time) and orders still get signed for the OLD exchanges
-    even though the canonical name in ``py_clob_client.config`` is patched.
-    """
-    global _new_exchange_patch_applied  # noqa: PLW0603
-    if _new_exchange_patch_applied or not settings.POLYMARKET_USE_NEW_EXCHANGES:
-        return
-
-    from py_clob_client import client as _client_mod
-    from py_clob_client import config as _cfg
-    from py_clob_client.clob_types import ContractConfig
-    from py_clob_client.order_builder import builder as _builder_mod
-
-    _orig = _cfg.get_contract_config
-
-    def _patched(chain_id: int, neg_risk: bool = False) -> ContractConfig:
-        if chain_id != 137:
-            return _orig(chain_id, neg_risk)
-        return ContractConfig(
-            exchange=NEW_EXCHANGES["neg_risk"] if neg_risk else NEW_EXCHANGES["regular"],
-            collateral=NEW_EXCHANGES["collateral"],
-            conditional_tokens=NEW_EXCHANGES["ctf"],
-        )
-
-    # Patch all sites that captured the function via `from ... import ...`
-    _cfg.get_contract_config = _patched
-    _client_mod.get_contract_config = _patched
-    _builder_mod.get_contract_config = _patched
-
-    _new_exchange_patch_applied = True
-    logger.warning(
-        "Patched py_clob_client to use NEW Polymarket exchanges "
-        "(regular=%s neg_risk=%s collateral=pUSD)",
-        NEW_EXCHANGES["regular"],
-        NEW_EXCHANGES["neg_risk"],
-    )
-
+# V2 ``get_contract_config(137)`` returns one struct with both V1 and V2
+# fields populated. Callers that need to know "what address is the active
+# regular exchange?" should read ``exchange_v2`` / ``neg_risk_exchange_v2``
+# from this single source of truth — do not hard-code addresses elsewhere.
 
 # ---------------------------------------------------------------------------
 # Module-level client singleton
@@ -118,41 +49,39 @@ _version_mismatch_alerted = False  # one-shot alert dedup per process
 
 
 def build_clob_client():
-    """Build a fresh ClobClient using the configured signature_type / funder.
+    """Build a fresh V2 ClobClient using the configured signature_type / funder.
 
     Returns None when ``POLYMARKET_PRIVATE_KEY`` is empty (dry-run mode).
 
     The funder + signature_type pair must match what Polymarket has registered
     for this wallet. For a wallet that has never logged into polymarket.com,
     leave the defaults (``POLYMARKET_SIGNATURE_TYPE=0`` and an empty
-    ``POLYMARKET_FUNDER_ADDRESS``) — funder is then derived from the EOA. For
-    a wallet that has been UI-onboarded, set ``POLYMARKET_SIGNATURE_TYPE=2``
-    and ``POLYMARKET_FUNDER_ADDRESS=<proxy address>``; otherwise the CLOB
-    rejects every order with ``order_version_mismatch``.
+    ``POLYMARKET_FUNDER_ADDRESS``) — funder is then derived from the EOA.
+    For a UI-onboarded wallet, set ``POLYMARKET_SIGNATURE_TYPE=2`` and
+    ``POLYMARKET_FUNDER_ADDRESS=<proxy address>``.
     """
     if not settings.POLYMARKET_PRIVATE_KEY:
         return None
 
-    apply_new_exchange_patch()
-
     from eth_account import Account
-    from py_clob_client.client import ClobClient
+    from py_clob_client_v2.client import ClobClient
 
     eoa_address = Account.from_key(settings.POLYMARKET_PRIVATE_KEY).address
     funder_address = settings.POLYMARKET_FUNDER_ADDRESS or eoa_address
     signature_type = settings.POLYMARKET_SIGNATURE_TYPE
 
+    # V2 ClobClient: chain_id is positional arg #2 (was kwarg in V1).
     temp_client = ClobClient(
         settings.POLYMARKET_HOST,
+        settings.POLYMARKET_CHAIN_ID,
         key=settings.POLYMARKET_PRIVATE_KEY,
-        chain_id=settings.POLYMARKET_CHAIN_ID,
     )
-    creds = temp_client.create_or_derive_api_creds()
+    creds = temp_client.create_or_derive_api_key()
 
     return ClobClient(
         settings.POLYMARKET_HOST,
+        settings.POLYMARKET_CHAIN_ID,
         key=settings.POLYMARKET_PRIVATE_KEY,
-        chain_id=settings.POLYMARKET_CHAIN_ID,
         creds=creds,
         signature_type=signature_type,
         funder=funder_address,
@@ -224,7 +153,7 @@ def get_wallet_usdc_balance(force_refresh: bool = False) -> float | None:
         return None
 
     try:
-        from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
+        from py_clob_client_v2.clob_types import AssetType, BalanceAllowanceParams
 
         resp = client.get_balance_allowance(
             BalanceAllowanceParams(asset_type=AssetType.COLLATERAL),
@@ -373,8 +302,8 @@ async def place_order(
 
     yes_token_id, no_token_id = token_ids
 
-    from py_clob_client.clob_types import OrderArgs, OrderType
-    from py_clob_client.order_builder.constants import BUY
+    from py_clob_client_v2.clob_types import OrderArgsV2, OrderType
+    from py_clob_client_v2.order_builder.constants import BUY
 
     from src.db.models import TradeDirection
 
@@ -418,7 +347,9 @@ async def place_order(
         return False
 
     try:
-        order = OrderArgs(
+        # V2 OrderArgs: no fee_rate_bps / nonce / taker — those have moved
+        # out of the signed struct in the V2 exchange contracts.
+        order = OrderArgsV2(
             token_id=token_id,
             price=limit_price,
             size=size_shares,
@@ -471,12 +402,9 @@ async def _maybe_alert_version_mismatch(message: str, market_id: str) -> None:
     """Fire a one-shot Telegram alert when Polymarket rejects with
     ``order_version_mismatch``.
 
-    This error means the SDK is signing for an exchange contract Polymarket no
-    longer routes to — typically because Polymarket migrated and the locally
-    pinned addresses are stale. With AUTO_EXECUTE on, every signal would be
-    silently rejected; the alert exists so the operator can flip
-    ``POLYMARKET_USE_NEW_EXCHANGES`` (or ship a patched address set) before
-    the next trading day.
+    Means Polymarket migrated their exchange protocol again and our pinned SDK
+    no longer matches the API. The bot will silently reject every signal until
+    the SDK is bumped; this alert exists so the operator can react fast.
     """
     global _version_mismatch_alerted  # noqa: PLW0603
     if _version_mismatch_alerted or "order_version_mismatch" not in message.lower():
@@ -487,17 +415,14 @@ async def _maybe_alert_version_mismatch(message: str, market_id: str) -> None:
         from src.execution.alerter import get_alerter
 
         alerter = get_alerter()
-        cfg = "NEW" if settings.POLYMARKET_USE_NEW_EXCHANGES else "OLD"
-        regular = current_exchange_config()["regular"]
-        neg_risk = current_exchange_config()["neg_risk"]
         err = RuntimeError(
             f"Polymarket rejected order with order_version_mismatch on market {market_id}. "
-            f"Bot is signing for {cfg} exchange addresses (regular={regular}, neg_risk={neg_risk}). "
-            f"This usually means Polymarket migrated exchange contracts. "
-            f"Run `python -m src.cli bet diagnose` to inspect, then flip "
-            f"POLYMARKET_USE_NEW_EXCHANGES or update the address constants."
+            f"Polymarket has likely migrated CLOB protocol again. The currently-pinned "
+            f"py-clob-client-v2 SDK is no longer compatible. Run "
+            f"`python -m src.cli bet diagnose --post-test` to inspect and check PyPI "
+            f"for a newer SDK release."
         )
-        await alerter.send_system_error(err, context="Polymarket exchange version mismatch")
+        await alerter.send_system_error(err, context="Polymarket protocol version mismatch")
     except Exception:
         logger.exception("Failed to send order_version_mismatch alert")
 
