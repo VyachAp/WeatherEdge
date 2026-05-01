@@ -1229,7 +1229,7 @@ def bet_orders(max_orders: int) -> None:
         client = get_clob_client()
 
         from py_clob_client_v2.clob_types import OpenOrderParams
-        orders = client.get_orders(OpenOrderParams())
+        orders = client.get_open_orders(OpenOrderParams())
 
         if not orders:
             click.echo("No orders found.")

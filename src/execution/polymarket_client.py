@@ -40,6 +40,42 @@ logger = logging.getLogger(__name__)
 # from this single source of truth — do not hard-code addresses elsewhere.
 
 # ---------------------------------------------------------------------------
+# Cloudflare HTML noise filter
+# ---------------------------------------------------------------------------
+#
+# When the SDK posts to ``/auth/api-key`` and Cloudflare rate-limits the IP,
+# it returns a 403 with the full Cloudflare blocked-page HTML in the body.
+# The SDK's request layer dumps that whole HTML body to logger.error and the
+# CLI then transparently falls back to ``derive_api_key`` (a GET, which
+# Cloudflare doesn't block). Net effect: every CLI invocation prints ~5KB of
+# Cloudflare HTML even though the call succeeded. Suppress those specific
+# error records while leaving legitimate API errors intact.
+
+class _CloudflareNoiseFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:  # noqa: D401
+        try:
+            msg = record.getMessage()
+        except Exception:  # noqa: BLE001
+            return True
+        return "<!DOCTYPE html>" not in msg and "Cloudflare" not in msg
+
+
+def _install_cloudflare_filter() -> None:
+    """Attach the noise filter once. Idempotent."""
+    target = logging.getLogger("py_clob_client_v2.http_helpers.helpers")
+    if not any(isinstance(f, _CloudflareNoiseFilter) for f in target.filters):
+        target.addFilter(_CloudflareNoiseFilter())
+    # The SDK module also uses the package-root logger as a parent in some
+    # versions — cover both.
+    root = logging.getLogger("py_clob_client_v2")
+    if not any(isinstance(f, _CloudflareNoiseFilter) for f in root.filters):
+        root.addFilter(_CloudflareNoiseFilter())
+
+
+_install_cloudflare_filter()
+
+
+# ---------------------------------------------------------------------------
 # Module-level client singleton
 # ---------------------------------------------------------------------------
 

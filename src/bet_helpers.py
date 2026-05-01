@@ -367,7 +367,7 @@ def get_trades_history(client) -> list[dict]:
 def get_open_orders(client) -> list[dict]:
     """Fetch all open orders from the CLOB API."""
     from py_clob_client_v2.clob_types import OpenOrderParams
-    return client.get_orders(OpenOrderParams())
+    return client.get_open_orders(OpenOrderParams())
 
 
 async def enrich_trades_with_markets(trades: list[dict]) -> dict[str, dict]:
