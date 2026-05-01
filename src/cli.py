@@ -631,17 +631,20 @@ def bet_place(market: str, side: str, amount: float, skip_confirm: bool, ignore_
         yes_token, no_token = token_pair
         token_id = yes_token if side.lower() == "yes" else no_token
 
-        # --- Check USDC balance ---
+        # --- Check collateral balance ---
+        # Polymarket V2 (post-2026-04-28) uses pUSD as collateral instead of
+        # USDC.e. We still print all three so a user with legacy USDC.e
+        # sitting around can see they need to deposit it via the UI.
         click.echo("Checking wallet balance...")
         pusd, usdc_e, usdc_native = await get_usdc_balance(settings.POLYMARKET_PRIVATE_KEY)
-        click.echo(f"  pUSD:        ${pusd:.2f}")
-        click.echo(f"  USDC.e:      ${usdc_e:.2f}")
+        click.echo(f"  pUSD:        ${pusd:.2f}  (V2 collateral)")
+        click.echo(f"  USDC.e:      ${usdc_e:.2f}  (legacy V1 collateral)")
         click.echo(f"  Native USDC: ${usdc_native:.2f}")
 
-        if usdc_e < amount:
-            click.echo(f"\nError: insufficient USDC.e (${usdc_e:.2f} < ${amount:.2f}).")
-            if usdc_native >= amount:
-                click.echo("You have native USDC — swap to USDC.e on a DEX first.")
+        if pusd < amount:
+            click.echo(f"\nError: insufficient pUSD (${pusd:.2f} < ${amount:.2f}).")
+            if usdc_e >= amount or usdc_native >= amount:
+                click.echo("Deposit via polymarket.com UI to convert USDC.e/native USDC into pUSD.")
             raise SystemExit(1)
 
         # --- Daily spend cap ---
