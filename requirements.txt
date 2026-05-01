@@ -4,5 +4,5 @@ sqlalchemy>=2.0
 pandas>=2.0
 plotly>=5.0
 numpy>=1.26
-py-clob-client>=0.34
+py-clob-client-v2>=1.0.0
 web3>=7.0
