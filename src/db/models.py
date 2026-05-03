@@ -107,6 +107,7 @@ class Trade(Base):
     status = Column(Enum(TradeStatus), nullable=False, default=TradeStatus.PENDING)
     opened_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     closed_at = Column(DateTime(timezone=True))
+    redeemed_at = Column(DateTime(timezone=True), nullable=True, index=True)
 
     # Polymarket CLOB execution fields
     order_id = Column(String)  # CLOB order identifier

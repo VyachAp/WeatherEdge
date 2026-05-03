@@ -7,7 +7,7 @@ import json
 import logging
 import signal
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import TYPE_CHECKING
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -46,10 +46,18 @@ _shutdown_event: asyncio.Event | None = None
 
 # Fast-lock-poll bookkeeping. In-process only; reset on process restart.
 # `_locked_markets_fired_today` prevents re-firing on a market we've already
-# placed a lock order for; cleared by `job_daily_settlement` at 22:00 UTC.
+# placed a lock order for. Cleared per-station at the station's local-day
+# rollover by `_maybe_clear_per_station_caches` (run from the unified
+# pipeline tick), not at a single global UTC time.
 # `_last_routine_seen` skips METARs the fast loop already processed.
+# `_market_to_icao` lets the per-station rollover find which market_ids
+# in `_locked_markets_fired_today` belong to a given station.
+# `_local_day_seen` tracks each station's last-observed local date so we
+# can detect rollover.
 _locked_markets_fired_today: set[str] = set()
 _last_routine_seen: dict[str, datetime] = {}
+_market_to_icao: dict[str, str] = {}
+_local_day_seen: dict[str, date] = {}
 
 # ---------------------------------------------------------------------------
 # Structured JSON logging
@@ -155,6 +163,77 @@ _UNIFIED_CONCURRENCY = 8  # Max concurrent city aggregations
 _EXCLUDED_ICAOS: set[str] = {"VHHH", "LLBG"}  # Hong Kong, Tel Aviv
 
 
+def _maybe_clear_per_station_caches() -> None:
+    """Drop per-station dedup / cache entries when a station's local day
+    has rolled over since we last looked.
+
+    Replaces the legacy global wipe at 22:00 UTC: each station now resets
+    on its own local midnight, which is the actual data-day boundary the
+    routine-METAR / lock-rule logic uses (see lock_rules._market_daily_max).
+
+    Cheap to call every unified-pipeline tick — most calls are no-ops
+    because nothing rolled over in the last 5 minutes.
+    """
+    from src.signals.mapper import ICAO_TIMEZONE, icao_timezone, today_local
+    from src.signals.state_aggregator import clear_state_cache_for_icao
+
+    for icao in ICAO_TIMEZONE.keys():
+        try:
+            tz = icao_timezone(icao)
+            today = today_local(tz)
+        except Exception:
+            continue
+        prev = _local_day_seen.get(icao)
+        if prev is None:
+            # First time we're seeing this station — record today's
+            # local date but don't wipe state. Avoids clobbering dedup
+            # entries written by fast-poll before the first unified tick.
+            _local_day_seen[icao] = today
+            continue
+        if prev == today:
+            continue
+        # Local day rolled over — drop dedup market_ids that belong to
+        # this station, the per-station routine cursor, and the cached
+        # forecast/bias inputs so the next tick re-fetches.
+        for mid in [m for m, ic in _market_to_icao.items() if ic == icao]:
+            _locked_markets_fired_today.discard(mid)
+            _market_to_icao.pop(mid, None)
+        _last_routine_seen.pop(icao, None)
+        clear_state_cache_for_icao(icao)
+        _local_day_seen[icao] = today
+
+
+async def job_resolve_trades() -> None:
+    """Every 5 min — resolve any expired markets.
+
+    Replaces the once-a-day resolution that used to live inside
+    ``job_daily_settlement``. Markets close at different UTC instants
+    depending on their station's local timezone; batching at 22:00 UTC left
+    morning-UTC closures sitting in OPEN status for up to ~22h, polluting
+    bankroll/exposure accounting in the meantime.
+
+    Idempotent: ``resolve_trades`` already filters on
+    ``Market.end_date < now`` and ``Trade.status == OPEN``; repeated calls
+    only touch newly-elapsed markets.
+    """
+    alerter = get_alerter()
+    try:
+        async with async_session() as session:
+            resolved = await resolve_trades(session)
+            for trade in resolved:
+                market = await session.get(Market, trade.market_id)
+                await alerter.send_resolution(trade, market)
+            await session.commit()
+            if resolved:
+                logger.info("Resolved %d trade(s)", len(resolved))
+    except Exception as exc:
+        logger.exception("resolve_trades failed")
+        try:
+            await alerter.send_system_error(exc, "resolve_trades")
+        except Exception:
+            logger.warning("Alerter failed to send resolve_trades error")
+
+
 async def job_unified_pipeline() -> None:
     """Every 5 min — unified METAR + Open-Meteo + market pipeline.
 
@@ -176,6 +255,10 @@ async def job_unified_pipeline() -> None:
         from src.signals.edge_calculator import compute_edges
         from src.signals.mapper import icao_for_location, geocode
         from src.execution.polymarket_client import get_best_bid_ask, get_orderbook_depth, get_token_ids
+
+        # Reset per-station dedup / cache for any station whose local day
+        # has just rolled over. Cheap, runs every tick.
+        _maybe_clear_per_station_caches()
 
         async with async_session() as session:
             # 1. Circuit breaker check
@@ -1009,31 +1092,31 @@ def _extract_market_prices(market, buckets: list[int]) -> dict[int, float]:
 
 
 async def job_daily_settlement() -> None:
-    """Daily 22:00 UTC — resolve markets, P&L, daily summary."""
+    """Daily 22:00 UTC — bankroll/drawdown bookkeeping, daily digest.
+
+    Trade resolution moved to ``job_resolve_trades`` (5-min interval) so
+    markets settle within minutes of their actual ``end_date`` rather than
+    sitting in OPEN until the next 22:00 UTC tick. Per-station cache
+    rollover moved to ``_maybe_clear_per_station_caches``.
+    """
     alerter = get_alerter()
     try:
         monitor = await _get_drawdown_monitor()
 
         async with async_session() as session:
-            # 1. Resolve expired trades
-            resolved = await resolve_trades(session)
-            for trade in resolved:
-                market = await session.get(Market, trade.market_id)
-                await alerter.send_resolution(trade, market)
-
-            # 2. Update bankroll & drawdown
-            bankroll = await get_current_bankroll(session)
-            total_pnl = sum(t.pnl or 0.0 for t in resolved)
-            new_bankroll = bankroll + total_pnl
+            # 1. Update bankroll & drawdown.
+            # ``get_current_bankroll`` already includes unredeemed WON pnl,
+            # so we don't add it twice here — just record the current equity.
+            new_bankroll = await get_current_bankroll(session)
             dd_state = await monitor.update(new_bankroll, session)
 
             if dd_state.level in (DrawdownLevel.CAUTION, DrawdownLevel.PAUSED):
                 await alerter.send_drawdown_warning(dd_state)
 
-            # 3. Daily summary
+            # 2. Daily summary
             await alerter.send_daily_summary(session)
 
-            # 4. WX observation retention cleanup
+            # 3. WX observation retention cleanup
             if settings.WX_API_KEY:
                 from sqlalchemy import delete
 
@@ -1050,7 +1133,7 @@ async def job_daily_settlement() -> None:
                 if result.rowcount:
                     logger.info("WX cleanup: deleted %d old observations", result.rowcount)
 
-            # 5. Station bias recording
+            # 4. Station bias recording
             try:
                 from src.ingestion.station_bias import record_daily_outcome
                 from src.ingestion.aviation import get_routine_daily_max
@@ -1115,13 +1198,11 @@ async def job_daily_settlement() -> None:
             except Exception:
                 logger.exception("Station bias recording failed (non-fatal)")
 
-            # 6. Reset fast-lock-poll dedup so the next trading day starts clean.
-            _locked_markets_fired_today.clear()
-            _last_routine_seen.clear()
-            from src.signals.state_aggregator import clear_state_cache
-            clear_state_cache()
+            # (Per-station fast-lock-poll dedup is now reset at each
+            # station's local-day rollover by ``_maybe_clear_per_station_caches``;
+            # no global wipe at 22:00 UTC.)
 
-            # 7. Weekly calibration check (Sundays)
+            # 5. Weekly calibration check (Sundays)
             if datetime.now(timezone.utc).weekday() == 6:
                 coeffs = await get_calibration_coefficients(session)
                 if coeffs is not None:
@@ -1487,6 +1568,7 @@ async def job_fast_lock_poll() -> None:
                         # same market on every poll. A second fresh entry
                         # later in the day would require a new lock signal.
                         _locked_markets_fired_today.add(market.id)
+                        _market_to_icao[market.id] = icao
                         exposure += stake
                     # If stake == 0 the FAK didn't fill (book empty at the
                     # limit) or the filter rejected. Don't dedup — fresh
@@ -1523,6 +1605,14 @@ def setup_scheduler() -> AsyncIOScheduler:
         job_daily_settlement,
         CronTrigger(hour=22, minute=0, timezone="UTC"),
         id="daily_settlement",
+        max_instances=1,
+        coalesce=True,
+    )
+    scheduler.add_job(
+        job_resolve_trades,
+        IntervalTrigger(minutes=5),
+        id="resolve_trades",
+        next_run_time=datetime.now(timezone.utc) + timedelta(seconds=30),
         max_instances=1,
         coalesce=True,
     )

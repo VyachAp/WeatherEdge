@@ -17,6 +17,44 @@ _YES_RESOLVED_THRESHOLD = 0.95
 _NO_RESOLVED_THRESHOLD = 0.05
 
 
+async def _refresh_market_price(market: Market) -> float | None:
+    """Fetch live mid for an expired market's YES token.
+
+    The 5-min ``job_unified_pipeline`` and 15-min ``job_scan_markets`` may
+    have left ``market.current_yes_price`` 30+ minutes stale by the time a
+    market expires. Re-querying the CLOB before applying the 0.95/0.05
+    resolution thresholds tightens the loop so we don't wait an extra tick
+    on edge-case 0.94 → 0.96 drift. Failures fall back to the stored value.
+    """
+    from src.execution.polymarket_client import (
+        get_best_bid_ask,
+        get_token_ids,
+    )
+
+    try:
+        token_ids = await get_token_ids(market.id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Token ID fetch failed for %s: %s", market.id, exc)
+        return market.current_yes_price
+
+    if not token_ids:
+        return market.current_yes_price
+
+    try:
+        quote = get_best_bid_ask(token_ids[0])
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Price refresh failed for %s: %s", market.id, exc)
+        return market.current_yes_price
+
+    if quote is None:
+        return market.current_yes_price
+
+    bid, ask = quote
+    mid = (bid + ask) / 2.0
+    market.current_yes_price = mid
+    return mid
+
+
 async def resolve_trades(session: AsyncSession) -> list[Trade]:
     """Find open trades on expired markets and settle them.
 
@@ -39,8 +77,12 @@ async def resolve_trades(session: AsyncSession) -> list[Trade]:
     trades = list(result.scalars().unique())
 
     resolved: list[Trade] = []
+    refreshed_markets: set[str] = set()
     for trade in trades:
         market = trade.market
+        if market.id not in refreshed_markets:
+            await _refresh_market_price(market)
+            refreshed_markets.add(market.id)
         price = market.current_yes_price
         if price is None:
             continue
@@ -93,24 +135,52 @@ async def calculate_daily_pnl(session: AsyncSession) -> float:
     return float(result.scalar_one())
 
 
-async def get_current_bankroll(session: AsyncSession) -> float:
-    """Return current spendable bankroll in USD.
+async def get_unredeemed_won_payout(session: AsyncSession) -> float:
+    """Sum the future-redeem dollar value of unsettled WON trades.
 
-    Source of truth, in priority order:
+    Polymarket wins do **not** auto-settle into wallet USDC — the user must
+    call ``redeemPositions()`` on-chain (via the ``bet redeem`` CLI) to
+    convert the conditional tokens into wallet balance. Until then the
+    payout sits as conditional tokens; the wallet doesn't reflect it.
+
+    For each WON trade with ``redeemed_at IS NULL``:
+        future_payout = stake_usd / entry_price = stake_usd + pnl
+
+    (because ``pnl = stake * (1/entry - 1)``)
+    """
+    result = await session.execute(
+        select(
+            func.coalesce(
+                func.sum(Trade.stake_usd + func.coalesce(Trade.pnl, 0.0)), 0.0
+            )
+        ).where(
+            Trade.status == TradeStatus.WON,
+            Trade.redeemed_at.is_(None),
+        )
+    )
+    return float(result.scalar_one())
+
+
+async def get_current_bankroll(session: AsyncSession) -> float:
+    """Return current spendable-equivalent bankroll in USD.
+
+    Equity, not wallet liquidity: counts won-but-unredeemed positions so
+    the drawdown monitor compares against true equity instead of phantom
+    drawdown caused by conditional tokens still sitting on-chain.
+
+    Sources, in priority order:
       1. Live USDC wallet balance via the CLOB client (when a private key
-         is configured). The wallet is the only authoritative figure once
-         we are placing real orders — settled wins/losses move funds in or
-         out of it directly, so reading it avoids drift between the bot's
-         internal accounting and reality.
-      2. Latest BankrollLog row, written by daily settlement.
-      3. ``INITIAL_BANKROLL`` setting as a last-resort fallback for fresh
-         installs / dry-run environments with no settled history yet.
+         is configured), **plus** unredeemed WON payouts.
+      2. Latest BankrollLog row plus unredeemed WON payouts.
+      3. ``INITIAL_BANKROLL`` setting as a last-resort fallback.
     """
     from src.execution.polymarket_client import get_wallet_usdc_balance
 
+    unredeemed = await get_unredeemed_won_payout(session)
+
     wallet = get_wallet_usdc_balance()
     if wallet is not None and wallet > 0:
-        return wallet
+        return wallet + unredeemed
 
     result = await session.execute(
         select(BankrollLog.balance)
@@ -118,7 +188,8 @@ async def get_current_bankroll(session: AsyncSession) -> float:
         .limit(1)
     )
     row = result.scalar_one_or_none()
-    return row if row is not None else settings.INITIAL_BANKROLL
+    base = row if row is not None else settings.INITIAL_BANKROLL
+    return base + unredeemed
 
 
 async def get_current_exposure(session: AsyncSession) -> float:

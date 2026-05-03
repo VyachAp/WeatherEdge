@@ -114,6 +114,12 @@ def clear_state_cache() -> None:
     _state_cache.clear()
 
 
+def clear_state_cache_for_icao(icao: str) -> None:
+    """Drop the cached input for a single station (per-station local-day
+    rollover). No-op when the station has no cached entry."""
+    _state_cache.pop(icao, None)
+
+
 # ---------------------------------------------------------------------------
 # Internal helpers that work on a pre-fetched history list (no extra HTTP)
 # ---------------------------------------------------------------------------

@@ -1706,6 +1706,7 @@ def bet_redeem(redeem_all: bool, skip_confirm: bool) -> None:
             return receipt
 
         success_count = 0
+        redeemed_condition_ids: set[str] = set()
         for item in to_redeem:
             question = (item["question"] or item["asset_id"][:20])[:50]
             condition_id_hex = item["condition_id"]
@@ -1753,9 +1754,32 @@ def bet_redeem(redeem_all: bool, skip_confirm: bool) -> None:
                 click.echo(f"    Status: {status}  tx: {tx_hash}...  gas: {gas_used}")
                 if receipt["status"] == 1:
                     success_count += 1
+                    redeemed_condition_ids.add(item["condition_id"])
             except Exception as e:
                 click.echo(f"    FAILED: {e}")
                 click.echo("    (Market may not be resolved on-chain yet)")
+
+        # --- Stamp Trade.redeemed_at so bankroll stops counting these as
+        # unredeemed pending payouts. Market.id == condition_id in our DB
+        # (set during ingest in src/ingestion/polymarket.py).
+        if redeemed_condition_ids:
+            from sqlalchemy import update
+            from src.db.engine import async_session
+            from src.db.models import Trade as TradeModel, TradeStatus as TradeStatusEnum
+
+            async with async_session() as session:
+                stamped = await session.execute(
+                    update(TradeModel)
+                    .where(
+                        TradeModel.market_id.in_(redeemed_condition_ids),
+                        TradeModel.status == TradeStatusEnum.WON,
+                        TradeModel.redeemed_at.is_(None),
+                    )
+                    .values(redeemed_at=datetime.now(timezone.utc))
+                )
+                await session.commit()
+                if stamped.rowcount:
+                    click.echo(f"  Stamped redeemed_at on {stamped.rowcount} local trade row(s)")
 
         # --- Final balance ---
         click.echo(f"\n=== Results ===")

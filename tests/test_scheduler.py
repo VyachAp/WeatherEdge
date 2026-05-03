@@ -351,3 +351,83 @@ class TestBinaryMarketEdgeAsymmetricPricing:
         # MUST pass the quote.
         assert edge.market_price == 0.625
         assert abs(edge.edge - 0.182) < 0.001
+
+
+# ---------------------------------------------------------------------------
+# Per-station local-day cache rollover (replaces the legacy 22:00 UTC wipe)
+# ---------------------------------------------------------------------------
+
+
+class TestPerStationCacheRollover:
+    """`_maybe_clear_per_station_caches` clears only stations whose local
+    day rolled over since last call, not all stations globally."""
+
+    def setup_method(self):
+        # Reset module-level state between tests.
+        from src import scheduler as sch
+        sch._locked_markets_fired_today.clear()
+        sch._last_routine_seen.clear()
+        sch._market_to_icao.clear()
+        sch._local_day_seen.clear()
+
+    def test_first_call_seeds_state_no_clears(self):
+        from src import scheduler as sch
+        # Pre-populate dedup state for two stations.
+        sch._locked_markets_fired_today.add("mkt_kjfk_1")
+        sch._market_to_icao["mkt_kjfk_1"] = "KJFK"
+        sch._last_routine_seen["KJFK"] = datetime.now(timezone.utc)
+
+        sch._maybe_clear_per_station_caches()
+
+        # First call seeds _local_day_seen but doesn't drop anything (no
+        # prior cookie to compare against).
+        assert "mkt_kjfk_1" in sch._locked_markets_fired_today
+        assert "KJFK" in sch._last_routine_seen
+        assert "KJFK" in sch._local_day_seen
+
+    def test_only_rolled_over_stations_cleared(self):
+        from src import scheduler as sch
+        from datetime import date
+
+        sch._locked_markets_fired_today.update({"mkt_kjfk_1", "mkt_egll_1"})
+        sch._market_to_icao.update({"mkt_kjfk_1": "KJFK", "mkt_egll_1": "EGLL"})
+        sch._last_routine_seen.update({
+            "KJFK": datetime.now(timezone.utc),
+            "EGLL": datetime.now(timezone.utc),
+        })
+
+        # Pretend we've already seen yesterday's local-date for KJFK only.
+        # (EGLL hasn't rolled — its cookie matches today_local; KJFK's
+        # cookie is yesterday so it should clear.)
+        from src.signals.mapper import icao_timezone, today_local
+        kjfk_today = today_local(icao_timezone("KJFK"))
+        egll_today = today_local(icao_timezone("EGLL"))
+        sch._local_day_seen["KJFK"] = kjfk_today - timedelta(days=1)
+        sch._local_day_seen["EGLL"] = egll_today
+
+        sch._maybe_clear_per_station_caches()
+
+        # KJFK was rolled over → its dedup entries dropped.
+        assert "mkt_kjfk_1" not in sch._locked_markets_fired_today
+        assert "mkt_kjfk_1" not in sch._market_to_icao
+        assert "KJFK" not in sch._last_routine_seen
+        assert sch._local_day_seen["KJFK"] == kjfk_today
+
+        # EGLL had no rollover → entries preserved.
+        assert "mkt_egll_1" in sch._locked_markets_fired_today
+        assert "EGLL" in sch._last_routine_seen
+
+    def test_idempotent_when_no_rollover(self):
+        from src import scheduler as sch
+        from src.signals.mapper import icao_timezone, today_local
+
+        sch._locked_markets_fired_today.add("mkt_kjfk_1")
+        sch._market_to_icao["mkt_kjfk_1"] = "KJFK"
+        sch._local_day_seen["KJFK"] = today_local(icao_timezone("KJFK"))
+
+        # Two consecutive calls should be no-ops.
+        sch._maybe_clear_per_station_caches()
+        sch._maybe_clear_per_station_caches()
+
+        assert "mkt_kjfk_1" in sch._locked_markets_fired_today
+        assert "mkt_kjfk_1" in sch._market_to_icao
