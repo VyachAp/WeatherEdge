@@ -96,6 +96,7 @@ The scheduler runs on port 8080 (health check) and the dashboard on port 8501.
 | `LOCK_MARGIN_F` | `2.0` | Safety margin (°F) above/below threshold before declaring a lock |
 | `LOCK_POSITION_PCT` | `0.02` | Lock trade size as % of bankroll (no Kelly) |
 | `ENSEMBLE_MODELS` | `ecmwf_ifs025,gfs_seamless,icon_seamless,gem_seamless` | Open-Meteo models for σ |
+| `PROJECTION_RESIDUAL_SLOPE_ENABLED` | `true` | v2 projection (residual-slope extrapolation) for forecast-exceedance alerts; set `false` to revert to v1 halflife decay |
 | `AUTO_EXECUTE` | `false` | When true, place real CLOB orders |
 | `DAILY_SPEND_CAP_USD` | `200` | Hard 24h rolling spend cap |
 

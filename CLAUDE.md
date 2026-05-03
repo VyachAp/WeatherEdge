@@ -65,24 +65,30 @@ circuit_breakers ─► get_active_weather_markets ─► group by ICAO (skip _E
                                                  └─ place_order
 
   job_fast_lock_poll (30s):
-    fetch_latest_metars(active_icaos) ─► for each (icao, market):
+    fetch_latest_metars(active_icaos) ─► for each new routine (icao, market):
         evaluate_lock(_minimal_state, market) ─► _try_lock_rule_trade
+        _fast_poll_projection_check(icao, station_metars) ─► reuses cached
+          forecast/bias/normals from last unified tick → build_state_from_metars
+          → check_and_record_daily_max_alert (no extra HTTP)
 ```
 
-`_locked_markets_fired_today` and `_last_routine_seen` are in-process dicts cleared by `job_daily_settlement` so the next trading day starts fresh. A bias-runaway station (`|bias| > 3°C`) is skipped at Phase 1 grouping.
+`_locked_markets_fired_today`, `_last_routine_seen`, and the `_state_cache` (in `state_aggregator.py`) are in-process dicts cleared **per-station at the station's local-day rollover** by `_maybe_clear_per_station_caches` (called at the top of every `job_unified_pipeline` tick). A sibling `_market_to_icao` map populated at lock-fire time lets the rollover find which `market_id` entries belong to which station; `_local_day_seen` cookies the last-observed `today_local(tz)` per ICAO. A bias-runaway station (`|bias| > 3°C`) is skipped at Phase 1 grouping.
 
 ### Scheduler Jobs (`src/scheduler.py`)
 
 | Job | Schedule | Purpose |
 |-----|----------|---------|
 | `job_scan_markets` | Every 15 min | Fetch Polymarket weather markets via Gamma API, upsert `Market` + `MarketSnapshot` |
-| `job_unified_pipeline` | Every `UNIFIED_PIPELINE_INTERVAL_MINUTES` (5m default) | Aggregate per-city weather state, evaluate lock + probability paths, place trades |
-| `job_fast_lock_poll` | Every `FAST_LOCK_POLL_INTERVAL_SECONDS` (30s default) | Bulk `fetch_latest_metars` for active binary-market ICAOs; fire EASY-direction lock trades on new routine METARs without waiting for the 5-min tick. Dedup via `_locked_markets_fired_today`, cleared at 22:00 UTC settlement. Disabled by `FAST_LOCK_POLL_ENABLED=false` or `LOCK_RULE_ENABLED=false`. |
-| `job_daily_settlement` | 22:00 UTC | Resolve expired trades, record station bias, send daily summary, weekly calibration check, reset fast-poll dedup |
+| `job_resolve_trades` | Every 5 min (30s offset from unified) | Settle expired markets within minutes of their `end_date`. Calls `resolve_trades` (idempotent: gates on `Market.end_date < now` and `Trade.status=OPEN`); refreshes `current_yes_price` from CLOB before applying the 0.95/0.05 thresholds so a 30-min-stale price doesn't delay resolution. Telegram-pushes each new resolution. |
+| `job_unified_pipeline` | Every `UNIFIED_PIPELINE_INTERVAL_MINUTES` (5m default) | Aggregate per-city weather state, evaluate lock + probability paths, place trades. Calls `_maybe_clear_per_station_caches` at the top of each tick. |
+| `job_fast_lock_poll` | Every `FAST_LOCK_POLL_INTERVAL_SECONDS` (30s default) | Bulk `fetch_latest_metars` for active binary-market ICAOs; fire EASY-direction lock trades on new routine METARs without waiting for the 5-min tick, AND re-run the forecast-exceedance projection check using cached forecast/bias from the last unified tick. Dedup via `_locked_markets_fired_today`, cleared per-station on local-day rollover. Disabled by `FAST_LOCK_POLL_ENABLED=false` or `LOCK_RULE_ENABLED=false`. |
+| `job_daily_settlement` | 22:00 UTC | Bankroll/drawdown bookkeeping (records current equity to `BankrollLog`), Telegram daily summary, WX retention cleanup, station-bias recording, weekly calibration check. **Does not** resolve trades or clear caches — both moved to higher-cadence per-station jobs. |
 
 `job_startup` runs once on boot: starts Telegram alerter, loads drawdown state, runs an initial market scan.
 
 `job_fast_lock_poll` only fires the **EASY** lock direction (observed max already clears threshold + margin) — it builds a `_minimal_state_for_easy_lock` with no forecast, no solar/cloud, just `routine_history`. The **HARD** direction (no-more-heating: market-day max below threshold AND past-peak signal AND forecast peak < threshold) needs full forecast context and stays in `job_unified_pipeline`.
+
+For the **forecast-exceedance projection** check, fast-poll instead reuses the previous unified tick's forecast / station-bias / climate-normals via the `_state_cache` (in `state_aggregator.py`, 30-min TTL keyed by ICAO). `_fast_poll_projection_check` merges the new METAR into cached history, calls `build_state_from_metars`, then `check_and_record_daily_max_alert`. Closes the 5-min cadence gap on projection alerts (~30s instead of up to 5 min). No-op when no cached state exists yet (unified hasn't run for this station, or cache aged out).
 
 ### Data sources
 
@@ -98,9 +104,10 @@ Aviation providers fail over in order: AWC → IEM → OGIMET → NOAA → Check
 
 ### Database (`src/db/models.py`)
 
-Core: `Market`, `MarketSnapshot`, `Signal`, `Trade`, `BankrollLog`, `StationBias`
+Core: `Market`, `MarketSnapshot`, `Signal`, `Trade`, `BankrollLog`, `StationBias`, `StationNormal`
 Aviation: `MetarObservation`, `TafForecast`, `Pirep`, `SynopObservation`, `AviationAlert`
 Alerting: `ForecastExceedanceAlert` (every same-hour delta > 0.5°F, with `alerted` flag for Telegram-pushed rows)
+Backtest archive: `ForecastArchive` — one row per (station, target-local-day, fetched_at) capturing the blended Open-Meteo forecast. Written best-effort by `aggregate_state` after `_blend_forecasts`; consumed by the replay-capable backtest in `simulate_distribution_pipeline`. Hourly arrays stored as JSONB.
 Auxiliary: `WxObservation`
 
 `Signal` has legacy `gfs_prob`/`ecmwf_prob`/`aviation_prob`/`wx_prob` columns — always NULL in the unified pipeline; kept for schema compatibility (still read by `alerter._build_detail_message` for the inline-button "detail" view).
@@ -132,16 +139,25 @@ Every applied signal is appended to `distribution.reasoning` — the log tail yo
 - `metar_trend_rate` / `metar_trend_rate_short` — 6h and 2.5h linear regressions on routine METAR temps. Probability engine uses the 6h slope; `forecast_exceedance` uses the 2.5h slope (the 6h regression stays positive past the real peak on sharp-cooling afternoons).
 - `routine_history` — sorted `(observed_at_utc, temp_f)` tuples for last 24 h, used by `lock_rules._market_daily_max` to compute the per-market daily max anchored to `market.end_date`'s **station-local** day (matters for markets that close at e.g. 07:00 local time).
 - `latest_obs_temp_f`, `forecast_temp_now_f`, `forecast_slope_to_peak_f_per_hr`, `forecast_residual_f` — bias-adjusted residuals; trajectory comparison drives the residual-rate METAR trend signal.
+- `forecast_residual_slope_f_per_hr`, `forecast_residual_count` — `d(residual)/dt` linear regression over routines in the 6h window (computed by `_compute_residual_slope`). Captures "forecast falling further behind hour-over-hour" — invisible to the point-residual field above. Drives the v2 path of `_project_daily_max` when `forecast_residual_count >= 3`. None / 0 when forecast missing or fewer than 2 routines.
 - `forecast_sigma_f`, `ensemble_model_count` — ensemble σ at peak hour (None when ensemble unavailable).
 - `has_forecast` — gates HARD-direction lock evaluation.
 - `_routine_daily_max` boundaries are **station-local day**, not UTC.
 - When Open-Meteo fails entirely, `WeatherState` is still returned: `forecast_peak_f = current_max_f`, `hours_until_peak = 0`, solar/cloud signals False, `forecast_sigma_f = None`. The probability engine degenerates to a narrow band around current max; lock rule's HARD direction is disabled.
 
+After every successful aggregation, `aggregate_state` also stashes its inputs (`forecast`, `bias_c`, `climate_prior_*`, `history`, timestamp) into the module-level `_state_cache` keyed by ICAO. The fast-poll loop reads via `get_cached_aggregation_inputs(icao)` (30-min TTL) so it can rebuild state with a fresh METAR appended without re-paying the forecast / bias / normals HTTP cost. Cleared in `job_daily_settlement` via `clear_state_cache()`.
+
 ### Lock-rule trader (`src/signals/lock_rules.py`, `scheduler._try_lock_rule_trade`)
 
-Deterministic complement to the probability engine. Returns a `LockDecision(side, reasons, margin_f)` rather than a probability. Operators in scope: `above`, `at_least`, `below`, `at_most`. `exactly` and bracket markets are out of scope.
+Deterministic complement to the probability engine. Returns a `LockDecision(side, reasons, margin_f)` rather than a probability.
 
-Two directions:
+Operators in scope:
+- **Threshold** (`above`, `at_least`, `below`, `at_most`) — EASY/HARD branches below.
+- **Range / bracket / `exactly`** — routed through `_evaluate_range_lock`. `market_range_f` (in `scheduler.py`) builds the `[low_f, high_f]` window: parsed `(low, high)` for explicit bracket questions, or a synthetic single-bucket range for `exactly` (e.g. `=10°C` → `[50, 51]°F`). Fires NO on overshoot (`current_max_f > high_f + margin`), NO on undershoot (`current_max_f < low_f - margin` AND `_no_more_heating`), YES on in-range (`low_f <= current_max_f <= high_f` AND past-peak with no upward signal).
+
+**Lowest/minimum temperature markets are filtered upstream** in `polymarket.parse_question` (`_LOWEST_TEMP_RE`) — the entire pipeline assumes daily-max physics, so comparing `current_max_f` against a daily-min threshold would be a category error. A defensive guard in `evaluate_lock` also drops them by question-text match in case a stale Market row from before the filter still has `parsed_operator` set.
+
+Two threshold-market directions:
 
 - **EASY** — market-day max ≥ threshold + `LOCK_MARGIN_F` (default 2.0°F). Mathematically locked because daily max is monotonic. Decides YES for `above`/`at_least`, NO for `below`/`at_most`. No forecast required.
 - **HARD** — market-day max < threshold − margin AND `_no_more_heating(state, threshold)`:
@@ -150,13 +166,19 @@ Two directions:
   - past-peak signal: `solar_declining` OR `metar_trend_rate ≤ 0`.
   Decides NO for `above`/`at_least`, YES for `below`/`at_most`.
 
-Per-market daily max comes from `_market_daily_max(state, market.end_date, now_utc)` — anchored to **`market.end_date`'s local day**, not the snapshot's local day. Source: `state.routine_history`. Routine count guard: `routine_count >= MIN_ROUTINE_COUNT`.
+Per-market daily max comes from `_market_daily_max(state, market.end_date, now_utc)` — anchored to **`market.end_date`'s local day**, not the snapshot's local day. Source: `state.routine_history`.
+
+Routine-count guard is **direction-dependent**:
+- Hard floor of **2** routines for any lock (single-METAR fluke prevention).
+- **Super-margin EASY** (overshoot ≥ 2× `LOCK_MARGIN_F` = 4°F by default): allowed at routine_count = 2. Daily max is monotonic — two confirming obs already 4°F+ over threshold cannot be undone by a third. Cuts ~30-60 min of morning lag on hot days.
+- **Standard EASY** (margin between `LOCK_MARGIN_F` and 2× `LOCK_MARGIN_F`): requires `MIN_ROUTINE_COUNT` (3 by default).
+- **HARD** + **range/exactly**: requires `MIN_ROUTINE_COUNT` (forecast-dependent, no fluke shortcut).
 
 `_try_lock_rule_trade` (in `scheduler.py`) is the executor used by both `job_unified_pipeline` (Phase 2, before the near-resolved skip) and `job_fast_lock_poll`. Flow:
 
 1. `evaluate_lock(state, market)` → if `side is None`, return `None` (caller falls through to probability).
 2. Compute `effective_price` = `yes_price` (YES side) or `1 - yes_price` (NO side); reject if outside `[LOCK_RULE_MIN_PRICE=0.05, LOCK_RULE_MAX_PRICE=0.95]`.
-3. Pull buy-side depth, run shared `_check_filters` (routine count, close buffer, depth) with stub edge/prob — no edge gate.
+3. Pull buy-side depth, run shared `_check_filters` with `min_routine_count=2` (lock-rule already gated routine count per its own super-margin / standard rules), close buffer, depth — stub edge/prob, no edge gate.
 4. Size via `size_locked_position` (`LOCK_POSITION_PCT=2%` of bankroll, capped at `MAX_POSITION_USD/2` and 15% of orderbook depth), apply drawdown multiplier, place FOK order.
 5. On execution, write `Signal(model_prob=1.0, market_prob=effective_price, edge=1-effective_price)` and `Trade(direction, stake_usd, entry_price=effective_price)`. Telegram 🔒 alert.
 
@@ -164,18 +186,23 @@ Settings: `LOCK_RULE_ENABLED`, `LOCK_RULE_MIN_PRICE`, `LOCK_RULE_MAX_PRICE`, `LO
 
 ### Forecast-exceedance alerts (`src/signals/forecast_exceedance.py`)
 
-Diagnostic + Polymarket-discovery layer that runs from `aggregate_state` every tick. Two outputs:
+Diagnostic + Polymarket-discovery layer that runs from `aggregate_state` every unified tick AND from `_fast_poll_projection_check` (in `scheduler.py`) on every fresh fast-poll METAR. Two outputs:
 
-1. **DB row** in `forecast_exceedance_alerts` for every routine METAR whose same-hour delta vs forecast exceeds `EXCEEDANCE_THRESHOLD_F=0.5°F`. This is calibration history — bucket by `alerted` to compare push rate vs reality.
+1. **DB row** in `forecast_exceedance_alerts` for every routine METAR whose same-hour delta vs forecast exceeds `EXCEEDANCE_THRESHOLD_F=0.5°F`. This is calibration history — bucket by `alerted` to compare push rate vs reality. The `(station_icao, observed_at)` uniqueness constraint dedupes between fast-poll and unified for the same observation.
 2. **Telegram 🌡 push** when *all* of:
    - `_peak_passed(state)` is False (heuristics on `metar_trend_rate_short`, solar, hours_until_peak);
-   - `routine_count_today >= MIN_ROUTINE_COUNT_FOR_PUSH=3`;
+   - routine count gate: `routine_count_today >= 3` normally, or `>= 2` when `same_hour_delta_f > STRONG_RESIDUAL_DELTA_F=1.0°F` (the obs is already running clearly hot, so 2 confirming routines suffice);
    - `_project_daily_max(state) - state.forecast_peak_f > DELTA_THRESHOLD_F=1.0°F`;
    - station hasn't already pushed within `ALERT_COOLDOWN=30 min`.
 
-`_project_daily_max` blends a residual-carry projection with the forecast peak: pre-peak it adds `α·forecast_residual_f` (`α=exp(-h/2)`) plus a damped trend residual; post-peak with positive obs slope it extrapolates `POST_PEAK_TREND_CARRY_K=0.75 × rate × hours`. Capped at `forecast_peak + MAX_OVERSHOOT_F=5°F`; observed max is always a floor.
+`_project_daily_max` has two pre-peak branches; both share the post-peak trend carry, dewpoint nudge, overshoot cap (`forecast_peak + MAX_OVERSHOOT_F=5°F`), and observed-max floor:
 
-Optional Polymarket-discovery line via `projected_market_lookup.lookup_projected_binary` — finds the active binary closest to the projected max and prints its operator/threshold/YES price. Tunables live as module-level constants in `forecast_exceedance.py` (no config plumbing); edit + restart.
+- **v2 (slope, default when ≥ `RESIDUAL_SLOPE_MIN_POINTS=3` routines and `PROJECTION_RESIDUAL_SLOPE_ENABLED=True`)** — projects the residual forward at its observed slope: `projected = forecast_peak + (current_residual + slope × min(hours_until_peak, RESIDUAL_SLOPE_HOURS_CAP=3))`. Slope clipped to `±RESIDUAL_SLOPE_MAX_F_PER_HR=1.5°F/hr`; the slope contribution is damped by `solar_decline_magnitude` and `cloud_rise_magnitude`. Captures "forecast falling further behind every hour" 1-2 hours earlier than v1.
+- **v1 (legacy halflife decay, fallback)** — `α·forecast_residual_f` (`α=exp(-h/2)`) plus a separate damped trend-residual carry (`obs_slope − forecast_forward_slope`). Used when fewer than 3 routines, slope unavailable, or the v2 setting is off.
+
+For A/B comparison while v2 stabilizes, every exceedance log line carries both projections side-by-side: `projected=… (live v2), legacy_projected=… (v1)`. Grep `legacy_projected=` over a few days to compare lead time and RMS error vs the realized daily max — promote/revert via `PROJECTION_RESIDUAL_SLOPE_ENABLED`.
+
+Optional Polymarket-discovery line via `projected_market_lookup.lookup_projected_binary` — finds the active binary closest to the projected max and prints its operator/threshold/YES price. Tunables live as module-level constants in `forecast_exceedance.py` (no config plumbing) except for the v2 master switch above; edit + restart.
 
 ### Edge calculator (`src/signals/edge_calculator.py`)
 
@@ -188,7 +215,7 @@ All filters must pass:
 | `edge >= MIN_EDGE` | 0.05 | `edge_calculator.MIN_EDGE` (hardcoded) |
 | `our_probability >= MIN_PROBABILITY` | 0.60 | `settings.MIN_PROBABILITY` |
 | `MIN_ENTRY_PRICE <= price <= MAX_ENTRY_PRICE` | 0.40 / 0.97 | `settings` |
-| `routine_count >= MIN_ROUTINE_COUNT` | 3 | `settings` |
+| `routine_count >= min_routine_count` | 3 | `settings.MIN_ROUTINE_COUNT`, overridable via the `min_routine_count` kwarg (lock-rule path passes 2 since it gates routine count per its own super-margin rules) |
 | `minutes_to_close >= MARKET_CLOSE_BUFFER_MINUTES` | 30 | `settings` |
 | `depth >= MIN_DEPTH_USD` | 10 | `settings` |
 
@@ -234,13 +261,25 @@ Four states, not three. Multipliers in parentheses:
 
 Exit `RECOVERY` → `NORMAL` only when `current_bankroll >= peak`.
 
+#### Bankroll = equity, not wallet liquidity (`src/resolution.py`)
+
+`get_current_bankroll(session)` returns **equity**, not the live USDC balance:
+
+```
+bankroll = wallet_usdc + Σ (stake_usd + pnl) for trades WHERE status=WON AND redeemed_at IS NULL
+```
+
+Polymarket wins do not auto-settle into wallet USDC — the user must run `bet redeem` (which calls `redeemPositions()` on-chain) to convert the conditional tokens into wallet balance. Until then the future payout sits as conditional tokens. Without the unredeemed-WON adjustment, the drawdown monitor sees `peak = wallet + pnl` (from the prior `BankrollLog` write) but `current = wallet`, triggers a phantom `CAUTION`/`PAUSED`, and shrinks every Kelly stake by 0.5×–0× until the user redeems. The `(stake + pnl)` term equals `stake/entry` — exactly the dollar value the conditional tokens will return on redemption — so once redeemed, wallet rises by the same amount the unredeemed sum drops by, with no double-count. `get_unredeemed_won_payout(session)` exposes the adjustment for diagnostics.
+
+`bet redeem` stamps `Trade.redeemed_at = now()` on every WON row whose `market_id` matches a successful `redeemPositions()` receipt (`Market.id` is the `condition_id` in our DB). `BankrollLog` is written at 22:00 UTC by `job_daily_settlement` from the same `get_current_bankroll` value, so the persisted history reflects equity too.
+
 ### Circuit breakers (`src/risk/circuit_breakers.py`)
 
 Checked once per unified pipeline tick *and* every fast-poll tick, before any city is evaluated:
 - Daily loss stop: halt when today's P&L < `-DAILY_LOSS_STOP_USD` (-$200).
 - Consecutive loss stop: `CONSECUTIVE_LOSS_PAUSE_COUNT` LOST trades in a row (default 3) → pause `CONSECUTIVE_LOSS_PAUSE_HOURS` (2h). `_paused_until` lives in process memory; consecutive losses are re-queried from the DB each check, so the pause re-engages on restart if the streak still holds.
 
-Both counts are configurable via `settings`. Per-city routine-count and bias-runaway checks live in the aggregator and edge filter, not here. The fast-poll dedup state (`_locked_markets_fired_today`, `_last_routine_seen`) is also in-process and reset at 22:00 UTC settlement.
+Both counts are configurable via `settings`. Per-city routine-count and bias-runaway checks live in the aggregator and edge filter, not here. The fast-poll dedup state (`_locked_markets_fired_today`, `_last_routine_seen`) is also in-process and reset per-station at the station's local-day rollover (`_maybe_clear_per_station_caches`).
 
 ## How To: Common Tasks
 
@@ -255,16 +294,21 @@ Both counts are configurable via `settings`. Per-city routine-count and bias-run
 ### Tune trade filters
 
 Everything is in `src/config.py` (Pydantic `Settings`, overridable via `.env`):
-- `MIN_EDGE` (hardcoded to 0.05 in `edge_calculator.py`, separate from `settings.MIN_EDGE`)
+- `MIN_EDGE` (default 0.05; harmonised — `edge_calculator._check_filters` reads `settings.MIN_EDGE` directly)
 - `MIN_PROBABILITY`, `MIN_ENTRY_PRICE`, `MAX_ENTRY_PRICE`
 - `MIN_DEPTH_USD`, `MIN_ROUTINE_COUNT`, `MARKET_CLOSE_BUFFER_MINUTES`
 - Kelly caps: `KELLY_FRACTION`, `MAX_POSITION_PCT`, `MAX_POSITION_USD`, `DEPTH_POSITION_CAP_PCT`
+- `APPLY_CALIBRATION` (default False) — when True, the unified pipeline refreshes the consensus calibration cache each tick and applies the linear correction to the chosen side's probability before edge filtering. See `src/signals/consensus.py`.
 
 The lock-rule path has its **own** knob set (`LOCK_RULE_*`, `LOCK_MARGIN_F`, `LOCK_POSITION_PCT`, `FAST_LOCK_POLL_*`) — changing the directional `MIN_EDGE` etc. does not affect it. The ensemble σ knobs (`ENSEMBLE_*`) only affect Phase 1 σ in the probability engine.
 
+Forecast-exceedance / projection knobs:
+- `PROJECTION_RESIDUAL_SLOPE_ENABLED` (default `True`) — flip off to revert `_project_daily_max` to the legacy halflife decay path without code change.
+- Tunables live as module-level constants in `src/signals/forecast_exceedance.py`: `RESIDUAL_SLOPE_MIN_POINTS=3`, `RESIDUAL_SLOPE_HOURS_CAP=3.0`, `RESIDUAL_SLOPE_MAX_F_PER_HR=1.5`, `STRONG_RESIDUAL_DELTA_F=1.0`, `STRONG_RESIDUAL_MIN_ROUTINES=2`, `MIN_ROUTINE_COUNT_FOR_PUSH=3`, `DELTA_THRESHOLD_F=1.0`, `MAX_OVERSHOOT_F=5.0`, `ALERT_COOLDOWN=30 min`. Edit + restart.
+
 ### Change pipeline cadence
 
-`UNIFIED_PIPELINE_INTERVAL_MINUTES` in `.env` (default 5). The cron-style settlement job is fixed at 22:00 UTC in `setup_scheduler()`.
+`UNIFIED_PIPELINE_INTERVAL_MINUTES` in `.env` (default 5). `job_resolve_trades` is hardcoded to a 5-min interval (with a 30s offset from unified to spread CLOB load). The cron-style daily settlement job is fixed at 22:00 UTC in `setup_scheduler()`.
 
 ### Add / modify probability signals
 
@@ -288,15 +332,15 @@ Signals live in `src/signals/probability_engine.py` as `_apply_*` helpers. Each 
 
 | File | Purpose | Key exports |
 |------|---------|-------------|
-| `src/scheduler.py` | APScheduler jobs + health server + binary/bracket edge helpers + lock-rule executor | `job_scan_markets`, `job_unified_pipeline`, `job_fast_lock_poll`, `job_daily_settlement`, `_try_lock_rule_trade`, `_is_binary_market`, `_binary_market_edge`, `_should_skip_future_day`, `_EXCLUDED_ICAOS`, `run_scheduler` |
-| `src/signals/state_aggregator.py` | Per-ICAO weather state snapshot, deterministic + ensemble forecast blend | `WeatherState`, `aggregate_state`, `build_state_from_metars`, `_blend_forecasts` |
+| `src/scheduler.py` | APScheduler jobs + health server + binary/bracket edge helpers + lock-rule executor + fast-poll projection + per-station cache rollover | `job_scan_markets`, `job_resolve_trades`, `job_unified_pipeline`, `job_fast_lock_poll`, `job_daily_settlement`, `_maybe_clear_per_station_caches`, `_try_lock_rule_trade`, `_fast_poll_projection_check`, `_is_binary_market`, `_binary_market_edge`, `_should_skip_future_day`, `_EXCLUDED_ICAOS`, `run_scheduler` |
+| `src/signals/state_aggregator.py` | Per-ICAO weather state snapshot, deterministic + ensemble forecast blend, residual-slope fit, fast-poll input cache | `WeatherState`, `CachedAggregationInputs`, `aggregate_state`, `build_state_from_metars`, `_blend_forecasts`, `_compute_residual_slope`, `get_cached_aggregation_inputs`, `clear_state_cache`, `clear_state_cache_for_icao` |
 | `src/signals/probability_engine.py` | Signal-based bucket distribution | `BucketDistribution`, `compute_distribution` |
-| `src/signals/edge_calculator.py` | Per-bucket edge + filter checks | `BucketEdge`, `compute_edges`, `_check_filters`, `MIN_EDGE` |
-| `src/signals/lock_rules.py` | Deterministic physical-lock decisions | `LockDecision`, `evaluate_lock` |
-| `src/signals/forecast_exceedance.py` | "Daily max set to beat forecast" alerts + DB calibration history | `check_and_record_daily_max_alert`, `_project_daily_max` |
+| `src/signals/edge_calculator.py` | Per-bucket edge + filter checks (`min_routine_count` overridable) | `BucketEdge`, `compute_edges`, `_check_filters`, `MIN_EDGE` |
+| `src/signals/lock_rules.py` | Deterministic physical-lock decisions (super-margin EASY at routine #2) | `LockDecision`, `evaluate_lock` |
+| `src/signals/forecast_exceedance.py` | "Daily max set to beat forecast" alerts + DB calibration history; v2 slope-projection (`PROJECTION_RESIDUAL_SLOPE_ENABLED`) with v1 parallel-logged | `check_and_record_daily_max_alert`, `_project_daily_max`, `_project_with_residual` |
 | `src/signals/projected_market_lookup.py` | Find the active binary closest to a projected daily max | `lookup_projected_binary` |
 | `src/signals/mapper.py` | Geocoding, ICAO lookup, operator/date/threshold normalisation, station-local timezones | `CITIES`, `CITY_ICAO`, `icao_for_location`, `cities_for_icao`, `geocode`, `icao_timezone`, `unit_for_station`, `normalize_operator`, `convert_threshold`, `f_to_c` |
-| `src/signals/consensus.py` | Linear recalibration from resolved signals (weekly, not applied live) | `get_calibration_coefficients`, `MIN_CALIBRATION_SAMPLES` |
+| `src/signals/consensus.py` | Linear recalibration `actual ≈ slope*predicted + intercept` from resolved signals, plus an in-process TTL cache (`refresh_calibration` / `get_cached_calibration`) and a sync `apply_calibration(prob) → (corrected, applied_bool)`. Wired into `_binary_market_edge` post-side-selection when `settings.APPLY_CALIBRATION=True`. | `get_calibration_coefficients`, `refresh_calibration`, `apply_calibration`, `MIN_CALIBRATION_SAMPLES` |
 | `src/signals/reverse_lookup.py` | Find markets by city/station/observation | `find_markets_for_city`, `find_markets_for_station`, `find_markets_for_observation`, `find_markets_for_event` |
 | `src/ingestion/polymarket.py` | Gamma API scanner + question parser | `scan_and_ingest`, `ingest_markets`, `get_active_weather_markets`, `parse_question`, `is_weather_market`, `parse_temperature_brackets` |
 | `src/ingestion/openmeteo.py` | Deterministic + ensemble hourly forecast, solar/cloud/dewpoint helpers | `OpenMeteoForecast`, `fetch_deterministic_forecast`, `fetch_ensemble_forecast`, `solar_declining`, `cloud_rising`, `dewpoint_trend` |
@@ -309,14 +353,17 @@ Signals live in `src/signals/probability_engine.py` as `_apply_*` helpers. Each 
 | `src/risk/drawdown.py` | Four-state drawdown machine with hysteresis | `DrawdownMonitor`, `DrawdownLevel` (`NORMAL`/`CAUTION`/`PAUSED`/`RECOVERY`) |
 | `src/risk/circuit_breakers.py` | Daily loss + consecutive loss halts | `check_circuit_breakers`, `CircuitBreakerState` |
 | `src/risk/simulate.py` | Paper-trade simulator | used by `cli paper-trade` |
-| `src/resolution.py` | Trade settlement, bankroll, exposure | `resolve_trades`, `get_current_bankroll`, `get_current_exposure`, `calculate_daily_pnl` |
-| `src/db/models.py` | SQLAlchemy ORM | `Market`, `Signal`, `Trade`, `StationBias`, `MetarObservation`, `TafForecast`, `Pirep`, `WxObservation`, `AviationAlert`, `ForecastExceedanceAlert` |
+| `src/resolution.py` | Trade settlement, bankroll-as-equity, exposure, CLOB-refreshed resolution price | `resolve_trades`, `_refresh_market_price`, `get_current_bankroll`, `get_unredeemed_won_payout`, `get_current_exposure`, `calculate_daily_pnl` |
+| `src/db/models.py` | SQLAlchemy ORM. `Trade.redeemed_at` is the redemption-tracking timestamp set by `bet redeem` (NULL means winnings still locked in conditional tokens). | `Market`, `Signal`, `Trade`, `StationBias`, `StationNormal`, `MetarObservation`, `TafForecast`, `Pirep`, `WxObservation`, `AviationAlert`, `ForecastExceedanceAlert`, `ForecastArchive` |
+| `src/ingestion/forecast_archive.py` | Best-effort writer that snapshots every `OpenMeteoForecast` blend into the `ForecastArchive` table for replay-capable backtests | `archive_forecast_snapshot` |
 | `src/config.py` | Pydantic settings | `settings` |
 | `src/cli.py` | CLI entry points | `run`, `scan`, `backfill`, `status`, `paper-trade`, `backtest-v2`, `migrate`, `approve`, `test-trade`, `bet {place,info,search,find,cancel,orders,portfolio,redeem}` |
 | `scripts/backtest_lock_rule.py` | Replay the lock-rule trader against resolved markets + DB METARs | standalone CLI |
 | `scripts/debug_pipeline.py` | Trace the unified pipeline for one market/station, no orders | standalone CLI |
 | `scripts/inspect_loss.py` | Post-mortem drilldown for a single losing trade | standalone CLI |
 | `scripts/backfill_station_bias_tz.py` | Idempotent recompute of station bias from DB METARs (timezone-correct windows) | one-shot |
+| `scripts/compare_projection_versions.py` | Phase 1.3 — joins `forecast_exceedance_alerts` to realised daily max (single batch query, not N+1); reports v2 projection RMSE / mean-bias by station + lead bucket + alerted flag. v1/v2 head-to-head deferred until `forecast_archive` has ≥1 week of data. | `PYTHONPATH=. python scripts/compare_projection_versions.py --days 30` |
+| `scripts/station_calibration_report.py` | Phase 1.4 — per-ICAO markdown dashboard combining `StationBias` rolling mean, projection error, push hit rate, lock-rule strike rate, and probability-path realised edge / Brier. Output committed to `reports/calibration/stations_baseline.md`. | `PYTHONPATH=. python scripts/station_calibration_report.py --days 30` |
 
 ## Live Execution
 
@@ -349,8 +396,17 @@ Orders are placed via `py-clob-client` in `src/execution/polymarket_client.py::p
 
 - **Near-resolved skip is 0.99 / 0.01**, not 0.95. Threshold was raised so the lock-rule path can evaluate prices in the 0.90–0.99 zone (where Wunderground UI hasn't yet caught up to a freshly-published METAR).
 - **Lock-rule fires before the near-resolved skip.** Phase 2 runs `_try_lock_rule_trade` first; only if it returns `None` does the probability path see the market. A lock that's "fired but rejected" (price out of `[0.05, 0.95]`, depth too thin, close-buffer breach) returns `0.0` and the market is skipped for the rest of this tick.
-- **Fast-poll dedup is in-process and aggressive.** `_locked_markets_fired_today` blocks a market for the rest of the day even if the lock got *filtered out* (depth, close buffer). By design — re-trying every 30 s wouldn't change the rejection cause. Cleared at 22:00 UTC settlement and on restart.
-- **Bias is recorded against the deterministic single-source peak**, not the ensemble blend (`job_daily_settlement` step 5). Reason: keep the bias reference frame stable when the ensemble model list changes. The pipeline still trades on the bias-adjusted ensemble peak.
+- **Fast-poll dedup is in-process and aggressive.** `_locked_markets_fired_today` blocks a market for the rest of the day even if the lock got *filtered out* (depth, close buffer). By design — re-trying every 30 s wouldn't change the rejection cause. Cleared per-station when the station's `today_local(tz)` rolls over (`_maybe_clear_per_station_caches`), and on restart.
+- **Per-station rollover, not global UTC clear.** `_maybe_clear_per_station_caches` runs at the top of every unified tick. On the first sighting of a station it just seeds `_local_day_seen` (no clear) — this avoids clobbering dedup entries that fast-poll may have written between process boot and the first unified tick. The dedup→ICAO link is stored in `_market_to_icao` at lock-fire time; if a market is added to `_locked_markets_fired_today` outside `job_fast_lock_poll`, the rollover won't find it.
+- **Fast-poll projection check needs a warm cache.** `_fast_poll_projection_check` is a no-op for a station until `aggregate_state` has run for it once (cache populated) and within the 30-min TTL. After a restart, the first 5 minutes of fast-poll alerts will be silent until the next unified tick warms the cache — expected, not a bug.
+- **`_state_cache` is in-process, never persisted.** Resets on restart and per-station on local-day rollover. Forecast and bias drift slowly within 30 minutes, so the staleness ceiling is fine for fast-poll's projection use case but not for anything that needs day-spanning data.
+- **`job_resolve_trades` ≠ `job_daily_settlement`.** Resolution moved to a 5-min interval job; settlement at 22:00 UTC only does bankroll/drawdown bookkeeping, daily summary, station bias, and weekly calibration. A trade's `closed_at` is now within ≤5 min of the market's `end_date`, not the next 22:00 UTC tick.
+- **Resolution price is refreshed at settlement time.** `resolve_trades` calls `_refresh_market_price` on each candidate before applying the 0.95/0.05 thresholds. The 15-min `job_scan_markets` and 5-min `job_unified_pipeline` writes can leave `current_yes_price` 30+ min stale by the time the market expires; the live CLOB mid is the source of truth for resolution. Failures fall back to the stored price and retry next tick.
+- **Bankroll is equity, not wallet.** `get_current_bankroll` adds `Σ(stake + pnl) for WON trades with redeemed_at IS NULL` to the wallet balance. Without this, won trades whose conditional tokens haven't been on-chain redeemed yet show as a phantom drawdown. `bet redeem` stamps `Trade.redeemed_at` on success; `Market.id` doubles as the on-chain `condition_id` for the matching update.
+- **`Trade.redeemed_at` migration backfill assumes pre-existing wins were already redeemed** (sets `redeemed_at = closed_at`). If you have actual unredeemed wins at deploy time, NULL their `redeemed_at` after running `alembic upgrade head`, or run `bet redeem` first. Migration `g7h8i9j0k1l2_add_trade_redeemed_at`. The Postgres `tradestatus` enum stores **uppercase names** (`'WON'`/`'LOST'`/`'OPEN'`/`'PENDING'`) — SQLAlchemy's default `Enum(TradeStatus)` uses enum names, not `.value` strings; raw SQL touching this column must use the uppercase form.
+- **`projected_max_f` in `forecast_exceedance_alerts` is whichever path is live (v2 by default).** The legacy v1 value is **only** in the JSON logs (`legacy_projected=`), not the DB. If you need to compare v1 vs v2 historically, parse logs. Promoting v2 permanently means deleting the parallel-logging block in `check_and_record_daily_max_alert`.
+- **Bias is recorded against the deterministic single-source peak**, not the ensemble blend (`job_daily_settlement` step 4). Reason: keep the bias reference frame stable when the ensemble model list changes. The pipeline still trades on the bias-adjusted ensemble peak.
+- **Dry-run trades zero `stake_usd` and stay `PENDING` in BOTH paths.** When `place_order` returns from the dry-run branch (`polymarket_client.py:308-318`) it sets `trade.exchange_status="dry_run"` without touching `stake_usd`. Both the lock-rule executor (`scheduler.py:1014-1020`) and the probability-path post-place block (`scheduler.py:566-583`) then check that flag and explicitly zero `stake_usd`, keep `status=PENDING`, and emit a Telegram alert prefixed "(dry-run)" with an "Indicative" stake/price line. Result: DB exposure / P&L stay clean in dry-run; live daemon dry-run runs accumulate signals but no fake fills. If you fork either branch make sure the dry-run guard stays in place — without it, `resolve_trades` will attribute fictitious P&L against the requested mid.
 - **Hong Kong (VHHH) and Tel Aviv (LLBG) are silently skipped** even though they're in `CITIES`/`CITY_ICAO`. `_EXCLUDED_ICAOS` in `scheduler.py` filters them at the grouping step because their Polymarket resolution station diverges from the routine METAR feed we consume.
 - **`Signal.aviation_prob` is still read by the alerter** (inline-button "detail" view) — it's NULL for unified-pipeline signals, so the detail view shows a stale dash. Surprising but not a bug.
 - **Orderbook fetching is not disabled.** `job_unified_pipeline` calls `get_best_bid_ask` and `get_orderbook_depth` for every market with token IDs; 404s on resolved tokens produce the `Could not fetch orderbook for token X after 3 attempts` warning twice per market (once per call, since the failed fetch isn't cached). The subsequent skip comes from the `price >= 0.99 or price <= 0.01` check using the stale DB price.
@@ -358,12 +414,12 @@ Orders are placed via `py-clob-client` in `src/execution/polymarket_client.py::p
 - `_fetch_orderbook` caches only **successful** fetches for 30s. Failures are not negative-cached, so two back-to-back calls to a dead token retry 3×3×throttle delay.
 - `WeatherState` is produced **even if Open-Meteo fails** — in that case `forecast_peak_f = current_max_f`, `hours_until_peak = 0`, solar/cloud signals are False, `forecast_sigma_f = None`, `has_forecast = False`. Probability distribution degenerates to a narrow band around current max; lock rule's HARD direction is disabled.
 - Dewpoint trend in `state_aggregator.py` uses recent METARs (6h window), not Open-Meteo. `openmeteo.dewpoint_trend` exists but isn't wired into the pipeline.
-- `consensus.py` is a vestigial filename — it no longer blends multi-model forecasts; it only fits linear calibration coefficients (`slope*predicted + intercept`) from resolved signals, logged on Sundays. **Not applied to live probabilities.**
-- `MIN_EDGE` is defined twice: `edge_calculator.MIN_EDGE = 0.05` (used by the unified pipeline) and `settings.MIN_EDGE = 0.10` (unused today; legacy).
+- `consensus.py` is a vestigial filename — it no longer blends multi-model forecasts. Today it (a) fits linear calibration coefficients from resolved signals, (b) caches them in-process for 30 min via `refresh_calibration`, and (c) exposes `apply_calibration` which the unified pipeline calls inside `_binary_market_edge` (post-side-selection) **only when `settings.APPLY_CALIBRATION=True`** (default False). Default-off because the bake-off in `reports/calibration/` hasn't been run yet — flip on, run a backtest, compare Brier, then promote.
+- `MIN_EDGE` is now harmonised on `settings.MIN_EDGE` (default 0.05). The module-level `edge_calculator.MIN_EDGE` is kept as a re-export for back-compat but `_check_filters` reads `settings.MIN_EDGE` directly. If you have an older `.env` with `MIN_EDGE=0.10`, that value still wins via env override — review it before assuming the default applies.
 - `gfs.py`/`ecmwf.py`/`detector.py`/old `mapper.py` signal-generation paths are gone. The `Signal.gfs_prob`/`ecmwf_prob` columns remain in the schema but are always NULL.
 - **Backtest harnesses exist as standalone scripts**, not as a module in the pipeline: `python -m src.cli backtest-v2` (probability path) and `python scripts/backtest_lock_rule.py` (lock path). Earlier docs claimed there was no backtest — that's stale.
 - Token IDs are refetched from Gamma per order and per price call. High-frequency trading would benefit from caching on the `Market` row, but current 5-min cadence makes it a non-issue.
 - FOK orders fully fill or cancel — no partial fills; thin books leave trades in `PENDING`.
 - Aviation has its own rate-limit semaphores per provider (`_RATE_LIMIT_RPS` constants) independent of the pipeline semaphore (`_UNIFIED_CONCURRENCY=8`).
 - `_paused_until` circuit-breaker state resets on process restart. Consecutive losses are re-queried from DB each check, so the pause re-engages if the streak still holds.
-- `Market.current_yes_price` is **overwritten** in-memory during Phase 2 with the live CLOB mid — that write is never committed to the DB row unless the session flushes; it only affects the current tick's probability/price comparison.
+- `Market.current_yes_price` is **read-only** in the unified pipeline, fast-lock poll, and resolve_trades paths. They take the live mid from `get_best_bid_ask` into a local `live_price` and never assign back to the ORM row — `expire_on_commit=False` plus default autoflush meant any later `session.add(Signal/Trade)` was flushing dirty Market mutations to disk and causing cross-transaction deadlocks (multiple jobs UPDATEing overlapping markets in different orders). Only `job_scan_markets` (`ingest_markets`) persists this column, and it iterates raw markets sorted by id so the UPDATEs are emitted in deterministic primary-key order.

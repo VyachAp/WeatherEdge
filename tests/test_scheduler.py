@@ -366,6 +366,7 @@ class TestPerStationCacheRollover:
         # Reset module-level state between tests.
         from src import scheduler as sch
         sch._locked_markets_fired_today.clear()
+        sch._unified_fired_today.clear()
         sch._last_routine_seen.clear()
         sch._market_to_icao.clear()
         sch._local_day_seen.clear()

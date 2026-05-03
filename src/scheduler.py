@@ -49,12 +49,21 @@ _shutdown_event: asyncio.Event | None = None
 # placed a lock order for. Cleared per-station at the station's local-day
 # rollover by `_maybe_clear_per_station_caches` (run from the unified
 # pipeline tick), not at a single global UTC time.
+# `_unified_fired_today` is the dry-run-only sibling for the probability path
+# (keyed by `(market_id, direction, bucket)` since brackets can fire several
+# buckets per market). In dry-run, `place_order` is a no-op and the resulting
+# Trade row carries `stake_usd=0`, so `current_exposure` doesn't grow and
+# nothing else blocks the next 5-min tick from re-emitting the same alert.
+# This set closes that gap. Live trades remain undeduped — the OPEN-trade
+# exposure is the source of truth there.
 # `_last_routine_seen` skips METARs the fast loop already processed.
 # `_market_to_icao` lets the per-station rollover find which market_ids
-# in `_locked_markets_fired_today` belong to a given station.
+# in `_locked_markets_fired_today` / `_unified_fired_today` belong to a
+# given station.
 # `_local_day_seen` tracks each station's last-observed local date so we
 # can detect rollover.
 _locked_markets_fired_today: set[str] = set()
+_unified_fired_today: set[tuple[str, str, int]] = set()
 _last_routine_seen: dict[str, datetime] = {}
 _market_to_icao: dict[str, str] = {}
 _local_day_seen: dict[str, date] = {}
@@ -195,9 +204,15 @@ def _maybe_clear_per_station_caches() -> None:
         # Local day rolled over — drop dedup market_ids that belong to
         # this station, the per-station routine cursor, and the cached
         # forecast/bias inputs so the next tick re-fetches.
-        for mid in [m for m, ic in _market_to_icao.items() if ic == icao]:
+        mids_for_icao = [m for m, ic in _market_to_icao.items() if ic == icao]
+        for mid in mids_for_icao:
             _locked_markets_fired_today.discard(mid)
             _market_to_icao.pop(mid, None)
+        if mids_for_icao:
+            mids_set = set(mids_for_icao)
+            _unified_fired_today.difference_update(
+                {k for k in _unified_fired_today if k[0] in mids_set}
+            )
         _last_routine_seen.pop(icao, None)
         clear_state_cache_for_icao(icao)
         _local_day_seen[icao] = today
@@ -549,6 +564,23 @@ async def job_unified_pipeline() -> None:
                             )
                             continue
 
+                        # Dry-run dedup: place_order is a no-op and the Trade
+                        # row's stake_usd is later zeroed, so nothing else
+                        # blocks the next tick from re-emitting the same
+                        # alert. Skip if this (market, direction, bucket) was
+                        # already paper-fired today. Live mode is undeduped —
+                        # the OPEN trade's exposure is the source of truth
+                        # there.
+                        dedup_key = (
+                            market.id, edge.direction.value, edge.bucket_value,
+                        )
+                        if not is_live() and dedup_key in _unified_fired_today:
+                            logger.info(
+                                "[%s] skip %s bucket=%d: already paper-fired today (dry-run dedup)",
+                                icao, side_label, edge.bucket_value,
+                            )
+                            continue
+
                         from src.db.models import Signal
                         # Store the side-effective probability so the
                         # consensus calibration regression (which reads
@@ -596,6 +628,8 @@ async def job_unified_pipeline() -> None:
                                 f"Indicative: ${indicative_stake:.2f} @ {indicative_price:.3f}\n"
                                 f"Market: {market.question[:60]}",
                             )
+                            _unified_fired_today.add(dedup_key)
+                            _market_to_icao[market.id] = icao
                         elif order_ok and (trade.stake_usd or 0.0) > 0:
                             trade.status = TradeStatus.OPEN
                             actual_stake = trade.stake_usd
