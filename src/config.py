@@ -18,7 +18,12 @@ class Settings(BaseSettings):
 
     TELEGRAM_BOT_TOKEN: str = ""
     TELEGRAM_CHAT_ID: str = ""
-    MIN_EDGE: float = 0.10
+    # Edge threshold gate in `_check_filters`. The historical hardcode in
+    # `edge_calculator.py` was 0.05 and was the value actually applied
+    # for years; the older `MIN_EDGE=0.10` default here was unused. Default
+    # restored to 0.05 to match observed paper-trade behavior; tune after
+    # calibration backtest is wired (see Phase 1 in the revenue plan).
+    MIN_EDGE: float = 0.05
     KELLY_FRACTION: float = 0.25
     MAX_POSITION_PCT: float = 0.05
     INITIAL_BANKROLL: float = 750.0
@@ -86,6 +91,14 @@ class Settings(BaseSettings):
     DEFAULT_STATION_BIAS_C: float = 1.0
     STATION_BIAS_WINDOW_DAYS: int = 30
     STATION_BIAS_MAX_C: float = 3.0
+
+    # Consensus calibration (Phase 1.2). When True, the unified pipeline
+    # refreshes a linear (slope, intercept) fit from resolved signals
+    # every tick and applies it to the chosen side's probability before
+    # edge filtering. Default False so the live pipeline is unchanged
+    # until the bake-off in `reports/calibration/` confirms a Brier
+    # improvement. See `src/signals/consensus.py`.
+    APPLY_CALIBRATION: bool = False
 
     # Circuit breakers
     DAILY_LOSS_STOP_USD: float = 200.0

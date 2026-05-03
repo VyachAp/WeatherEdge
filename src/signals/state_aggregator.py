@@ -492,6 +492,17 @@ async def aggregate_state(
     forecast = _blend_forecasts(deterministic, ensemble)
 
     if forecast is not None:
+        # Diagnostic archive write — feeds the replay-capable backtest in
+        # ``simulate_distribution_pipeline``. Best-effort; never block
+        # state aggregation on archive failures.
+        try:
+            from src.ingestion.forecast_archive import archive_forecast_snapshot
+            await archive_forecast_snapshot(session, icao, forecast)
+        except Exception:
+            logger.warning(
+                "forecast archive write failed for %s", icao, exc_info=True,
+            )
+
         try:
             bias_c = await get_bias(session, icao)
         except Exception:

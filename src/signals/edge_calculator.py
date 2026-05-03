@@ -16,8 +16,10 @@ from src.signals.probability_engine import BucketDistribution
 
 logger = logging.getLogger(__name__)
 
-# Edge threshold for the unified pipeline (redesign doc: 0.05)
-MIN_EDGE: float = 0.05
+# Re-exported for backwards compatibility — `settings.MIN_EDGE` is the
+# source of truth (default 0.05). Imports of `MIN_EDGE` from this module
+# now resolve to the configured value rather than a hardcoded constant.
+MIN_EDGE: float = settings.MIN_EDGE
 
 
 @dataclass
@@ -126,8 +128,8 @@ def _check_filters(
     callers that have their own routine-count gate (e.g. the lock-rule path
     can fire on 2 routines for super-margin EASY locks).
     """
-    if edge < MIN_EDGE:
-        return f"edge {edge:.4f} < {MIN_EDGE}"
+    if edge < settings.MIN_EDGE:
+        return f"edge {edge:.4f} < {settings.MIN_EDGE}"
 
     if prob < settings.MIN_PROBABILITY:
         return f"probability {prob:.4f} < {settings.MIN_PROBABILITY}"

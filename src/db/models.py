@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from sqlalchemy import (
     Boolean,
     Column,
+    Date,
     DateTime,
     Enum,
     Float,
@@ -324,6 +325,49 @@ class StationNormal(Base):
     sample_years = Column(Integer, nullable=False)
     source = Column(String, nullable=False, default="openmeteo_archive_era5")
     computed_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+
+class ForecastArchive(Base):
+    """Snapshot of an Open-Meteo blended forecast at the moment a unified
+    pipeline tick fetched it.
+
+    One row per (station, target-local-day, fetched_at) — multiple per
+    station-day are expected (forecast evolves through the heating cycle).
+    Used by the replay-capable backtest in ``src/risk/simulate.py`` to
+    score the probability/projection paths against realised daily max.
+    Hourly arrays match the ``OpenMeteoForecast`` shape (24 entries each
+    by convention).
+    """
+
+    __tablename__ = "forecast_archive"
+    __table_args__ = (
+        Index(
+            "ix_forecast_archive_icao_target_fetched",
+            "station_icao",
+            "target_date_local",
+            "fetched_at",
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    station_icao = Column(String, nullable=False)
+    target_date_local = Column(Date, nullable=False)
+    fetched_at = Column(DateTime(timezone=True), nullable=False)
+    peak_temp_c = Column(Float, nullable=False)
+    peak_hour_utc = Column(Integer, nullable=False)
+    peak_temp_std_c = Column(Float, nullable=False, default=0.0)
+    model_count = Column(Integer, nullable=False, default=1)
+    hourly_temps_c = Column(JSONB, nullable=False)
+    hourly_cloud_cover = Column(JSONB, nullable=False)
+    hourly_solar_radiation = Column(JSONB, nullable=False)
+    hourly_dewpoint_c = Column(JSONB, nullable=False)
+    hourly_wind_speed = Column(JSONB, nullable=False)
+    hourly_temps_std_c = Column(JSONB, nullable=True)
+    created_at = Column(
         DateTime(timezone=True),
         nullable=False,
         default=lambda: datetime.now(timezone.utc),

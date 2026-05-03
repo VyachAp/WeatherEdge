@@ -347,6 +347,20 @@ async def job_unified_pipeline() -> None:
             exposure = await get_current_exposure(session)
             total_trades = 0
 
+            # Refresh consensus calibration once per tick when enabled.
+            # The fit is cached for `_CACHE_TTL_SEC` (30 min) so back-to-back
+            # ticks don't re-query; `apply_calibration` reads sync from the
+            # cache inside `_binary_market_edge`.
+            if settings.APPLY_CALIBRATION:
+                try:
+                    from src.signals.consensus import refresh_calibration
+                    await refresh_calibration(session)
+                except Exception:
+                    logger.warning(
+                        "calibration refresh failed; falling back to uncalibrated",
+                        exc_info=True,
+                    )
+
             for icao, state in city_states.items():
               try:
                 for market in city_markets[icao]:
@@ -564,7 +578,25 @@ async def job_unified_pipeline() -> None:
                         await session.flush()
 
                         order_ok = await place_order(trade, session)
-                        if order_ok and (trade.stake_usd or 0.0) > 0:
+                        # In dry-run, ``place_order`` is a no-op and never
+                        # updates fill fields, so ``trade.stake_usd`` is still
+                        # the requested value. Zero it (DB stays clean) and
+                        # report indicatively. Mirrors the lock-rule pattern.
+                        is_dry_run = trade.exchange_status == "dry_run"
+                        if order_ok and is_dry_run:
+                            indicative_stake = adjusted_stake
+                            indicative_price = trade.entry_price or edge.market_price
+                            trade.stake_usd = 0.0
+                            trade.status = TradeStatus.PENDING
+                            unit = _market_unit(market)
+                            display_bucket = _display_bucket(edge.bucket_value, unit)
+                            await alerter._enqueue(
+                                f"\U0001f4b0 *Unified trade (dry-run)* [{icao}] {side_label}\n"
+                                f"Bucket: {display_bucket}{unit} | Edge: {edge.edge:.3f}\n"
+                                f"Indicative: ${indicative_stake:.2f} @ {indicative_price:.3f}\n"
+                                f"Market: {market.question[:60]}",
+                            )
+                        elif order_ok and (trade.stake_usd or 0.0) > 0:
                             trade.status = TradeStatus.OPEN
                             actual_stake = trade.stake_usd
                             exposure += actual_stake
@@ -838,6 +870,22 @@ def _binary_market_edge(
         side_price = yes_price
         side_edge = yes_edge
         side_depth = depth_yes
+
+    # Apply consensus calibration when enabled — corrects the
+    # side-effective probability based on resolved-signal history. No-op
+    # when `APPLY_CALIBRATION=False`, when fewer than
+    # `MIN_CALIBRATION_SAMPLES` resolved signals exist, or when the cache
+    # is stale (refresh happens at the top of each tick).
+    from src.signals.consensus import apply_calibration
+    side_prob_raw = side_prob
+    side_prob, calibrated = apply_calibration(side_prob_raw)
+    if calibrated:
+        side_edge = round(side_prob - side_price, 4)
+        logger.debug(
+            "calibrated %s: prob %.3f→%.3f, edge %.3f→%.3f",
+            direction.value, side_prob_raw, side_prob,
+            round(side_prob_raw - side_price, 4), side_edge,
+        )
 
     reason = _check_filters(
         edge=side_edge, prob=side_prob, price=side_price,
