@@ -131,7 +131,8 @@ class TestRefreshMarketPrice:
             mid = await _refresh_market_price(market)
 
         assert mid == pytest.approx(0.975)
-        assert market.current_yes_price == pytest.approx(0.975)
+        # Function returns the refreshed mid but does not mutate the ORM row.
+        assert market.current_yes_price == 0.50
 
     @pytest.mark.asyncio
     async def test_falls_back_to_stored_price_on_failure(self):

@@ -20,11 +20,10 @@ _NO_RESOLVED_THRESHOLD = 0.05
 async def _refresh_market_price(market: Market) -> float | None:
     """Fetch live mid for an expired market's YES token.
 
-    The 5-min ``job_unified_pipeline`` and 15-min ``job_scan_markets`` may
-    have left ``market.current_yes_price`` 30+ minutes stale by the time a
-    market expires. Re-querying the CLOB before applying the 0.95/0.05
-    resolution thresholds tightens the loop so we don't wait an extra tick
-    on edge-case 0.94 → 0.96 drift. Failures fall back to the stored value.
+    Returns the live CLOB mid, or the stored ``market.current_yes_price`` if
+    the live fetch fails. Does not mutate the ORM row — concurrent writes
+    to ``markets.current_yes_price`` from multiple jobs were the cause of a
+    cross-transaction deadlock; only ``scan_markets`` persists this column.
     """
     from src.execution.polymarket_client import (
         get_best_bid_ask,
@@ -50,9 +49,7 @@ async def _refresh_market_price(market: Market) -> float | None:
         return market.current_yes_price
 
     bid, ask = quote
-    mid = (bid + ask) / 2.0
-    market.current_yes_price = mid
-    return mid
+    return (bid + ask) / 2.0
 
 
 async def resolve_trades(session: AsyncSession) -> list[Trade]:
@@ -77,13 +74,12 @@ async def resolve_trades(session: AsyncSession) -> list[Trade]:
     trades = list(result.scalars().unique())
 
     resolved: list[Trade] = []
-    refreshed_markets: set[str] = set()
+    refreshed_prices: dict[str, float | None] = {}
     for trade in trades:
         market = trade.market
-        if market.id not in refreshed_markets:
-            await _refresh_market_price(market)
-            refreshed_markets.add(market.id)
-        price = market.current_yes_price
+        if market.id not in refreshed_prices:
+            refreshed_prices[market.id] = await _refresh_market_price(market)
+        price = refreshed_prices[market.id]
         if price is None:
             continue
 

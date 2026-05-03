@@ -615,7 +615,10 @@ async def ingest_markets(session: AsyncSession, raw_markets: list[dict[str, Any]
 
     snapshot_rows: list[dict[str, Any]] = []
 
-    for raw in raw_markets:
+    # Iterate in primary-key order so SQLAlchemy emits UPDATEs in a
+    # deterministic sequence — defends against deadlocks with concurrent
+    # FK-share locks taken by Signal/Trade INSERTs from other jobs.
+    for raw in sorted(raw_markets, key=lambda r: r.get("id") or r.get("conditionId") or ""):
         mid = raw.get("id") or raw.get("conditionId")
         if not mid:
             continue
@@ -651,8 +654,10 @@ async def ingest_markets(session: AsyncSession, raw_markets: list[dict[str, Any]
         ))
         count += 1
 
-    # bulk-insert all snapshots in one statement
+    # bulk-insert all snapshots in one statement, sorted by market_id so
+    # the FK-share locks on `markets` are taken in deterministic order.
     if snapshot_rows:
+        snapshot_rows.sort(key=lambda r: r["market_id"])
         await session.execute(insert(MarketSnapshot).values(snapshot_rows))
 
     await session.commit()

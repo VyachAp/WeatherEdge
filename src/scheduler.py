@@ -376,17 +376,21 @@ async def job_unified_pipeline() -> None:
                     mkt_depth = 0.0
                     yes_bid: float | None = None
                     yes_ask: float | None = None
+                    live_price: float | None = None
                     token_ids = await get_token_ids(market.id)
                     if token_ids:
                         quote = get_best_bid_ask(token_ids[0])
                         if quote:
                             yes_bid, yes_ask = quote
                             live_price = (yes_bid + yes_ask) / 2
-                            market.current_yes_price = live_price
-                        if market.current_yes_price:
-                            mkt_depth = get_orderbook_depth(token_ids[0], market.current_yes_price)
+                        if live_price:
+                            mkt_depth = get_orderbook_depth(token_ids[0], live_price)
 
-                    price = market.current_yes_price or 0.0
+                    # Don't persist the live mid back onto the ORM row —
+                    # concurrent writers caused cross-transaction deadlocks.
+                    # Use the live quote in-tick; the stored value (refreshed
+                    # by job_scan_markets every 15 min) is the durable copy.
+                    price = live_price if live_price is not None else (market.current_yes_price or 0.0)
 
                     # --- Lock-rule fast path (deterministic physical lock-in) ---
                     # Evaluate before the near-resolved skip so the 0.90-0.95
@@ -1548,7 +1552,6 @@ async def job_fast_lock_poll() -> None:
                         continue
                     yes_bid, yes_ask = quote
                     yes_price = (yes_bid + yes_ask) / 2
-                    market.current_yes_price = yes_price
 
                     yes_depth = get_orderbook_depth(token_ids[0], yes_price) if yes_price > 0 else 0.0
                     end_time = market.end_date or now_utc + timedelta(hours=24)
