@@ -14,6 +14,12 @@ from dateutil import parser as dateutil_parser
 
 logger = logging.getLogger(__name__)
 
+# Locations we've already warned about being unmapped — first sighting per
+# process logs at WARNING (so a brand-new Polymarket city is still surfaced
+# as a candidate for CITIES/CITY_ICAO), subsequent calls are silent. Resets
+# on restart by design.
+_warned_unknown_locations: set[str] = set()
+
 # ---------------------------------------------------------------------------
 # Geocoding – static lookup for major US cities & state capitals
 # ---------------------------------------------------------------------------
@@ -703,7 +709,9 @@ def icao_for_location(location: str) -> str | None:
         if key in city or city in key:
             return icao
 
-    logger.warning("icao_for_location: unknown location %r", location)
+    if key not in _warned_unknown_locations:
+        _warned_unknown_locations.add(key)
+        logger.warning("icao_for_location: unknown location %r", location)
     return None
 
 
@@ -741,7 +749,9 @@ def geocode(location: str) -> tuple[float, float] | None:
         if key in city or city in key:
             return coords
 
-    logger.warning("geocode: unknown location %r", location)
+    if key not in _warned_unknown_locations:
+        _warned_unknown_locations.add(key)
+        logger.warning("geocode: unknown location %r", location)
     return None
 
 

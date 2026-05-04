@@ -359,7 +359,7 @@ async def place_order(
 
     yes_token_id, no_token_id = token_ids
 
-    from py_clob_client_v2.clob_types import OrderArgsV2, OrderType
+    from py_clob_client_v2.clob_types import MarketOrderArgsV2, OrderType
     from py_clob_client_v2.order_builder.constants import BUY
 
     from src.db.models import TradeDirection
@@ -394,25 +394,29 @@ async def place_order(
     except Exception:
         logger.debug("tick-size lookup failed; using raw limit_price", exc_info=True)
 
-    # Worst-case sizing: if every share fills at the limit, we spend
-    # exactly stake_usd. Better-priced fills leave us underspent — fine.
-    raw_size = trade.stake_usd / limit_price
-    # Polymarket requires whole-cent share sizes (typically 2-decimal).
-    size_shares = round(raw_size, 2)
-    if size_shares <= 0:
+    if trade.stake_usd <= 0:
         trade.exchange_status = "size_zero"
         return False
 
     try:
-        # V2 OrderArgs: no fee_rate_bps / nonce / taker — those have moved
-        # out of the signed struct in the V2 exchange contracts.
-        order = OrderArgsV2(
+        # Use the market-order builder, not the limit-order builder.
+        # The CLOB enforces ≤2-decimal precision on the maker (USDC) leg of
+        # FAK / FOK buys; the limit-order path produces price*size with up to
+        # round_config.amount decimals (4 for tick=0.01) and gets rejected
+        # with "invalid amounts ... market buy orders maker amount supports a
+        # max accuracy of 2 decimals". MarketOrderArgsV2 takes amount in USDC
+        # directly (round_config.size=2) and derives shares as amount/price,
+        # which fits the server rule by construction. Passing a non-zero
+        # `price` skips the SDK's network calculate_market_price call and
+        # uses our tick-snapped limit as the worst-case fill price.
+        order = MarketOrderArgsV2(
             token_id=token_id,
-            price=limit_price,
-            size=size_shares,
+            amount=trade.stake_usd,
             side=BUY,
+            price=limit_price,
+            order_type=OrderType.FAK,
         )
-        signed = client.create_order(order)
+        signed = client.create_market_order(order)
         resp = client.post_order(signed, OrderType.FAK)
 
         trade.order_id = resp.get("orderID")
@@ -420,9 +424,9 @@ async def place_order(
 
         if resp.get("success") or resp.get("orderID"):
             logger.info(
-                "Order posted: market=%s side=%s limit=%.3f size=%.2f stake=$%.2f order=%s status=%s",
+                "Order posted: market=%s side=%s limit=%.3f amount=$%.2f order=%s status=%s",
                 trade.market_id, trade.direction.value,
-                limit_price, size_shares, trade.stake_usd,
+                limit_price, trade.stake_usd,
                 trade.order_id, trade.exchange_status,
             )
             if trade.order_id:
