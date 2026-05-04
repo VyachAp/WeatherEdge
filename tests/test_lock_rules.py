@@ -137,6 +137,31 @@ class TestHardDirectionAbove:
         state = _state(current_max_f=70.0, forecast_peak_f=82.0, solar_declining=True)
         assert _eval(state, mkt).side is None
 
+    def test_hard_no_lock_pre_peak_overnight_cooling(self):
+        # Regression for the Beijing 2 AM bug: at e.g. 2 AM local with
+        # hours_until_peak=+12, the 6h METAR regression over overnight
+        # radiative cooling is strongly negative. Pre-fix, _no_more_heating's
+        # OR (`solar_declining or metar_trend_rate <= 0`) fired on the
+        # negative trend alone and the HARD-NO branch locked. The fix gates
+        # on `hours_until_peak > 0.0` first.
+        mkt = _FakeMarket(parsed_threshold=80.0, parsed_operator="above")
+        state = WeatherState(
+            station_icao=_TEST_ICAO,
+            current_max_f=55.0,         # well under threshold - margin
+            metar_trend_rate=-1.0,      # cooling overnight
+            dewpoint_trend_rate=0.0,
+            forecast_peak_f=76.0,       # forecast clearly < threshold (would clear gate A)
+            hours_until_peak=12.0,      # peak is 12 h away
+            solar_declining=False,      # solar = 0 overnight, can't decline
+            solar_decline_magnitude=0.0,
+            cloud_rising=False,
+            cloud_rise_magnitude=0.0,
+            routine_count_today=5,
+            has_forecast=True,
+            routine_history=_build_history(55.0, count=5),
+        )
+        assert _eval(state, mkt).side is None
+
     def test_no_lock_when_neither_past_peak_signal(self):
         # Even with low forecast, if temp is rising and solar isn't declining, no lock.
         mkt = _FakeMarket(parsed_threshold=80.0, parsed_operator="above")
@@ -484,6 +509,33 @@ class TestRangeMarkets:
         assert _eval(state, mkt).side == "NO"
         # Sanity: Celsius round-trip
         assert round(f_to_c(c17_in_f)) == 17
+
+    def test_undershoot_pre_peak_does_not_lock(self):
+        # Regression for the Beijing 2 AM bug: at e.g. 2 AM local, hours
+        # before the day's peak, the 6h METAR regression is negative
+        # (overnight radiative cooling) but that is NOT past-peak. The
+        # range_undershoot path must not fire while hours_until_peak > 0.
+        mkt = _FakeMarket(
+            parsed_threshold=None,
+            parsed_operator="bracket",
+            question="Will the highest temperature in NYC be between 80-81°F on June 15?",
+        )
+        state = WeatherState(
+            station_icao=_TEST_ICAO,
+            current_max_f=55.0,         # well under range_low - margin
+            metar_trend_rate=-1.0,      # cooling overnight
+            dewpoint_trend_rate=0.0,
+            forecast_peak_f=70.0,       # forecast peak < range_low (would clear gate A)
+            hours_until_peak=12.0,      # peak is 12 h away — pre-peak
+            solar_declining=False,      # solar = 0 overnight (can't decline)
+            solar_decline_magnitude=0.0,
+            cloud_rising=False,
+            cloud_rise_magnitude=0.0,
+            routine_count_today=5,
+            has_forecast=True,
+            routine_history=_build_history(55.0, count=5),
+        )
+        assert _eval(state, mkt).side is None
 
     def test_celsius_exactly_in_range_locks_yes(self):
         # 17°C exactly = bucket [62, 63]. Observed 63°F (= 17.2°C, rounds to 17),

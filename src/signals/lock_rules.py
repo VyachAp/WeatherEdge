@@ -116,6 +116,16 @@ def _no_more_heating(state: WeatherState, threshold_f: float) -> tuple[bool, lis
             f"forecast peak {state.forecast_peak_f:.1f}°F >= threshold {threshold_f:.1f}°F",
         ]
 
+    # Pre-peak guard. Without this, overnight radiative cooling (negative
+    # `metar_trend_rate` over the 6h window) satisfies the OR-style past-peak
+    # check below at e.g. 2 AM local — hours before the day's heating has
+    # even started. The HARD direction's certainty depends on the day's peak
+    # being **observably behind us**, not on temperature merely trending down.
+    if state.hours_until_peak > 0.0:
+        return False, [
+            f"forecast peak still {state.hours_until_peak:.1f}h away — pre-peak",
+        ]
+
     past_peak = state.solar_declining or state.metar_trend_rate <= 0.0
     if not past_peak:
         return False, [
