@@ -76,6 +76,11 @@ class MarketSnapshot(Base):
 
 class Signal(Base):
     __tablename__ = "signals"
+    # One signal per (market, direction). UPSERT in scheduler.py refreshes
+    # model_prob/market_prob/edge/created_at on each tick.
+    __table_args__ = (
+        UniqueConstraint("market_id", "direction", name="uq_signals_market_direction"),
+    )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     market_id = Column(String, ForeignKey("markets.id"), nullable=False)
@@ -84,6 +89,13 @@ class Signal(Base):
     edge = Column(Float, nullable=False)
     direction = Column(Enum(TradeDirection), nullable=False)
     confidence = Column(Float)
+    # Path that produced this signal — 'probability' or 'lock'. Lets
+    # post-mortems split realised P&L by path without re-deriving from logs.
+    signal_kind = Column(String, nullable=False, default="probability")
+    # Lock-rule decision context (NULL for probability-path signals).
+    lock_branch = Column(String)  # 'easy_super' | 'easy_standard' | 'hard' | 'range_overshoot' | 'range_undershoot' | 'range_in_window'
+    lock_routine_count = Column(Integer)
+    lock_observed_max_f = Column(Float)
     gfs_prob = Column(Float)  # Legacy — always NULL, drop via migration later
     ecmwf_prob = Column(Float)  # Legacy — always NULL, drop via migration later
     aviation_prob = Column(Float)
@@ -117,8 +129,58 @@ class Trade(Base):
     filled_size = Column(Float)  # Shares filled
     exchange_status = Column(String)  # live|matched|delayed|unmatched|failed
 
+    # Submit-time market context — populated by place_order before the FAK
+    # call. Lets post-mortems decompose `fill_price - entry_price` into
+    # spread (yes_ask - yes_bid) vs depth-walked (size > top-of-book qty).
+    # NULL for old rows and for paths that don't capture (e.g. backtests).
+    submit_yes_bid = Column(Float)
+    submit_yes_ask = Column(Float)
+    submit_depth_usd = Column(Float)
+    submit_at = Column(DateTime(timezone=True))
+
     signal = relationship("Signal", back_populates="trades")
     market = relationship("Market", back_populates="trades")
+
+
+class EvaluationLog(Base):
+    """Append-only telemetry: one row per per-side edge evaluation.
+
+    Captures both PASSING and REJECTED candidates so filter-tightening
+    decisions (lower MIN_EDGE? raise MIN_DEPTH_USD?) can be backtested
+    against the actual stream of candidates we saw, not just the slice
+    that passed. ``signals`` is now de-duplicated to one row per
+    ``(market_id, direction)`` and only contains passing edges, so it
+    can no longer answer "what did we evaluate today and why did it
+    fail" — this table can.
+
+    Volume note: one row per (city × market × tick) — at 8 cities × ~5
+    markets/city × 12 ticks/hour ≈ 480 rows/hour ≈ 11.5K/day. Keep
+    indexed on ``(market_id, created_at)`` for the per-market
+    time-series queries calibration scripts will run.
+    """
+
+    __tablename__ = "evaluation_logs"
+    __table_args__ = (
+        Index("ix_eval_logs_market_created", "market_id", "created_at"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    market_id = Column(String, ForeignKey("markets.id"), nullable=False)
+    direction = Column(Enum(TradeDirection), nullable=False)
+    signal_kind = Column(String, nullable=False)  # 'probability' | 'lock'
+    model_prob = Column(Float, nullable=False)
+    market_prob = Column(Float, nullable=False)
+    edge = Column(Float, nullable=False)
+    passes = Column(Boolean, nullable=False)
+    reject_reason = Column(String)  # NULL when passes=True
+    depth_usd = Column(Float)
+    minutes_to_close = Column(Float)
+    routine_count = Column(Integer)
+    created_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
 
 
 class BankrollLog(Base):

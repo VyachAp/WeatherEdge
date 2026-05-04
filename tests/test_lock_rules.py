@@ -351,6 +351,63 @@ class TestDecisionShape:
         assert any("85" in r for r in decision.reasons)
 
 
+class TestBranchTagging:
+    """Each LockDecision carries a `branch` tag so calibration scripts can
+    split realised P&L by which deterministic path fired. Without this,
+    'EASY-super at 2 routines' and 'HARD with no_more_heating' would be
+    indistinguishable in the resolved-trades table."""
+
+    def test_easy_super_at_two_routines(self):
+        # super_margin = 2 * LOCK_MARGIN_F (default 4.0°F). Overshoot of
+        # 5.0°F + only 2 routines should fire as 'easy_super'.
+        mkt = _FakeMarket(parsed_threshold=80.0, parsed_operator="above")
+        state = _state(current_max_f=85.0, routine_count=2)
+        decision = _eval(state, mkt)
+        assert decision.side == "YES"
+        assert decision.branch == "easy_super"
+        assert decision.routine_count == 2
+        assert decision.observed_max_f == 85.0
+
+    def test_easy_standard_under_super_margin(self):
+        # Overshoot of 2.5°F (above 2.0°F LOCK_MARGIN_F but below 4.0°F
+        # super margin) at 5 routines → 'easy_standard'.
+        mkt = _FakeMarket(parsed_threshold=80.0, parsed_operator="above")
+        state = _state(current_max_f=82.5, routine_count=5)
+        decision = _eval(state, mkt)
+        assert decision.side == "YES"
+        assert decision.branch == "easy_standard"
+        assert decision.routine_count == 5
+        assert decision.observed_max_f == 82.5
+
+    def test_hard_branch_tagged(self):
+        # Below threshold by margin AND no_more_heating → 'hard'.
+        mkt = _FakeMarket(parsed_threshold=80.0, parsed_operator="above")
+        state = _state(
+            current_max_f=72.0,
+            forecast_peak_f=75.0,
+            metar_trend=-0.5,
+            solar_declining=True,
+        )
+        decision = _eval(state, mkt)
+        assert decision.side == "NO"
+        assert decision.branch == "hard"
+        assert decision.observed_max_f == 72.0
+
+    def test_no_lock_carries_no_branch(self):
+        # Below threshold but no_more_heating evidence missing → no lock.
+        mkt = _FakeMarket(parsed_threshold=80.0, parsed_operator="above")
+        state = _state(
+            current_max_f=72.0,
+            forecast_peak_f=78.0,  # forecast still close to threshold
+            metar_trend=+0.5,  # still rising
+            solar_declining=False,
+        )
+        decision = _eval(state, mkt)
+        assert decision.side is None
+        assert decision.branch is None
+        assert decision.observed_max_f is None
+
+
 class TestRangeMarkets:
     """Lock-rule support for 'between X-Y°F' and 'X°C exactly' shapes."""
 

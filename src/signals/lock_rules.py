@@ -30,11 +30,25 @@ Side = Literal["YES", "NO"]
 
 @dataclass
 class LockDecision:
-    """Result of evaluating physical lock conditions against a market."""
+    """Result of evaluating physical lock conditions against a market.
+
+    ``branch`` identifies which deterministic path fired so the resulting
+    Signal row can be filtered on it in calibration queries:
+      'easy_super'      — observed max ≥ threshold + 2×LOCK_MARGIN_F (routines≥2)
+      'easy_standard'   — observed max ≥ threshold + LOCK_MARGIN_F (routines≥MIN)
+      'hard'            — observed max << threshold AND no_more_heating
+      'range_overshoot' — current_max > range_high + margin
+      'range_undershoot'— current_max < range_low - margin AND no_more_heating
+      'range_in_window' — current_max in [low, high] + past peak + no upward
+    None when ``side is None``.
+    """
 
     side: Side | None
     reasons: list[str] = field(default_factory=list)
     margin_f: float = 0.0
+    branch: str | None = None
+    routine_count: int = 0
+    observed_max_f: float | None = None
 
     @property
     def direction(self) -> TradeDirection | None:
@@ -188,6 +202,7 @@ def evaluate_lock(
     easy_min_routines = (
         2 if easy_overshoot >= super_margin else settings.MIN_ROUTINE_COUNT
     )
+    easy_branch = "easy_super" if easy_overshoot >= super_margin else "easy_standard"
     if op in ("above", "at_least"):
         if (
             current_max_f >= threshold_f + margin
@@ -201,6 +216,9 @@ def evaluate_lock(
                     f"routine_count={routine_count} (min {easy_min_routines})",
                 ],
                 margin_f=easy_overshoot,
+                branch=easy_branch,
+                routine_count=routine_count,
+                observed_max_f=current_max_f,
             )
     elif op in ("below", "at_most"):
         if (
@@ -215,6 +233,9 @@ def evaluate_lock(
                     f"routine_count={routine_count} (min {easy_min_routines})",
                 ],
                 margin_f=easy_overshoot,
+                branch=easy_branch,
+                routine_count=routine_count,
+                observed_max_f=current_max_f,
             )
     else:
         return _NO_LOCK
@@ -239,6 +260,9 @@ def evaluate_lock(
             f"routine_count={routine_count}",
         ],
         margin_f=threshold_f - current_max_f,
+        branch="hard",
+        routine_count=routine_count,
+        observed_max_f=current_max_f,
     )
 
 
@@ -272,6 +296,9 @@ def _evaluate_range_lock(
                 f"routine_count={routine_count}",
             ],
             margin_f=current_max_f - high_f,
+            branch="range_overshoot",
+            routine_count=routine_count,
+            observed_max_f=current_max_f,
         )
 
     # NO undershoot.
@@ -287,6 +314,9 @@ def _evaluate_range_lock(
                     f"routine_count={routine_count}",
                 ],
                 margin_f=low_f - current_max_f,
+                branch="range_undershoot",
+                routine_count=routine_count,
+                observed_max_f=current_max_f,
             )
         return _NO_LOCK
 
@@ -312,6 +342,9 @@ def _evaluate_range_lock(
                     f"routine_count={routine_count}",
                 ],
                 margin_f=min(current_max_f - low_f, high_f - current_max_f),
+                branch="range_in_window",
+                routine_count=routine_count,
+                observed_max_f=current_max_f,
             )
 
     return _NO_LOCK

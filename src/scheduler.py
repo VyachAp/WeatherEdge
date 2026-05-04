@@ -17,7 +17,7 @@ from sqlalchemy import select
 
 from src.config import settings
 from src.db.engine import async_session, engine
-from src.db.models import Market, Signal, Trade, TradeStatus
+from src.db.models import EvaluationLog, Market, Signal, Trade, TradeStatus
 from src.execution.alerter import get_alerter
 from src.ingestion.polymarket import scan_and_ingest
 from src.resolution import (
@@ -52,7 +52,8 @@ _shutdown_event: asyncio.Event | None = None
 # `_unified_fired_today` is the dry-run-only sibling for the probability path
 # (keyed by `(market_id, direction, bucket)` since brackets can fire several
 # buckets per market). In dry-run, `place_order` is a no-op and the resulting
-# Trade row carries `stake_usd=0`, so `current_exposure` doesn't grow and
+# Trade row stays `status=PENDING` (with `exchange_status='dry_run'`), so
+# `current_exposure` — which filters on `status=OPEN` — doesn't grow and
 # nothing else blocks the next 5-min tick from re-emitting the same alert.
 # This set closes that gap. Live trades remain undeduped — the OPEN-trade
 # exposure is the source of truth there.
@@ -527,6 +528,33 @@ async def job_unified_pipeline() -> None:
                         edge_result.edge, tag, dist.reasoning,
                     )
 
+                    # Telemetry: log every evaluation (pass or fail) so
+                    # filter-tuning can be backtested against rejected
+                    # candidates. Depth on the actual buy side; minutes
+                    # to close from end_time. See _log_evaluation docstring.
+                    eval_side_depth = (
+                        mkt_depth if edge_result.direction.value == "BUY_YES"
+                        else _no_depth_for_market()
+                    )
+                    eval_minutes_to_close = (
+                        (end_time - now_utc).total_seconds() / 60.0
+                        if end_time else None
+                    )
+                    await _log_evaluation(
+                        session,
+                        market_id=market.id,
+                        direction=edge_result.direction,
+                        signal_kind="probability",
+                        model_prob=edge_result.our_probability,
+                        market_prob=edge_result.market_price,
+                        edge=edge_result.edge,
+                        passes=edge_result.passes,
+                        reject_reason=edge_result.reject_reason,
+                        depth_usd=eval_side_depth or None,
+                        minutes_to_close=eval_minutes_to_close,
+                        routine_count=state.routine_count_today,
+                    )
+
                     edges = [edge_result]
                     passing = [edge_result] if edge_result.passes else []
 
@@ -564,39 +592,47 @@ async def job_unified_pipeline() -> None:
                             )
                             continue
 
-                        # Dry-run dedup: place_order is a no-op and the Trade
-                        # row's stake_usd is later zeroed, so nothing else
-                        # blocks the next tick from re-emitting the same
-                        # alert. Skip if this (market, direction, bucket) was
-                        # already paper-fired today. Live mode is undeduped —
-                        # the OPEN trade's exposure is the source of truth
-                        # there.
+                        # Hard guard: don't double-bet a (market, direction).
+                        # ``_has_active_trade`` checks the DB for any
+                        # PENDING/OPEN trade on this pair — catches both
+                        # live re-fires (after restart, when in-process
+                        # dedup is empty) and dry-run repeats.
+                        # ``_unified_fired_today`` is a same-tick speed-up
+                        # that lets us skip the DB roundtrip when we know
+                        # we've already fired this tick.
                         dedup_key = (
                             market.id, edge.direction.value, edge.bucket_value,
                         )
-                        if not is_live() and dedup_key in _unified_fired_today:
+                        if dedup_key in _unified_fired_today:
                             logger.info(
-                                "[%s] skip %s bucket=%d: already paper-fired today (dry-run dedup)",
+                                "[%s] skip %s bucket=%d: already fired this tick",
                                 icao, side_label, edge.bucket_value,
                             )
                             continue
+                        if await _has_active_trade(session, market.id, edge.direction):
+                            logger.info(
+                                "[%s] skip %s bucket=%d: active trade exists for this market+side",
+                                icao, side_label, edge.bucket_value,
+                            )
+                            _unified_fired_today.add(dedup_key)
+                            _market_to_icao[market.id] = icao
+                            continue
 
-                        from src.db.models import Signal
-                        # Store the side-effective probability so the
-                        # consensus calibration regression (which reads
-                        # `model_prob` against won={0,1}) treats both
-                        # YES and NO trades uniformly. See
-                        # src/signals/consensus.py.
-                        sig_row = Signal(
+                        # Side-effective probability lands in Signal.model_prob
+                        # so consensus calibration treats YES and NO uniformly.
+                        # See src/signals/consensus.py. The (market, direction)
+                        # uniqueness constraint means this is INSERT-or-REFRESH:
+                        # repeat evaluations of the same market+side update the
+                        # existing row instead of inserting duplicates.
+                        sig_row = await _upsert_signal(
+                            session,
                             market_id=market.id,
+                            direction=edge.direction,
                             model_prob=edge.our_probability,
                             market_prob=edge.market_price,
                             edge=edge.edge,
-                            direction=edge.direction,
                             confidence=edge.our_probability,
                         )
-                        session.add(sig_row)
-                        await session.flush()
 
                         trade = Trade(
                             signal_id=sig_row.id,
@@ -609,23 +645,28 @@ async def job_unified_pipeline() -> None:
                         session.add(trade)
                         await session.flush()
 
-                        order_ok = await place_order(trade, session)
+                        order_ok = await place_order(
+                            trade, session,
+                            submit_yes_bid=yes_bid,
+                            submit_yes_ask=yes_ask,
+                            submit_depth_usd=side_depth or None,
+                        )
                         # In dry-run, ``place_order`` is a no-op and never
                         # updates fill fields, so ``trade.stake_usd`` is still
-                        # the requested value. Zero it (DB stays clean) and
-                        # report indicatively. Mirrors the lock-rule pattern.
+                        # the requested value. Keep it populated for paper-
+                        # trade analysis; ``status=PENDING`` + ``exchange_status
+                        # ='dry_run'`` keep it out of OPEN-filtered exposure
+                        # / PnL math. Any future query that sums stake_usd
+                        # must filter on one of those.
                         is_dry_run = trade.exchange_status == "dry_run"
                         if order_ok and is_dry_run:
-                            indicative_stake = adjusted_stake
-                            indicative_price = trade.entry_price or edge.market_price
-                            trade.stake_usd = 0.0
                             trade.status = TradeStatus.PENDING
                             unit = _market_unit(market)
                             display_bucket = _display_bucket(edge.bucket_value, unit)
                             await alerter._enqueue(
                                 f"\U0001f4b0 *Unified trade (dry-run)* [{icao}] {side_label}\n"
                                 f"Bucket: {display_bucket}{unit} | Edge: {edge.edge:.3f}\n"
-                                f"Indicative: ${indicative_stake:.2f} @ {indicative_price:.3f}\n"
+                                f"Indicative: ${trade.stake_usd:.2f} @ {trade.entry_price or edge.market_price:.3f}\n"
                                 f"Market: {market.question[:60]}",
                             )
                             _unified_fired_today.add(dedup_key)
@@ -939,6 +980,144 @@ def _binary_market_edge(
     )
 
 
+async def _log_evaluation(
+    session,
+    *,
+    market_id: str,
+    direction,
+    signal_kind: str,
+    model_prob: float,
+    market_prob: float,
+    edge: float,
+    passes: bool,
+    reject_reason: str | None,
+    depth_usd: float | None,
+    minutes_to_close: float | None,
+    routine_count: int | None,
+) -> None:
+    """Append one ``EvaluationLog`` row capturing this edge evaluation.
+
+    Called by BOTH the probability path and ``_try_lock_rule_trade`` for
+    EVERY candidate (passing or rejected). Without this row, MIN_EDGE /
+    MIN_PROBABILITY / MIN_DEPTH_USD tuning is blind because ``signals``
+    only carries passing edges and is now de-duplicated to one row per
+    (market, side). Append-only, no UPSERT — each tick's evaluation is a
+    separate calibration data point.
+    """
+    session.add(EvaluationLog(
+        market_id=market_id,
+        direction=direction,
+        signal_kind=signal_kind,
+        model_prob=model_prob,
+        market_prob=market_prob,
+        edge=edge,
+        passes=passes,
+        reject_reason=reject_reason,
+        depth_usd=depth_usd,
+        minutes_to_close=minutes_to_close,
+        routine_count=routine_count,
+    ))
+    # Don't flush here — the next session.flush() in the caller (e.g.
+    # _upsert_signal or commit) will batch these along with other writes.
+
+
+async def _has_active_trade(
+    session, market_id: str, direction,
+) -> bool:
+    """True iff a PENDING or OPEN Trade row already exists for this pair.
+
+    Hard guard against duplicate firing. Replaces the load-bearing role of
+    the in-process ``_unified_fired_today`` / ``_locked_markets_fired_today``
+    sets — those are kept as same-tick speed-ups but no longer the only
+    line of defence. In live mode this is the only thing that prevents
+    the bot from re-betting the same market+side every tick until the
+    Kelly exposure cap kicks in. In dry-run it stops the Signal/Trade
+    table from accumulating one row per tick.
+
+    Notes:
+      - Filters on status only, no Market.end_date check needed: PENDING/
+        OPEN trades on resolved markets are fixed up by ``resolve_trades``
+        within minutes of expiry, so a stale row blocking an already-
+        resolved market is a non-issue (we wouldn't trade into it anyway).
+      - The migration ``i9j0k1l2m3n4`` collapsed pre-existing duplicate
+        PENDING rows so this guard doesn't permanently lock out markets
+        that already accumulated multiple dry-run attempts.
+    """
+    result = await session.execute(
+        select(Trade.id).where(
+            Trade.market_id == market_id,
+            Trade.direction == direction,
+            Trade.status.in_([TradeStatus.PENDING, TradeStatus.OPEN]),
+        ).limit(1)
+    )
+    return result.scalar_one_or_none() is not None
+
+
+async def _upsert_signal(
+    session,
+    *,
+    market_id: str,
+    direction,
+    model_prob: float,
+    market_prob: float,
+    edge: float,
+    confidence: float | None,
+    signal_kind: str = "probability",
+    lock_branch: str | None = None,
+    lock_routine_count: int | None = None,
+    lock_observed_max_f: float | None = None,
+) -> Signal:
+    """Insert-or-refresh the unique ``(market_id, direction)`` Signal row.
+
+    Schema-level ``uq_signals_market_direction`` (migration
+    ``i9j0k1l2m3n4``) means we'd otherwise collide on every re-evaluation
+    tick. SELECT-then-INSERT-or-UPDATE keeps the ORM identity intact so
+    callers can still take ``sig_row.id`` for the Trade FK. Refreshes
+    ``created_at`` so callers can see "this signal was last evaluated at
+    X" in the DB.
+
+    ``signal_kind`` and the ``lock_*`` fields land on the row regardless
+    of whether it's INSERT or UPDATE; a market that flips between the
+    probability and lock paths between ticks (e.g. early-day probability
+    edge → lock fires when the threshold gets crossed) will overwrite
+    the kind/branch on the next tick. That's the intended semantic:
+    Signal reflects the current trading rationale, not history.
+    """
+    existing = await session.execute(
+        select(Signal).where(
+            Signal.market_id == market_id,
+            Signal.direction == direction,
+        )
+    )
+    sig_row = existing.scalar_one_or_none()
+    if sig_row is None:
+        sig_row = Signal(
+            market_id=market_id,
+            direction=direction,
+            model_prob=model_prob,
+            market_prob=market_prob,
+            edge=edge,
+            confidence=confidence,
+            signal_kind=signal_kind,
+            lock_branch=lock_branch,
+            lock_routine_count=lock_routine_count,
+            lock_observed_max_f=lock_observed_max_f,
+        )
+        session.add(sig_row)
+    else:
+        sig_row.model_prob = model_prob
+        sig_row.market_prob = market_prob
+        sig_row.edge = edge
+        sig_row.confidence = confidence
+        sig_row.signal_kind = signal_kind
+        sig_row.lock_branch = lock_branch
+        sig_row.lock_routine_count = lock_routine_count
+        sig_row.lock_observed_max_f = lock_observed_max_f
+        sig_row.created_at = datetime.now(timezone.utc)
+    await session.flush()
+    return sig_row
+
+
 async def _try_lock_rule_trade(
     *,
     session,
@@ -977,8 +1156,13 @@ async def _try_lock_rule_trade(
 
     decision = evaluate_lock(state, market)
     if decision.side is None or decision.direction is None:
+        # No lock fired — nothing to log; the probability path will emit
+        # its own EvaluationLog row for this market on this tick.
         return None
 
+    # Effective price needs to land before _has_active_trade so the
+    # EvaluationLog row carries the actual market_prob even on early
+    # rejections (active trade exists, etc.).
     if decision.side == "YES":
         effective_price = (
             yes_ask if (yes_ask is not None and yes_ask > 0) else yes_price
@@ -988,6 +1172,48 @@ async def _try_lock_rule_trade(
             (1.0 - yes_bid) if (yes_bid is not None and yes_bid > 0)
             else (1.0 - yes_price)
         )
+
+    now = datetime.now(timezone.utc)
+    minutes_to_close = (end_time - now).total_seconds() / 60.0
+
+    async def _log_lock_eval(passes: bool, reject_reason: str | None, depth_usd: float | None) -> None:
+        await _log_evaluation(
+            session,
+            market_id=market.id,
+            direction=decision.direction,
+            signal_kind="lock",
+            model_prob=1.0,
+            market_prob=effective_price,
+            edge=1.0 - effective_price,
+            passes=passes,
+            reject_reason=reject_reason,
+            depth_usd=depth_usd,
+            minutes_to_close=minutes_to_close,
+            routine_count=decision.routine_count,
+        )
+
+    # Hard guard against double-betting. Mirrors the probability path.
+    # ``_locked_markets_fired_today`` is the same-tick speed-up; the DB
+    # check is the durable line of defence (survives restarts and gates
+    # both modes). Returning 0.0 (not None) so the caller treats this as
+    # "lock evaluated but not executed" and skips the probability path
+    # for this market on this tick.
+    if market.id in _locked_markets_fired_today:
+        logger.info(
+            "[%s] LOCK %s %s: already fired this tick (in-process dedup)",
+            icao, decision.side, market.id[:12],
+        )
+        await _log_lock_eval(False, "fired this tick", None)
+        return 0.0
+    if await _has_active_trade(session, market.id, decision.direction):
+        logger.info(
+            "[%s] LOCK %s %s: active trade exists for this market+side, skipping",
+            icao, decision.side, market.id[:12],
+        )
+        _locked_markets_fired_today.add(market.id)
+        _market_to_icao[market.id] = icao
+        await _log_lock_eval(False, "active trade exists", None)
+        return 0.0
     if not (
         settings.LOCK_RULE_MIN_PRICE
         <= effective_price
@@ -997,6 +1223,11 @@ async def _try_lock_rule_trade(
             "[%s] lock %s %s: price %.2f outside [%.2f, %.2f]",
             icao, decision.side, market.id[:12], effective_price,
             settings.LOCK_RULE_MIN_PRICE, settings.LOCK_RULE_MAX_PRICE,
+        )
+        await _log_lock_eval(
+            False,
+            f"price {effective_price:.2f} outside [{settings.LOCK_RULE_MIN_PRICE}, {settings.LOCK_RULE_MAX_PRICE}]",
+            None,
         )
         return 0.0
 
@@ -1008,9 +1239,6 @@ async def _try_lock_rule_trade(
             get_orderbook_depth(token_ids[1], effective_price)
             if token_ids else 0.0
         )
-
-    now = datetime.now(timezone.utc)
-    minutes_to_close = (end_time - now).total_seconds() / 60.0
 
     # Reuse the existing filter helper for routine-count / close-buffer / depth.
     # Pass stub prob/edge/price values that will pass those specific checks; we're
@@ -1032,7 +1260,13 @@ async def _try_lock_rule_trade(
             "[%s] lock %s %s rejected by filter: %s",
             icao, decision.side, market.id[:12], reject,
         )
+        await _log_lock_eval(False, reject, buy_depth or None)
         return 0.0
+
+    # Lock candidate cleared all gates — emit the "passes" log row before
+    # the order goes out so backtests can correlate evaluations with trade
+    # outcomes via market_id+direction+created_at.
+    await _log_lock_eval(True, None, buy_depth or None)
 
     pos = size_locked_position(
         bankroll=bankroll,
@@ -1058,16 +1292,24 @@ async def _try_lock_rule_trade(
         )
         return 0.0
 
-    sig_row = Signal(
+    # model_prob=1.0 because the lock rule is deterministic (no probability
+    # estimate to record). confidence carries the lock margin in °F so the
+    # detail view can show "how locked was this". Lock fields tag the
+    # branch + observation context so post-mortems can split realised P&L
+    # by which lock path produced the signal.
+    sig_row = await _upsert_signal(
+        session,
         market_id=market.id,
-        model_prob=1.0,  # Lock rule is deterministic; carry no prob estimate.
+        direction=decision.direction,
+        model_prob=1.0,
         market_prob=effective_price,
         edge=1.0 - effective_price,
-        direction=decision.direction,
         confidence=decision.margin_f,
+        signal_kind="lock",
+        lock_branch=decision.branch,
+        lock_routine_count=decision.routine_count,
+        lock_observed_max_f=decision.observed_max_f,
     )
-    session.add(sig_row)
-    await session.flush()
 
     trade = Trade(
         signal_id=sig_row.id,
@@ -1080,7 +1322,12 @@ async def _try_lock_rule_trade(
     session.add(trade)
     await session.flush()
 
-    order_ok = await place_order(trade, session)
+    order_ok = await place_order(
+        trade, session,
+        submit_yes_bid=yes_bid,
+        submit_yes_ask=yes_ask,
+        submit_depth_usd=buy_depth or None,
+    )
     if not order_ok:
         logger.warning(
             "[%s] LOCK %s %s: order placement failed",
@@ -1089,17 +1336,18 @@ async def _try_lock_rule_trade(
         return 0.0
 
     # In dry-run, ``place_order`` is a no-op and never updates fill fields.
-    # Don't pretend the trade opened: keep status PENDING, zero stake_usd
-    # so DB-backed exposure/PnL stays clean, and emit a clearly-labelled
-    # indicative alert. We still return a positive value so the caller's
+    # Don't pretend the trade opened: keep status PENDING and emit a
+    # clearly-labelled indicative alert. ``stake_usd`` stays at the requested
+    # value so paper-trade analysis can read it directly; OPEN-filtered
+    # exposure / PnL math is unaffected because the row is PENDING and
+    # ``exchange_status='dry_run'``. Return positive so the caller's
     # in-process dedup blocks repeat firings on the same market today.
     is_dry_run = trade.exchange_status == "dry_run"
 
     if is_dry_run:
-        indicative_stake = stake
         indicative_price = trade.entry_price or effective_price
-        trade.stake_usd = 0.0
         trade.status = TradeStatus.PENDING
+        indicative_stake = trade.stake_usd
     else:
         # FAK orders may fill partially or not at all when liquidity is thin.
         # ``_update_fill_details`` already replaced trade.stake_usd with the

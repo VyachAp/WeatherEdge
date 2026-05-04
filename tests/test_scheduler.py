@@ -4,8 +4,17 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
-from src.scheduler import _minimal_state_for_easy_lock, _should_skip_future_day
+import pytest
+
+from src.scheduler import (
+    _has_active_trade,
+    _log_evaluation,
+    _minimal_state_for_easy_lock,
+    _should_skip_future_day,
+    _upsert_signal,
+)
 from src.signals.lock_rules import evaluate_lock
 
 
@@ -432,3 +441,209 @@ class TestPerStationCacheRollover:
 
         assert "mkt_kjfk_1" in sch._locked_markets_fired_today
         assert "mkt_kjfk_1" in sch._market_to_icao
+
+
+class TestHasActiveTrade:
+    """`_has_active_trade` short-circuits any second attempt at firing on
+    a (market, direction) pair while a PENDING/OPEN trade is on file —
+    the durable, mode-agnostic safety net behind the in-process dedup."""
+
+    @pytest.mark.asyncio
+    async def test_returns_true_when_pending_or_open_exists(self):
+        from src.db.models import TradeDirection
+
+        session = AsyncMock()
+        result = AsyncMock()
+        result.scalar_one_or_none = lambda: 42  # any truthy id
+        session.execute.return_value = result
+
+        assert await _has_active_trade(session, "mkt_x", TradeDirection.BUY_NO) is True
+
+    @pytest.mark.asyncio
+    async def test_returns_false_when_no_active_trade(self):
+        from src.db.models import TradeDirection
+
+        session = AsyncMock()
+        result = AsyncMock()
+        result.scalar_one_or_none = lambda: None
+        session.execute.return_value = result
+
+        assert await _has_active_trade(session, "mkt_y", TradeDirection.BUY_YES) is False
+
+
+class TestUpsertSignal:
+    """`_upsert_signal` is INSERT-or-REFRESH. The schema-level
+    `uq_signals_market_direction` constraint means a plain insert on every
+    tick would crash; this helper keeps callers ORM-friendly."""
+
+    @pytest.mark.asyncio
+    async def test_inserts_when_no_existing_row(self):
+        from src.db.models import TradeDirection
+
+        session = AsyncMock()
+        result = AsyncMock()
+        result.scalar_one_or_none = lambda: None
+        session.execute.return_value = result
+        # session.add is sync on the real Session — match shape.
+        session.add = lambda obj: None
+
+        sig = await _upsert_signal(
+            session,
+            market_id="mkt_z",
+            direction=TradeDirection.BUY_YES,
+            model_prob=0.7,
+            market_prob=0.4,
+            edge=0.3,
+            confidence=0.7,
+        )
+
+        # Returned a fresh Signal carrying the requested fields.
+        assert sig.market_id == "mkt_z"
+        assert sig.direction == TradeDirection.BUY_YES
+        assert sig.model_prob == 0.7
+        assert sig.market_prob == 0.4
+        assert sig.edge == 0.3
+        # Flushed exactly once after add.
+        session.flush.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_refreshes_existing_row_in_place(self):
+        from src.db.models import Signal, TradeDirection
+
+        existing = Signal(
+            market_id="mkt_z",
+            direction=TradeDirection.BUY_YES,
+            model_prob=0.5,
+            market_prob=0.6,
+            edge=0.1,
+            confidence=0.5,
+        )
+        # Snapshot the original timestamp so we can prove it advances.
+        existing.created_at = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+
+        session = AsyncMock()
+        result = AsyncMock()
+        result.scalar_one_or_none = lambda: existing
+        session.execute.return_value = result
+        # If the helper accidentally adds a new row we want to know.
+        added = []
+        session.add = lambda obj: added.append(obj)
+
+        sig = await _upsert_signal(
+            session,
+            market_id="mkt_z",
+            direction=TradeDirection.BUY_YES,
+            model_prob=0.8,
+            market_prob=0.45,
+            edge=0.35,
+            confidence=0.8,
+        )
+
+        # Same row, refreshed values, no insert.
+        assert sig is existing
+        assert added == []
+        assert sig.model_prob == 0.8
+        assert sig.market_prob == 0.45
+        assert sig.edge == 0.35
+        assert sig.confidence == 0.8
+        # created_at advanced past the original snapshot.
+        assert sig.created_at > datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+
+    @pytest.mark.asyncio
+    async def test_lock_kind_and_branch_persist_on_insert(self):
+        from src.db.models import TradeDirection
+
+        session = AsyncMock()
+        result = AsyncMock()
+        result.scalar_one_or_none = lambda: None
+        session.execute.return_value = result
+        session.add = lambda obj: None
+
+        sig = await _upsert_signal(
+            session,
+            market_id="mkt_lock",
+            direction=TradeDirection.BUY_NO,
+            model_prob=1.0,
+            market_prob=0.92,
+            edge=0.08,
+            confidence=4.5,
+            signal_kind="lock",
+            lock_branch="easy_super",
+            lock_routine_count=2,
+            lock_observed_max_f=85.0,
+        )
+
+        assert sig.signal_kind == "lock"
+        assert sig.lock_branch == "easy_super"
+        assert sig.lock_routine_count == 2
+        assert sig.lock_observed_max_f == 85.0
+
+
+class TestLogEvaluation:
+    """`_log_evaluation` appends a calibration data point per evaluation
+    tick. The append-only design (no UPSERT, no flush) is intentional —
+    each tick is its own row."""
+
+    @pytest.mark.asyncio
+    async def test_emits_one_row_with_all_fields(self):
+        from src.db.models import EvaluationLog, TradeDirection
+
+        added: list = []
+        session = AsyncMock()
+        session.add = lambda obj: added.append(obj)
+
+        await _log_evaluation(
+            session,
+            market_id="mkt_eval",
+            direction=TradeDirection.BUY_YES,
+            signal_kind="probability",
+            model_prob=0.72,
+            market_prob=0.55,
+            edge=0.17,
+            passes=True,
+            reject_reason=None,
+            depth_usd=120.0,
+            minutes_to_close=240.0,
+            routine_count=4,
+        )
+
+        assert len(added) == 1
+        row = added[0]
+        assert isinstance(row, EvaluationLog)
+        assert row.market_id == "mkt_eval"
+        assert row.signal_kind == "probability"
+        assert row.passes is True
+        assert row.reject_reason is None
+        assert row.depth_usd == 120.0
+        assert row.routine_count == 4
+        # Helper does not flush — caller batches.
+        session.flush.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_rejected_evaluation_carries_reason(self):
+        from src.db.models import TradeDirection
+
+        added: list = []
+        session = AsyncMock()
+        session.add = lambda obj: added.append(obj)
+
+        await _log_evaluation(
+            session,
+            market_id="mkt_eval",
+            direction=TradeDirection.BUY_NO,
+            signal_kind="lock",
+            model_prob=1.0,
+            market_prob=0.04,
+            edge=0.96,
+            passes=False,
+            reject_reason="price 0.04 outside [0.05, 0.95]",
+            depth_usd=None,
+            minutes_to_close=12.5,
+            routine_count=3,
+        )
+
+        assert len(added) == 1
+        row = added[0]
+        assert row.passes is False
+        assert "outside" in row.reject_reason
+        assert row.signal_kind == "lock"

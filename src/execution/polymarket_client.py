@@ -282,6 +282,10 @@ async def place_order(
     trade: Trade,
     session: AsyncSession,
     max_slippage_cents: float = 2.0,
+    *,
+    submit_yes_bid: float | None = None,
+    submit_yes_ask: float | None = None,
+    submit_depth_usd: float | None = None,
 ) -> bool:
     """Place a price-limited FAK (immediate-or-cancel) order on Polymarket.
 
@@ -298,12 +302,29 @@ async def place_order(
     reflect the actual USDC spent so downstream P&L and exposure
     accounting remain accurate even on partial fills.
 
+    The ``submit_*`` kwargs snapshot the caller's view of the live
+    market state at the moment we call this function — they land on the
+    Trade row regardless of dry-run / live so post-mortems can decompose
+    ``fill_price - entry_price`` into "spread we accepted" vs "depth we
+    walked". NULL when the caller didn't supply them (older callers,
+    backtests).
+
     Returns True when the order was successfully posted (regardless of
     whether it filled — partial fills and zero fills both return True so
     the caller can decide what to do based on ``trade.filled_size``).
     Returns False on outright failures (cap exceeded, no token IDs,
     client error).
     """
+    # Snapshot submit-time market context first — this lands on the row
+    # whether the order ultimately fires (live), no-ops (dry-run), or is
+    # rejected (cap_exceeded / no_client / etc.). The diagnostic value of
+    # "we wanted to fire, here's what the book looked like" is the same
+    # in every case.
+    trade.submit_yes_bid = submit_yes_bid
+    trade.submit_yes_ask = submit_yes_ask
+    trade.submit_depth_usd = submit_depth_usd
+    trade.submit_at = datetime.now(timezone.utc)
+
     # --- Dry-run guard ---
     if not is_live():
         logger.info(
