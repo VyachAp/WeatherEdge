@@ -430,7 +430,20 @@ async def place_order(
                 trade.order_id, trade.exchange_status,
             )
             if trade.order_id:
-                await _update_fill_details(trade, client)
+                # Fill-details lookup is best-effort: the order is already
+                # posted with order_id + exchange_status set, so a failure
+                # here must NOT roll those back to "exception" / return
+                # False. Otherwise transient lookup errors orphan a live
+                # order — DB row says "no trade" while the CLOB has us on
+                # the book.
+                try:
+                    await _update_fill_details(trade, client)
+                except Exception:
+                    logger.warning(
+                        "Could not update fill details for order %s; trade kept at status=%s",
+                        trade.order_id, trade.exchange_status,
+                        exc_info=True,
+                    )
                 if trade.filled_size and trade.filled_size > 0:
                     logger.info(
                         "Fill: %.2f shares @ avg %.3f → spent $%.2f (limit was %.3f)",
@@ -441,7 +454,7 @@ async def place_order(
                     )
                 else:
                     logger.info(
-                        "FAK order posted but no fill at limit %.3f (book empty at/below limit)",
+                        "FAK order posted but no fill at limit %.3f (book empty at/below limit, or still queued)",
                         limit_price,
                     )
             return True
@@ -501,6 +514,17 @@ async def _update_fill_details(trade: Trade, client) -> None:
         order = client.get_order(trade.order_id)
     except Exception:
         logger.warning("Could not fetch fill details for order %s", trade.order_id)
+        return
+
+    # CLOB returns null for orders still in `delayed` (queued) state — the
+    # GET-by-id endpoint doesn't index them until the matching engine picks
+    # them up. Treat as "no fill yet"; a future check_order_status can
+    # reconcile once the order leaves the queue.
+    if order is None:
+        logger.info(
+            "Order %s not yet retrievable (likely still queued); fills will be reconciled later",
+            trade.order_id,
+        )
         return
 
     fills = order.get("associate_trades") or []
