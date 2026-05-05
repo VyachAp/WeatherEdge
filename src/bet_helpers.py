@@ -203,12 +203,15 @@ async def get_usdc_balance(private_key: str) -> tuple[float, float, float]:
     funder = settings.POLYMARKET_FUNDER_ADDRESS or account.address
     addr = Web3.to_checksum_address(funder)
 
+    from web3.middleware import ExtraDataToPOAMiddleware
+
     w3 = Web3(
         Web3.HTTPProvider(
             "https://polygon-bor-rpc.publicnode.com",
             request_kwargs={"timeout": _RPC_TIMEOUT_SECONDS},
         )
     )
+    w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
 
     pusd = w3.eth.contract(
         address=Web3.to_checksum_address(PUSD), abi=BAL_ABI
@@ -338,6 +341,7 @@ def get_ctf_readonly(skip_url: str | None = None):
     """
     from eth_account import Account
     from web3 import Web3
+    from web3.middleware import ExtraDataToPOAMiddleware
 
     account = Account.from_key(settings.POLYMARKET_PRIVATE_KEY)
     address = account.address
@@ -355,6 +359,10 @@ def get_ctf_readonly(skip_url: str | None = None):
                     rpc_url, request_kwargs={"timeout": _RPC_TIMEOUT_SECONDS}
                 )
             )
+            # Polygon is a Bor PoA chain; without this middleware web3 v7
+            # raises "extraData is N bytes, but should be 32" on every
+            # block-aware response (notably eth_getTransactionReceipt).
+            w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
             w3.eth.get_balance(address)
             ctf = w3.eth.contract(
                 address=Web3.to_checksum_address(CTF_ADDRESS),

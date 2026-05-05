@@ -358,10 +358,15 @@ def approve() -> None:
     click.echo(f"Wallet: {address}")
 
     # Try RPC endpoints until one works
+    from web3.middleware import ExtraDataToPOAMiddleware
+
     w3 = None
     for rpc_url in RPC_URLS:
         try:
-            _w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": 10}))
+            _w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": 30}))
+            # Polygon (Bor) is PoA; without this, eth_getTransactionReceipt
+            # blows up with "extraData is N bytes, but should be 32".
+            _w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
             _w3.eth.get_balance(address)  # test connection
             w3 = _w3
             click.echo(f"Connected to {rpc_url}")
