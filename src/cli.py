@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from datetime import datetime, timedelta, timezone
 
 import click
@@ -1680,6 +1681,8 @@ def bet_redeem(redeem_all: bool, skip_confirm: bool) -> None:
             get_ctf_readonly,
             get_trades_history,
             get_usdc_balance,
+            is_transient_rpc_error,
+            rpc_call_with_retry,
         )
 
         if not settings.POLYMARKET_PRIVATE_KEY:
@@ -1804,26 +1807,62 @@ def bet_redeem(redeem_all: bool, skip_confirm: bool) -> None:
             raise SystemExit(1)
         click.echo(f"Connected to {rpc_url}")
 
-        bal = w3.eth.get_balance(address)
-        click.echo(f"POL balance: {w3.from_wei(bal, 'ether'):.4f} (for gas)")
+        # Mutable conn box: reconnect() rebuilds w3/ctf/neg_risk_adapter on
+        # the next available RPC so per-call retries can survive a dead
+        # endpoint without losing state.
+        class _Conn:
+            def __init__(self, w3, ctf, address, rpc_url):
+                self.w3 = w3
+                self.ctf = ctf
+                self.address = address
+                self.rpc_url = rpc_url
+                self._build_adapter()
+
+            def _build_adapter(self) -> None:
+                self.neg_risk_adapter = self.w3.eth.contract(
+                    address=Web3.to_checksum_address(NEG_RISK_ADAPTER_ADDRESS),
+                    abi=NEG_RISK_ADAPTER_ABI,
+                )
+
+            def reconnect(
+                self,
+                prev_exc: BaseException | None = None,
+                attempt: int | None = None,
+            ) -> None:
+                old_url = self.rpc_url
+                new_w3, new_ctf, _, new_url = get_ctf_readonly(skip_url=old_url)
+                self.w3 = new_w3
+                self.ctf = new_ctf
+                self.rpc_url = new_url
+                self._build_adapter()
+                why = f" (after {prev_exc.__class__.__name__})" if prev_exc else ""
+                click.echo(f"  RPC switch: {old_url} → {new_url}{why}")
+
+        conn = _Conn(w3, ctf, address, rpc_url)
+
+        bal = rpc_call_with_retry(
+            lambda: conn.w3.eth.get_balance(conn.address),
+            on_transient=conn.reconnect,
+        )
+        click.echo(f"POL balance: {conn.w3.from_wei(bal, 'ether'):.4f} (for gas)")
         if bal == 0:
             click.echo("Error: wallet has no POL for gas fees")
             raise SystemExit(1)
-
-        neg_risk_adapter = w3.eth.contract(
-            address=Web3.to_checksum_address(NEG_RISK_ADAPTER_ADDRESS),
-            abi=NEG_RISK_ADAPTER_ABI,
-        )
 
         # --- Check on-chain balances ---
         click.echo("\nChecking on-chain token balances...")
         to_redeem: list[dict] = []
 
         for item in redeemable:
+            asset_id_int = int(item["asset_id"])
+
+            def _check_balance(asset_id: int = asset_id_int) -> int:
+                return conn.ctf.functions.balanceOf(conn.address, asset_id).call()
+
             try:
-                token_balance = ctf.functions.balanceOf(
-                    address, int(item["asset_id"])
-                ).call()
+                token_balance = rpc_call_with_retry(
+                    _check_balance, on_transient=conn.reconnect
+                )
             except Exception as e:
                 click.echo(f"  Could not check balance for {item['question'][:50]}: {e}")
                 continue
@@ -1861,26 +1900,87 @@ def bet_redeem(redeem_all: bool, skip_confirm: bool) -> None:
 
         # --- Execute redemptions ---
         click.echo("\n=== Executing Redemptions ===")
-        gas_price = w3.eth.gas_price
-        nonce = w3.eth.get_transaction_count(address)
         CHAIN_ID = 137
         PARENT_COLLECTION_ID = b"\x00" * 32
 
-        def send_tx(tx_data: dict) -> dict:
-            nonlocal nonce
-            tx_data["nonce"] = nonce
-            tx_data["chainId"] = CHAIN_ID
-            tx_data["from"] = address
-            tx_data["gasPrice"] = gas_price
-            if "gas" not in tx_data:
-                tx_data["gas"] = w3.eth.estimate_gas(tx_data)
-            signed = w3.eth.account.sign_transaction(
-                tx_data, private_key=settings.POLYMARKET_PRIVATE_KEY
+        def _wait_for_receipt(tx_hash, total_timeout: float = 180.0):
+            """Poll for the receipt across RPC failovers.
+
+            web3's `wait_for_transaction_receipt` keeps re-polling the
+            same provider, so a flaky endpoint stalls the whole call.
+            We poll manually and rotate to a fresh RPC on every transient
+            error — the tx_hash is portable across endpoints.
+            """
+            deadline = time.time() + total_timeout
+            poll_interval = 2.0
+            while time.time() < deadline:
+                try:
+                    return rpc_call_with_retry(
+                        lambda: conn.w3.eth.get_transaction_receipt(tx_hash),
+                        on_transient=conn.reconnect,
+                        max_attempts=2,
+                    )
+                except Exception as exc:
+                    msg = str(exc).lower()
+                    # web3 raises TransactionNotFound while the tx is in
+                    # the mempool — that's expected, just keep polling.
+                    if "not found" in msg or "transactionnotfound" in msg:
+                        time.sleep(poll_interval)
+                        poll_interval = min(poll_interval * 1.3, 8.0)
+                        continue
+                    if is_transient_rpc_error(exc):
+                        try:
+                            conn.reconnect(exc)
+                        except Exception:
+                            pass
+                        time.sleep(poll_interval)
+                        continue
+                    raise
+            raise TimeoutError(
+                f"receipt for {tx_hash.hex() if hasattr(tx_hash, 'hex') else tx_hash} "
+                f"did not appear within {total_timeout:.0f}s"
             )
-            tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-            receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
-            nonce += 1
-            return receipt
+
+        def send_tx(tx_data: dict) -> dict:
+            """Sign, send, and wait for receipt with RPC failover.
+
+            Refreshes nonce per call against the `pending` tag so a
+            previous tx that broadcast-but-receipt-timed-out doesn't
+            stall the next one with "nonce too low". On transient RPC
+            errors, reconnects to a different endpoint and retries —
+            tx_hash is preserved across reconnects so a successfully
+            broadcast tx is never re-signed with a new nonce.
+            """
+            tx_data["chainId"] = CHAIN_ID
+            tx_data["from"] = conn.address
+
+            for attempt in range(1, 4):
+                try:
+                    tx_data["nonce"] = conn.w3.eth.get_transaction_count(
+                        conn.address, "pending"
+                    )
+                    tx_data["gasPrice"] = conn.w3.eth.gas_price
+                    if "gas" not in tx_data:
+                        tx_data["gas"] = conn.w3.eth.estimate_gas(tx_data)
+                    signed = conn.w3.eth.account.sign_transaction(
+                        tx_data, private_key=settings.POLYMARKET_PRIVATE_KEY
+                    )
+                    tx_hash = conn.w3.eth.send_raw_transaction(signed.raw_transaction)
+                    break
+                except Exception as exc:
+                    msg = str(exc).lower()
+                    if "nonce too low" in msg or "already known" in msg:
+                        # A previous tx landed despite a timeout. Skip
+                        # the broadcast and let the caller treat this
+                        # one as "no-op, but not an error" by re-raising.
+                        raise
+                    if is_transient_rpc_error(exc) and attempt < 3:
+                        conn.reconnect(exc)
+                        time.sleep(1.0 * attempt)
+                        continue
+                    raise
+
+            return _wait_for_receipt(tx_hash)
 
         success_count = 0
         redeemed_condition_ids: set[str] = set()
@@ -1912,18 +2012,18 @@ def bet_redeem(redeem_all: bool, skip_confirm: bool) -> None:
                         amounts = [0, on_chain]   # holding NO position
                     else:
                         amounts = [on_chain, 0]   # fallback
-                    tx = neg_risk_adapter.functions.redeemPositions(
+                    tx = conn.neg_risk_adapter.functions.redeemPositions(
                         condition_id_bytes,
                         amounts,
-                    ).build_transaction({"from": address, "gasPrice": gas_price})
+                    ).build_transaction({"from": conn.address})
                 else:
                     pusd_addr = Web3.to_checksum_address(PUSD_ADDRESS)
-                    tx = ctf.functions.redeemPositions(
+                    tx = conn.ctf.functions.redeemPositions(
                         pusd_addr,
                         PARENT_COLLECTION_ID,
                         condition_id_bytes,
                         index_sets,
-                    ).build_transaction({"from": address, "gasPrice": gas_price})
+                    ).build_transaction({"from": conn.address})
                 receipt = send_tx(tx)
                 status = "OK" if receipt["status"] == 1 else "FAILED"
                 tx_hash = receipt["transactionHash"].hex()[:16]
@@ -1933,8 +2033,13 @@ def bet_redeem(redeem_all: bool, skip_confirm: bool) -> None:
                     success_count += 1
                     redeemed_condition_ids.add(item["condition_id"])
             except Exception as e:
-                click.echo(f"    FAILED: {e}")
-                click.echo("    (Market may not be resolved on-chain yet)")
+                msg = str(e).lower()
+                if "nonce too low" in msg or "already known" in msg:
+                    click.echo(f"    SKIPPED: prior tx already broadcast ({e})")
+                    click.echo("    (Re-run `bet redeem` to refresh on-chain balances)")
+                else:
+                    click.echo(f"    FAILED: {e}")
+                    click.echo("    (Market may not be resolved on-chain yet)")
 
         # --- Stamp Trade.redeemed_at so bankroll stops counting these as
         # unredeemed pending payouts. Market.id == condition_id in our DB

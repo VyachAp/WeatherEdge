@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import json
 import logging
+import time
+from typing import Callable, Optional, TypeVar
 from urllib.parse import urlparse
 
 import httpx
@@ -204,7 +206,7 @@ async def get_usdc_balance(private_key: str) -> tuple[float, float, float]:
     w3 = Web3(
         Web3.HTTPProvider(
             "https://polygon-bor-rpc.publicnode.com",
-            request_kwargs={"timeout": 10},
+            request_kwargs={"timeout": _RPC_TIMEOUT_SECONDS},
         )
     )
 
@@ -239,6 +241,65 @@ _POLYGON_RPC_URLS = (
     "https://polygon-rpc.com",
 )
 
+# 30s allows slow eth_getTransactionReceipt polls to complete on a
+# congested RPC; the previous 10s tripped on every receipt wait against
+# publicnode and was the headline cause of "Read timed out" errors in
+# `bet redeem`.
+_RPC_TIMEOUT_SECONDS = 30
+
+_TRANSIENT_RPC_SIGNALS = (
+    "timed out",
+    "timeout",
+    "connection aborted",
+    "connection reset",
+    "remote end closed",
+    "max retries exceeded",
+    "bad gateway",
+    "service unavailable",
+    "too many requests",
+    "read timed out",
+)
+
+
+def is_transient_rpc_error(exc: BaseException) -> bool:
+    """Heuristic: True when `exc` is a retryable HTTP/RPC failure."""
+    msg = str(exc).lower()
+    return any(s in msg for s in _TRANSIENT_RPC_SIGNALS)
+
+
+_T = TypeVar("_T")
+
+
+def rpc_call_with_retry(
+    call_fn: Callable[[], _T],
+    *,
+    on_transient: Optional[Callable[[BaseException, int], None]] = None,
+    max_attempts: int = 3,
+    initial_backoff: float = 1.5,
+) -> _T:
+    """Run `call_fn()` with exponential-backoff retry on transient RPC errors.
+
+    `on_transient(exc, attempt)` runs between attempts so the caller can
+    rotate to a different RPC endpoint before the next try. Permanent
+    errors (revert, "nonce too low", invalid signature) propagate up
+    immediately so the caller can react.
+    """
+    backoff = initial_backoff
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return call_fn()
+        except Exception as exc:
+            if not is_transient_rpc_error(exc) or attempt == max_attempts:
+                raise
+            time.sleep(backoff)
+            if on_transient is not None:
+                try:
+                    on_transient(exc, attempt)
+                except Exception:
+                    pass
+            backoff *= 2
+    raise RuntimeError("rpc_call_with_retry: unreachable")
+
 _CTF_BALANCE_ABI = [
     {
         "inputs": [
@@ -265,12 +326,15 @@ _CTF_BALANCE_ABI = [
 ]
 
 
-def get_ctf_readonly():
-    """Connect to Polygon with RPC failover and return (w3, ctf, address).
+def get_ctf_readonly(skip_url: str | None = None):
+    """Connect to Polygon with RPC failover and return (w3, ctf, address, rpc_url).
 
     Read-only bootstrap shared by portfolio and redeem flows — does not
     check the POL gas balance; callers that submit transactions must do
     that themselves.
+
+    Pass `skip_url` to rotate the failover order so the previous (failing)
+    endpoint is tried last on a reconnect attempt.
     """
     from eth_account import Account
     from web3 import Web3
@@ -278,19 +342,30 @@ def get_ctf_readonly():
     account = Account.from_key(settings.POLYMARKET_PRIVATE_KEY)
     address = account.address
 
-    for rpc_url in _POLYGON_RPC_URLS:
+    urls = list(_POLYGON_RPC_URLS)
+    if skip_url and skip_url in urls:
+        idx = urls.index(skip_url)
+        urls = urls[idx + 1:] + urls[: idx + 1]
+
+    last_err: Exception | None = None
+    for rpc_url in urls:
         try:
-            w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": 10}))
+            w3 = Web3(
+                Web3.HTTPProvider(
+                    rpc_url, request_kwargs={"timeout": _RPC_TIMEOUT_SECONDS}
+                )
+            )
             w3.eth.get_balance(address)
             ctf = w3.eth.contract(
                 address=Web3.to_checksum_address(CTF_ADDRESS),
                 abi=_CTF_BALANCE_ABI,
             )
             return w3, ctf, address, rpc_url
-        except Exception:
+        except Exception as exc:
+            last_err = exc
             continue
 
-    raise RuntimeError("all Polygon RPC endpoints failed")
+    raise RuntimeError(f"all Polygon RPC endpoints failed (last: {last_err})")
 
 
 def get_clob_client():
