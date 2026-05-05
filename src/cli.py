@@ -1947,18 +1947,29 @@ def bet_redeem(redeem_all: bool, skip_confirm: bool) -> None:
             )
 
         def send_tx(tx_data: dict) -> dict:
-            """Sign, send, and wait for receipt with RPC failover.
+            """Sign, broadcast, and wait for receipt with RPC failover.
 
-            Refreshes nonce per call against the `pending` tag so a
+            Refreshes nonce + gasPrice per attempt against `pending` so a
             previous tx that broadcast-but-receipt-timed-out doesn't
-            stall the next one with "nonce too low". On transient RPC
-            errors, reconnects to a different endpoint and retries —
-            tx_hash is preserved across reconnects so a successfully
-            broadcast tx is never re-signed with a new nonce.
+            strand this one with "nonce too low". Forces a legacy
+            (type-0) transaction by stripping any auto-filled EIP-1559
+            fields — Polygon supports 1559 and `build_transaction` will
+            populate `maxFeePerGas`/`maxPriorityFeePerGas` when no
+            `gasPrice` is supplied, which then conflicts with our
+            `gasPrice` field at sign time (`Unknown kwargs: ['gasPrice']`).
+
+            Captures `signed.hash` BEFORE broadcasting so a
+            transient "already known" (the same tx reached the mempool
+            on a prior attempt via a different RPC) falls through to
+            the receipt poll instead of being treated as a fresh failure.
             """
             tx_data["chainId"] = CHAIN_ID
             tx_data["from"] = conn.address
+            tx_data.pop("maxFeePerGas", None)
+            tx_data.pop("maxPriorityFeePerGas", None)
+            tx_data.pop("type", None)
 
+            last_exc: Exception | None = None
             for attempt in range(1, 4):
                 try:
                     tx_data["nonce"] = conn.w3.eth.get_transaction_count(
@@ -1970,14 +1981,22 @@ def bet_redeem(redeem_all: bool, skip_confirm: bool) -> None:
                     signed = conn.w3.eth.account.sign_transaction(
                         tx_data, private_key=settings.POLYMARKET_PRIVATE_KEY
                     )
-                    tx_hash = conn.w3.eth.send_raw_transaction(signed.raw_transaction)
-                    break
+                    tx_hash = signed.hash
+                    try:
+                        conn.w3.eth.send_raw_transaction(signed.raw_transaction)
+                    except Exception as bcast_exc:
+                        bcast_msg = str(bcast_exc).lower()
+                        if "already known" in bcast_msg or "already exists" in bcast_msg:
+                            pass  # tx is in mempool from a prior attempt
+                        else:
+                            raise
+                    return _wait_for_receipt(tx_hash)
                 except Exception as exc:
+                    last_exc = exc
                     msg = str(exc).lower()
-                    if "nonce too low" in msg or "already known" in msg:
-                        # A previous tx landed despite a timeout. Skip
-                        # the broadcast and let the caller treat this
-                        # one as "no-op, but not an error" by re-raising.
+                    if "nonce too low" in msg:
+                        # An earlier-loop tx with the same nonce already
+                        # landed; let the caller report SKIPPED.
                         raise
                     if is_transient_rpc_error(exc) and attempt < 3:
                         conn.reconnect(exc)
@@ -1985,7 +2004,7 @@ def bet_redeem(redeem_all: bool, skip_confirm: bool) -> None:
                         continue
                     raise
 
-            return _wait_for_receipt(tx_hash)
+            raise last_exc or RuntimeError("send_tx exhausted retries")
 
         success_count = 0
         redeemed_condition_ids: set[str] = set()
@@ -2017,18 +2036,37 @@ def bet_redeem(redeem_all: bool, skip_confirm: bool) -> None:
                         amounts = [0, on_chain]   # holding NO position
                     else:
                         amounts = [on_chain, 0]   # fallback
-                    tx = conn.neg_risk_adapter.functions.redeemPositions(
-                        condition_id_bytes,
-                        amounts,
-                    ).build_transaction({"from": conn.address})
+
+                    def _build_tx() -> dict:
+                        # gasPrice forces a legacy (type-0) tx; without
+                        # it, web3 v7 auto-fills EIP-1559 fields and
+                        # signing then rejects gasPrice as "unknown
+                        # kwargs". Retried via rpc_call_with_retry so an
+                        # estimate_gas timeout fails over to a fresh RPC
+                        # rather than getting reported as a permanent
+                        # "Market may not be resolved" error.
+                        return conn.neg_risk_adapter.functions.redeemPositions(
+                            condition_id_bytes,
+                            amounts,
+                        ).build_transaction({
+                            "from": conn.address,
+                            "gasPrice": conn.w3.eth.gas_price,
+                        })
                 else:
                     pusd_addr = Web3.to_checksum_address(PUSD_ADDRESS)
-                    tx = conn.ctf.functions.redeemPositions(
-                        pusd_addr,
-                        PARENT_COLLECTION_ID,
-                        condition_id_bytes,
-                        index_sets,
-                    ).build_transaction({"from": conn.address})
+
+                    def _build_tx() -> dict:  # noqa: F811
+                        return conn.ctf.functions.redeemPositions(
+                            pusd_addr,
+                            PARENT_COLLECTION_ID,
+                            condition_id_bytes,
+                            index_sets,
+                        ).build_transaction({
+                            "from": conn.address,
+                            "gasPrice": conn.w3.eth.gas_price,
+                        })
+
+                tx = rpc_call_with_retry(_build_tx, on_transient=conn.reconnect)
                 receipt = send_tx(tx)
                 status = "OK" if receipt["status"] == 1 else "FAILED"
                 tx_hash = receipt["transactionHash"].hex()[:16]
