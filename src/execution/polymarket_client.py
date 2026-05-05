@@ -561,6 +561,176 @@ async def _update_fill_details(trade: Trade, client) -> None:
         trade.stake_usd = 0.0
 
 
+async def sell_position(
+    token_id: str,
+    size: float,
+    *,
+    max_slippage_cents: float = 2.0,
+) -> dict:
+    """Place a price-limited FAK SELL on Polymarket for *size* shares of *token_id*.
+
+    Mirrors ``place_order`` semantics but for the close-out side: read the
+    live best bid, set a per-share floor at ``best_bid - max_slippage_cents/100``,
+    snap to tick size, and post a Fill-And-Kill MarketOrderArgsV2 with
+    ``side=SELL``. For SELL market orders the SDK interprets ``amount`` as
+    shares (not USDC); the matching engine sweeps every bid priced
+    at-or-above the floor and cancels the unfilled remainder.
+
+    Returns a dict with at least:
+        {"ok": bool, "dry_run": bool, "order_id": str | None,
+         "status": str, "filled_size": float, "fill_price": float,
+         "proceeds_usd": float, "limit_price": float, "best_bid": float,
+         "error": str | None}
+
+    No DB writes — the caller is the CLI and decides what to log.
+    """
+    if size <= 0:
+        return {
+            "ok": False, "dry_run": False, "order_id": None,
+            "status": "size_zero", "filled_size": 0.0, "fill_price": 0.0,
+            "proceeds_usd": 0.0, "limit_price": 0.0, "best_bid": 0.0,
+            "error": "size must be > 0",
+        }
+
+    quote = get_best_bid_ask(token_id)
+    if quote is None:
+        return {
+            "ok": False, "dry_run": False, "order_id": None,
+            "status": "no_quote", "filled_size": 0.0, "fill_price": 0.0,
+            "proceeds_usd": 0.0, "limit_price": 0.0, "best_bid": 0.0,
+            "error": "could not fetch orderbook",
+        }
+    best_bid, _best_ask = quote
+
+    floor_price = max(0.001, min(0.999, best_bid - max_slippage_cents / 100.0))
+
+    # Dry-run guard — simulate the fill at the live best bid for diagnostics.
+    if not is_live():
+        logger.info(
+            "DRY-RUN: would SELL %.2f shares of %s at floor %.3f (best_bid=%.3f)",
+            size, token_id[:16], floor_price, best_bid,
+        )
+        return {
+            "ok": True, "dry_run": True, "order_id": None,
+            "status": "dry_run", "filled_size": size, "fill_price": best_bid,
+            "proceeds_usd": round(size * best_bid, 2),
+            "limit_price": floor_price, "best_bid": best_bid, "error": None,
+        }
+
+    client = _get_client()
+    if client is None:
+        return {
+            "ok": False, "dry_run": False, "order_id": None,
+            "status": "no_client", "filled_size": 0.0, "fill_price": 0.0,
+            "proceeds_usd": 0.0, "limit_price": floor_price, "best_bid": best_bid,
+            "error": "CLOB client unavailable",
+        }
+
+    try:
+        tick_size = float(client.get_tick_size(token_id))
+        if tick_size > 0:
+            floor_price = round(floor_price / tick_size) * tick_size
+            floor_price = max(tick_size, min(1.0 - tick_size, floor_price))
+    except Exception:
+        logger.debug("tick-size lookup failed; using raw floor_price", exc_info=True)
+
+    from py_clob_client_v2.clob_types import MarketOrderArgsV2, OrderType
+    from py_clob_client_v2.order_builder.constants import SELL
+
+    # For SELL market orders, MarketOrderArgsV2.amount is shares (round_config.size=2).
+    # Matching engine derives taker_amount = amount * price (USDC proceeds).
+    size_rounded = round(size, 2)
+    if size_rounded <= 0:
+        return {
+            "ok": False, "dry_run": False, "order_id": None,
+            "status": "size_zero", "filled_size": 0.0, "fill_price": 0.0,
+            "proceeds_usd": 0.0, "limit_price": floor_price, "best_bid": best_bid,
+            "error": "size rounds to zero",
+        }
+
+    try:
+        order = MarketOrderArgsV2(
+            token_id=token_id,
+            amount=size_rounded,
+            side=SELL,
+            price=floor_price,
+            order_type=OrderType.FAK,
+        )
+        signed = client.create_market_order(order)
+        resp = client.post_order(signed, OrderType.FAK)
+
+        order_id = resp.get("orderID")
+        status = resp.get("status", "unknown")
+
+        if not (resp.get("success") or order_id):
+            err = resp.get("errorMsg", "unknown error")
+            await _maybe_alert_version_mismatch(err, token_id)
+            return {
+                "ok": False, "dry_run": False, "order_id": order_id,
+                "status": f"failed: {err}", "filled_size": 0.0, "fill_price": 0.0,
+                "proceeds_usd": 0.0, "limit_price": floor_price, "best_bid": best_bid,
+                "error": err,
+            }
+
+        # Best-effort fill details readback.
+        filled_size = 0.0
+        avg_price = 0.0
+        proceeds = 0.0
+        if order_id:
+            try:
+                fetched = client.get_order(order_id)
+            except Exception:
+                fetched = None
+                logger.warning("Could not fetch fill details for SELL order %s", order_id)
+            if fetched is not None:
+                fills = fetched.get("associate_trades") or []
+                total_size = 0.0
+                total_proceeds = 0.0
+                for f in fills:
+                    try:
+                        p = float(f.get("price", 0))
+                        s = float(f.get("size", 0))
+                    except (TypeError, ValueError):
+                        continue
+                    if p > 0 and s > 0:
+                        total_size += s
+                        total_proceeds += p * s
+                if total_size == 0.0:
+                    sm = fetched.get("size_matched")
+                    if sm:
+                        try:
+                            total_size = float(sm)
+                        except (TypeError, ValueError):
+                            total_size = 0.0
+                filled_size = total_size
+                if total_size > 0 and total_proceeds > 0:
+                    avg_price = total_proceeds / total_size
+                    proceeds = round(total_proceeds, 2)
+
+        logger.info(
+            "SELL posted: token=%s... size=%.2f floor=%.3f order=%s status=%s filled=%.2f@%.3f",
+            token_id[:16], size_rounded, floor_price, order_id, status,
+            filled_size, avg_price,
+        )
+
+        return {
+            "ok": True, "dry_run": False, "order_id": order_id, "status": status,
+            "filled_size": filled_size, "fill_price": avg_price,
+            "proceeds_usd": proceeds, "limit_price": floor_price,
+            "best_bid": best_bid, "error": None,
+        }
+
+    except Exception as exc:
+        logger.exception("SELL execution error for token %s", token_id)
+        await _maybe_alert_version_mismatch(str(exc), token_id)
+        return {
+            "ok": False, "dry_run": False, "order_id": None,
+            "status": "exception", "filled_size": 0.0, "fill_price": 0.0,
+            "proceeds_usd": 0.0, "limit_price": floor_price, "best_bid": best_bid,
+            "error": str(exc),
+        }
+
+
 async def check_order_status(trade: Trade) -> str | None:
     """Check current status of an open order. Returns the status string."""
     client = _get_client()

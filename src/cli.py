@@ -1261,18 +1261,119 @@ def bet_orders(max_orders: int) -> None:
     asyncio.run(_orders())
 
 
+async def _load_active_positions(
+    *,
+    show_all: bool = False,
+) -> tuple[list[tuple[str, dict]], dict[str, dict], object]:
+    """Shared position loader for ``bet portfolio`` and ``bet sell``.
+
+    Returns ``(ordered_positions, token_to_market, clob_client)`` where
+    ``ordered_positions`` is a stable, asset_id-sorted list of
+    ``(asset_id, position_dict)`` tuples — same ordering used to assign
+    the [#N] index in ``bet portfolio``, so a numeric identifier passed
+    to ``bet sell`` resolves to the same position the user just saw.
+    """
+    from src.bet_helpers import (
+        compute_positions,
+        get_clob_client,
+        get_ctf_readonly,
+        get_trades_history,
+    )
+
+    client = get_clob_client()
+    trades = get_trades_history(client)
+    if not trades:
+        return [], {}, client
+
+    positions = compute_positions(trades)
+    if not positions:
+        return [], {}, client
+
+    import httpx
+
+    token_to_market: dict[str, dict] = {}
+    async with httpx.AsyncClient(timeout=15) as http:
+        seen_conds: dict[str, dict | None] = {}
+        for asset_id, pos in positions.items():
+            cond = pos.get("market", "")
+            if not cond:
+                continue
+            if cond not in seen_conds:
+                try:
+                    resp = await http.get(
+                        f"https://clob.polymarket.com/markets/{cond}",
+                    )
+                    resp.raise_for_status()
+                    seen_conds[cond] = resp.json()
+                except Exception:
+                    seen_conds[cond] = None
+            if seen_conds[cond]:
+                token_to_market[asset_id] = seen_conds[cond]
+
+    if not show_all:
+        resolved_assets = [
+            asset_id for asset_id, mkt in token_to_market.items()
+            if mkt.get("closed") is True
+            or str(mkt.get("closed", "")).lower() == "true"
+        ]
+        if resolved_assets:
+            try:
+                _w3, ctf, wallet_addr, _rpc = get_ctf_readonly()
+            except Exception:
+                pass
+            else:
+                for asset_id in resolved_assets:
+                    try:
+                        bal = ctf.functions.balanceOf(
+                            wallet_addr, int(asset_id)
+                        ).call()
+                    except Exception:
+                        continue
+                    if bal == 0:
+                        positions.pop(asset_id, None)
+                        token_to_market.pop(asset_id, None)
+
+    ordered = sorted(positions.items(), key=lambda kv: kv[0])
+    return ordered, token_to_market, client
+
+
+def _resolve_position_target(
+    selector: str,
+    ordered: list[tuple[str, dict]],
+) -> tuple[str, dict] | None:
+    """Resolve a CLI selector to a (asset_id, position) entry.
+
+    Accepts either a 1-based numeric index from the portfolio listing or
+    an asset_id prefix (≥4 chars). Returns None on no match.
+    """
+    sel = selector.strip()
+    if sel.isdigit():
+        idx = int(sel)
+        if 1 <= idx <= len(ordered):
+            return ordered[idx - 1]
+        return None
+    if len(sel) < 4:
+        return None
+    matches = [(aid, p) for aid, p in ordered if aid.startswith(sel)]
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
 @bet.command("portfolio")
 @click.option("--all", "show_all", is_flag=True, help="Show all positions ever held (including redeemed).")
 @click.option("--history", is_flag=True, help="Show full trade history instead of positions.")
 def bet_portfolio(show_all: bool, history: bool) -> None:
-    """Show open positions and P&L from your Polymarket trades."""
+    """Show open positions and P&L from your Polymarket trades.
+
+    Each active position is printed with an ``[#N]`` index and an 8-char
+    asset_id prefix; either form can be passed to ``bet sell``.
+    """
 
     async def _portfolio() -> None:
         from src.config import settings
         from src.bet_helpers import (
-            compute_positions,
             get_clob_client,
-            get_ctf_readonly,
             get_open_orders,
             get_trades_history,
             get_usdc_balance,
@@ -1354,93 +1455,40 @@ def bet_portfolio(show_all: bool, history: bool) -> None:
             return
 
         # --- Positions ---
-        positions = compute_positions(trades)
+        ordered, token_to_market, _ = await _load_active_positions(show_all=show_all)
 
-        if not positions:
+        if not ordered:
             click.echo("\n=== Positions (0) ===")
-            click.echo("  No open positions (all trades fully closed).")
-            return
-
-        # Resolve market questions via CLOB API (condition_id from trade data)
-        import httpx
-        token_to_market: dict[str, dict] = {}
-        async with httpx.AsyncClient(timeout=15) as http:
-            # Deduplicate: group by condition_id to avoid repeated lookups
-            seen_conds: dict[str, dict | None] = {}
-            for asset_id, pos in positions.items():
-                cond = pos.get("market", "")
-                if not cond:
-                    continue
-                if cond not in seen_conds:
-                    try:
-                        resp = await http.get(
-                            f"https://clob.polymarket.com/markets/{cond}",
-                        )
-                        resp.raise_for_status()
-                        seen_conds[cond] = resp.json()
-                    except Exception:
-                        seen_conds[cond] = None
-                if seen_conds[cond]:
-                    token_to_market[asset_id] = seen_conds[cond]
-
-        # Default: hide positions in resolved markets whose on-chain balance
-        # is zero (already redeemed). `--all` keeps the raw CLOB-history view.
-        if not show_all:
-            resolved_assets = [
-                asset_id for asset_id, mkt in token_to_market.items()
-                if mkt.get("closed") is True
-                or str(mkt.get("closed", "")).lower() == "true"
-            ]
-            if resolved_assets:
-                try:
-                    _w3, ctf, wallet_addr, _rpc = get_ctf_readonly()
-                except Exception as e:
-                    click.echo(f"  Warning: could not reach Polygon RPC ({e}); showing unfiltered.")
-                else:
-                    for asset_id in resolved_assets:
-                        try:
-                            bal = ctf.functions.balanceOf(
-                                wallet_addr, int(asset_id)
-                            ).call()
-                        except Exception:
-                            continue
-                        if bal == 0:
-                            positions.pop(asset_id, None)
-                            token_to_market.pop(asset_id, None)
-
-        mode_label = "all-time" if show_all else "active+unredeemed"
-        click.echo(f"\n=== Positions ({len(positions)}) [{mode_label}] ===")
-
-        if not positions:
             click.echo(
-                "  No active or unredeemed positions. "
-                "Use --all to show redeemed positions as well."
+                "  No active or unredeemed positions."
+                + ("" if show_all else " Use --all to include redeemed positions.")
             )
             return
+
+        mode_label = "all-time" if show_all else "active+unredeemed"
+        click.echo(f"\n=== Positions ({len(ordered)}) [{mode_label}] ===")
+        click.echo("  Reference each position by [#N] or its 8-char ID prefix in `bet sell`.")
 
         total_cost = 0.0
         total_value = 0.0
 
-        for asset_id, pos in positions.items():
+        for idx, (asset_id, pos) in enumerate(ordered, start=1):
             size = pos["size"]
             avg_price = pos["avg_price"]
             cost = abs(pos["cost"])
             total_cost += cost
 
-            # Resolve market question and determine YES/NO side
             mkt = token_to_market.get(asset_id)
             question = ""
             token_side = ""
             if mkt:
                 question = mkt.get("question", "")
-                # Determine if this token is YES or NO
                 tokens = mkt.get("tokens", [])
                 for tok in tokens:
                     if tok.get("token_id") == asset_id:
                         token_side = (tok.get("outcome") or "").upper()
                         break
 
-            # Fetch current price for this token
             current_price = None
             try:
                 last = client.get_last_trade_price(asset_id)
@@ -1458,11 +1506,11 @@ def bet_portfolio(show_all: bool, history: bool) -> None:
             else:
                 pnl_str = "?"
 
-            # Display
+            header_id = f"[#{idx}] {asset_id[:8]}"
             if question:
-                click.echo(f"\n  {question}")
+                click.echo(f"\n  {header_id}  {question}")
             else:
-                click.echo(f"\n  Token: {asset_id[:20]}...")
+                click.echo(f"\n  {header_id}  Token: {asset_id[:20]}...")
             side_label = f"LONG {token_side}" if token_side else pos["side"]
             click.echo(f"    Side:      {side_label}")
             click.echo(f"    Size:      {abs(size):.2f} shares")
@@ -1487,6 +1535,135 @@ def bet_portfolio(show_all: bool, history: bool) -> None:
         click.echo(f"  USDC.e balance: ${usdc_e:.2f}")
 
     asyncio.run(_portfolio())
+
+
+@bet.command("sell")
+@click.argument("position", required=False)
+@click.option("--all", "sell_all", is_flag=True, help="Sell every active position.")
+@click.option("--slippage", "slippage_cents", default=2.0, show_default=True,
+              type=float, help="Cents below best bid for the FAK floor.")
+@click.option("--yes", "-y", "skip_confirm", is_flag=True, help="Skip confirmation prompts.")
+def bet_sell(
+    position: str | None,
+    sell_all: bool,
+    slippage_cents: float,
+    skip_confirm: bool,
+) -> None:
+    """Sell an active position at the live best bid (FAK).
+
+    POSITION is the [#N] index or asset_id prefix (≥4 chars) shown in
+    ``bet portfolio``. Pass ``--all`` to close every active position.
+    Each sell is a Fill-And-Kill MarketOrderArgsV2 with side=SELL at a
+    floor of ``best_bid - --slippage`` cents; partial fills are kept,
+    unfilled remainders are cancelled by the matching engine.
+    """
+    if not position and not sell_all:
+        click.echo("Usage: bet sell <#N|asset_prefix>  OR  bet sell --all")
+        raise SystemExit(1)
+    if position and sell_all:
+        click.echo("Pass either POSITION or --all, not both.")
+        raise SystemExit(1)
+
+    async def _sell() -> None:
+        from src.config import settings
+        from src.execution.polymarket_client import is_live, sell_position
+
+        if not settings.POLYMARKET_PRIVATE_KEY:
+            click.echo("Error: POLYMARKET_PRIVATE_KEY not set in .env")
+            raise SystemExit(1)
+
+        click.echo("Connecting to Polymarket CLOB...")
+        ordered, token_to_market, _client = await _load_active_positions(show_all=False)
+        if not ordered:
+            click.echo("No active positions to sell.")
+            return
+
+        if sell_all:
+            targets = list(ordered)
+        else:
+            assert position is not None
+            match = _resolve_position_target(position, ordered)
+            if match is None:
+                click.echo(
+                    f"No position matched '{position}'. "
+                    f"Run `bet portfolio` to see [#N] / 8-char prefixes."
+                )
+                raise SystemExit(1)
+            targets = [match]
+
+        live = is_live()
+        if not live:
+            click.echo("(AUTO_EXECUTE=false → simulating sells, no orders posted)")
+
+        click.echo(f"\nWill sell {len(targets)} position(s):")
+        for asset_id, pos in targets:
+            mkt = token_to_market.get(asset_id) or {}
+            question = (mkt.get("question") or asset_id[:24])[:60]
+            tokens = mkt.get("tokens", [])
+            token_side = ""
+            for tok in tokens:
+                if tok.get("token_id") == asset_id:
+                    token_side = (tok.get("outcome") or "").upper()
+                    break
+            click.echo(
+                f"  {asset_id[:8]}  {abs(pos['size']):.2f} {token_side or 'shares'}  "
+                f"avg=${pos['avg_price']:.4f}  ({question})"
+            )
+
+        if not skip_confirm:
+            if not click.confirm(f"\nSubmit {len(targets)} sell order(s)?", default=False):
+                click.echo("Aborted.")
+                return
+
+        total_cost = 0.0
+        total_proceeds = 0.0
+        ok_count = 0
+
+        for asset_id, pos in targets:
+            size = abs(pos["size"])
+            cost = abs(pos["cost"])
+            mkt = token_to_market.get(asset_id) or {}
+            question = (mkt.get("question") or asset_id[:24])[:60]
+            click.echo(f"\n[{asset_id[:8]}] {question}")
+            click.echo(f"  Selling {size:.2f} shares (avg entry ${pos['avg_price']:.4f}, cost ${cost:.2f})...")
+
+            result = await sell_position(
+                asset_id, size, max_slippage_cents=slippage_cents,
+            )
+            if not result["ok"]:
+                click.echo(
+                    f"  FAILED: status={result['status']} "
+                    f"error={result.get('error') or 'unknown'}"
+                )
+                continue
+
+            ok_count += 1
+            total_cost += cost
+            proceeds = result["proceeds_usd"]
+            total_proceeds += proceeds
+            tag = "(dry-run)" if result["dry_run"] else ""
+            click.echo(
+                f"  OK {tag} order_id={result['order_id'] or '-'}  "
+                f"filled={result['filled_size']:.2f}@${result['fill_price']:.4f}  "
+                f"proceeds=${proceeds:.2f}  floor=${result['limit_price']:.4f}  "
+                f"best_bid=${result['best_bid']:.4f}"
+            )
+            if proceeds > 0 and cost > 0:
+                pnl = proceeds - cost
+                pnl_pct = pnl / cost * 100
+                sign = "+" if pnl >= 0 else ""
+                click.echo(f"  Realised P&L: {sign}{pnl:.2f} ({sign}{pnl_pct:.1f}%)")
+
+        click.echo(f"\n=== Summary ===")
+        click.echo(f"  Submitted: {ok_count}/{len(targets)}")
+        if ok_count:
+            click.echo(f"  Total cost:    ${total_cost:.2f}")
+            click.echo(f"  Total proceeds: ${total_proceeds:.2f}")
+            net = total_proceeds - total_cost
+            sign = "+" if net >= 0 else ""
+            click.echo(f"  Net P&L:       {sign}{net:.2f}")
+
+    asyncio.run(_sell())
 
 
 @bet.command("redeem")

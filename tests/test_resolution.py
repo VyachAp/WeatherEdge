@@ -12,6 +12,7 @@ from src.db.models import Market, Trade, TradeDirection, TradeStatus
 from src.resolution import (
     _refresh_market_price,
     get_current_bankroll,
+    get_open_trade_value,
     get_unredeemed_won_payout,
     resolve_trades,
 )
@@ -44,12 +45,42 @@ class TestGetUnredeemedWonPayout:
         assert total == 200.0
 
 
+def _bankroll_results(
+    *,
+    unredeemed: float = 0.0,
+    open_rows: list[tuple] | None = None,
+    log_balance: float | None = None,
+):
+    """Build the MagicMock result objects for a get_current_bankroll call.
+
+    Order of execute() calls inside get_current_bankroll:
+      1. get_unredeemed_won_payout — scalar_one
+      2. get_open_trade_value — result.all() returns rows
+      3. (no-wallet branch only) BankrollLog query — scalar_one_or_none
+
+    Always returns 3 results; wallet-path tests slice ``[:2]`` to drop the
+    unused BankrollLog result.
+    """
+    unredeemed_result = MagicMock()
+    unredeemed_result.scalar_one.return_value = unredeemed
+
+    open_result = MagicMock()
+    open_result.all.return_value = open_rows or []
+
+    log_result = MagicMock()
+    log_result.scalar_one_or_none.return_value = log_balance
+
+    return [unredeemed_result, open_result, log_result]
+
+
 class TestGetCurrentBankroll:
     @pytest.mark.asyncio
     async def test_wallet_plus_unredeemed_when_wallet_present(self, mock_session):
-        unredeemed_result = MagicMock()
-        unredeemed_result.scalar_one.return_value = 200.0
-        mock_session.execute.return_value = unredeemed_result
+        # Wallet path: only the unredeemed and open-value queries fire.
+        mock_session.execute.side_effect = _bankroll_results(
+            unredeemed=200.0,
+            open_rows=[],
+        )[:2]
 
         with patch(
             "src.execution.polymarket_client.get_wallet_usdc_balance",
@@ -61,10 +92,11 @@ class TestGetCurrentBankroll:
 
     @pytest.mark.asyncio
     async def test_excludes_redeemed_trades_via_query(self, mock_session):
-        """When all WONs are redeemed, the SUM is 0, so bankroll == wallet."""
-        unredeemed_result = MagicMock()
-        unredeemed_result.scalar_one.return_value = 0.0
-        mock_session.execute.return_value = unredeemed_result
+        """When all WONs are redeemed and no OPEN trades, bankroll == wallet."""
+        mock_session.execute.side_effect = _bankroll_results(
+            unredeemed=0.0,
+            open_rows=[],
+        )[:2]
 
         with patch(
             "src.execution.polymarket_client.get_wallet_usdc_balance",
@@ -76,15 +108,29 @@ class TestGetCurrentBankroll:
         assert bankroll == 1200.0
 
     @pytest.mark.asyncio
+    async def test_open_trade_value_added_to_wallet(self, mock_session):
+        """Regression: BUY_YES @ entry 0.50 with 100 stake and current 0.60
+        is worth 100/0.50 × 0.60 = 120 — must be added to wallet equity."""
+        mock_session.execute.side_effect = _bankroll_results(
+            unredeemed=0.0,
+            open_rows=[(TradeDirection.BUY_YES, 100.0, 0.50, 0.60)],
+        )[:2]
+
+        with patch(
+            "src.execution.polymarket_client.get_wallet_usdc_balance",
+            return_value=900.0,
+        ):
+            bankroll = await get_current_bankroll(mock_session)
+
+        assert bankroll == pytest.approx(1020.0)
+
+    @pytest.mark.asyncio
     async def test_no_wallet_falls_back_to_bankroll_log(self, mock_session):
-        unredeemed_result = MagicMock()
-        unredeemed_result.scalar_one.return_value = 50.0
-
-        log_result = MagicMock()
-        log_result.scalar_one_or_none.return_value = 950.0
-
-        # Two execute calls: unredeemed sum, then bankroll log.
-        mock_session.execute.side_effect = [unredeemed_result, log_result]
+        mock_session.execute.side_effect = _bankroll_results(
+            unredeemed=50.0,
+            open_rows=[],
+            log_balance=950.0,
+        )
 
         with patch(
             "src.execution.polymarket_client.get_wallet_usdc_balance",
@@ -96,13 +142,11 @@ class TestGetCurrentBankroll:
 
     @pytest.mark.asyncio
     async def test_no_wallet_no_log_uses_initial(self, mock_session):
-        unredeemed_result = MagicMock()
-        unredeemed_result.scalar_one.return_value = 0.0
-
-        log_result = MagicMock()
-        log_result.scalar_one_or_none.return_value = None
-
-        mock_session.execute.side_effect = [unredeemed_result, log_result]
+        mock_session.execute.side_effect = _bankroll_results(
+            unredeemed=0.0,
+            open_rows=[],
+            log_balance=None,
+        )
 
         with patch(
             "src.execution.polymarket_client.get_wallet_usdc_balance",
@@ -112,6 +156,83 @@ class TestGetCurrentBankroll:
             bankroll = await get_current_bankroll(mock_session)
 
         assert bankroll == 500.0
+
+
+class TestGetOpenTradeValue:
+    @pytest.mark.asyncio
+    async def test_no_open_trades_returns_zero(self, mock_session):
+        result = MagicMock()
+        result.all.return_value = []
+        mock_session.execute.return_value = result
+
+        assert await get_open_trade_value(mock_session) == 0.0
+
+    @pytest.mark.asyncio
+    async def test_buy_yes_marked_at_current_price(self, mock_session):
+        # 100 stake, 0.50 entry → 200 shares. Current YES 0.60 → 200 × 0.60 = 120.
+        result = MagicMock()
+        result.all.return_value = [
+            (TradeDirection.BUY_YES, 100.0, 0.50, 0.60),
+        ]
+        mock_session.execute.return_value = result
+
+        assert await get_open_trade_value(mock_session) == pytest.approx(120.0)
+
+    @pytest.mark.asyncio
+    async def test_buy_no_uses_one_minus_yes_price(self, mock_session):
+        # 80 stake, 0.40 entry → 200 shares. Current YES 0.30 → NO worth 0.70 → 140.
+        result = MagicMock()
+        result.all.return_value = [
+            (TradeDirection.BUY_NO, 80.0, 0.40, 0.30),
+        ]
+        mock_session.execute.return_value = result
+
+        assert await get_open_trade_value(mock_session) == pytest.approx(140.0)
+
+    @pytest.mark.asyncio
+    async def test_missing_yes_price_falls_back_to_cost_basis(self, mock_session):
+        # Stale market with no cached price → count the dollar at par.
+        result = MagicMock()
+        result.all.return_value = [
+            (TradeDirection.BUY_YES, 50.0, 0.45, None),
+        ]
+        mock_session.execute.return_value = result
+
+        assert await get_open_trade_value(mock_session) == 50.0
+
+    @pytest.mark.asyncio
+    async def test_missing_entry_price_falls_back_to_cost_basis(self, mock_session):
+        result = MagicMock()
+        result.all.return_value = [
+            (TradeDirection.BUY_YES, 25.0, None, 0.60),
+        ]
+        mock_session.execute.return_value = result
+
+        assert await get_open_trade_value(mock_session) == 25.0
+
+    @pytest.mark.asyncio
+    async def test_zero_or_missing_stake_skipped(self, mock_session):
+        result = MagicMock()
+        result.all.return_value = [
+            (TradeDirection.BUY_YES, 0.0, 0.50, 0.60),
+            (TradeDirection.BUY_YES, None, 0.50, 0.60),
+            (TradeDirection.BUY_YES, 10.0, 0.50, 0.40),  # 10/0.5 × 0.4 = 8
+        ]
+        mock_session.execute.return_value = result
+
+        assert await get_open_trade_value(mock_session) == pytest.approx(8.0)
+
+    @pytest.mark.asyncio
+    async def test_clipped_when_cached_price_outside_unit_interval(self, mock_session):
+        # Defensive: a stale 1.05 cached YES price shouldn't manufacture > stake equity.
+        result = MagicMock()
+        result.all.return_value = [
+            (TradeDirection.BUY_YES, 100.0, 0.50, 1.05),
+        ]
+        mock_session.execute.return_value = result
+
+        # 100/0.50 × clip(1.05) = 200 × 1.0 = 200
+        assert await get_open_trade_value(mock_session) == pytest.approx(200.0)
 
 
 class TestRefreshMarketPrice:
