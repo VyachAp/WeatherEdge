@@ -1450,6 +1450,11 @@ async def job_daily_settlement() -> None:
             # 2. Daily summary
             await alerter.send_daily_summary(session)
 
+            # 2b. Nudge to run `bet redeem` when WON trades sit on-chain.
+            # Skipped in pure dry-run wallets — there's nothing to redeem.
+            if settings.POLYMARKET_PRIVATE_KEY:
+                await alerter.send_redeem_nudge(session)
+
             # 3. WX observation retention cleanup
             if settings.WX_API_KEY:
                 from sqlalchemy import delete

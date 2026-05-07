@@ -61,6 +61,7 @@ class AlertType(str, enum.Enum):
     RESOLUTION = "resolution"
     DAILY_SUMMARY = "daily_summary"
     DRAWDOWN_WARNING = "drawdown_warning"
+    REDEEM_NUDGE = "redeem_nudge"
     SYSTEM_ERROR = "system_error"
 
 
@@ -326,6 +327,54 @@ class Alerter:
             f"\U0001f4c9 Drawdown: {e(f'{drawdown * 100:.1f}%')} \\({e(dd_label)}\\)"
         )
         await self._enqueue(text)
+
+    # -- Alert: REDEEM_NUDGE --------------------------------------------------
+
+    async def send_redeem_nudge(self, session: AsyncSession) -> None:
+        """Nudge to run ``bet redeem`` when WON trades sit unsettled.
+
+        Polymarket wins remain conditional tokens until ``redeemPositions()``
+        is called on-chain. This pushes a Telegram reminder once a day with
+        the count, total payout, and age of the oldest unredeemed win.
+        Silent when nothing is pending.
+        """
+        from sqlalchemy import func
+
+        from src.resolution import get_unredeemed_won_payout
+
+        row = (
+            await session.execute(
+                select(
+                    func.count(Trade.id),
+                    func.min(Trade.closed_at),
+                ).where(
+                    Trade.status == TradeStatus.WON,
+                    Trade.redeemed_at.is_(None),
+                )
+            )
+        ).one()
+        count = int(row[0] or 0)
+        oldest = row[1]
+
+        if count == 0:
+            return
+
+        payout = await get_unredeemed_won_payout(session)
+
+        e = _escape_md2
+        lines = [
+            f"\U0001f4b8 *Unredeemed wins* — {e(count)} position(s)",
+            "",
+            f"Future payout: {e(f'${payout:,.2f}')}",
+        ]
+        if oldest is not None:
+            age_h = (datetime.now(timezone.utc) - oldest).total_seconds() / 3600.0
+            age_str = f"{age_h:.0f}h" if age_h < 48 else f"{age_h / 24:.1f}d"
+            lines.append(f"Oldest: {e(age_str)} ago")
+        lines.append("")
+        lines.append(f"Run `{e('bet redeem --all')}` to settle on\\-chain\\.")
+
+        await self._enqueue("\n".join(lines))
 
     # -- Alert: DRAWDOWN_WARNING ----------------------------------------------
 
