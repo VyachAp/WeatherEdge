@@ -20,8 +20,10 @@ def _make_dist(probs: dict[int, float], current_max: int = 75) -> BucketDistribu
 
 class TestEdgeComputation:
     def test_positive_edge(self):
-        dist = _make_dist({80: 0.70, 81: 0.30})
-        prices = {80: 0.50, 81: 0.20}
+        # Probabilities bumped above 0.85 to reflect MIN_PROBABILITY raised
+        # 2026-05-08 to filter mid-confidence noise. Filter math unchanged.
+        dist = _make_dist({80: 0.90, 81: 0.10})
+        prices = {80: 0.70, 81: 0.20}
         depths = {80: 100.0, 81: 100.0}
         end = datetime.now(timezone.utc) + timedelta(hours=5)
 
@@ -44,9 +46,9 @@ class TestEdgeComputation:
 
 class TestMinProbabilityFilter:
     def test_low_probability_rejected(self):
-        # Prob 0.45 fails the new 0.50 floor; edge=0.15 is fine.
-        dist = _make_dist({80: 0.45})
-        prices = {80: 0.30}
+        # Prob 0.80 fails the new 0.85 floor; edge=0.30 is fine.
+        dist = _make_dist({80: 0.80})
+        prices = {80: 0.50}
         depths = {80: 100.0}
         end = datetime.now(timezone.utc) + timedelta(hours=5)
 
@@ -55,9 +57,9 @@ class TestMinProbabilityFilter:
         assert "probability" in edges[0].reject_reason
 
     def test_at_floor_passes(self):
-        # 0.55 used to be rejected (was below 0.60); now passes (>= 0.50).
-        dist = _make_dist({80: 0.55})
-        prices = {80: 0.45}  # Edge = 0.10 (passes edge filter)
+        # 0.85 sits exactly on the floor and should pass.
+        dist = _make_dist({80: 0.85})
+        prices = {80: 0.70}  # Edge = 0.15 (passes edge filter)
         depths = {80: 100.0}
         end = datetime.now(timezone.utc) + timedelta(hours=5)
 
@@ -65,8 +67,8 @@ class TestMinProbabilityFilter:
         assert edges[0].passes is True
 
     def test_high_probability_passes(self):
-        dist = _make_dist({80: 0.80})
-        prices = {80: 0.50}
+        dist = _make_dist({80: 0.95})
+        prices = {80: 0.70}
         depths = {80: 100.0}
         end = datetime.now(timezone.utc) + timedelta(hours=5)
 
@@ -76,7 +78,7 @@ class TestMinProbabilityFilter:
 
 class TestPriceFilter:
     def test_price_too_low(self):
-        dist = _make_dist({80: 0.80})
+        dist = _make_dist({80: 0.90})
         prices = {80: 0.30}  # Below 0.40
         depths = {80: 100.0}
         end = datetime.now(timezone.utc) + timedelta(hours=5)
@@ -97,8 +99,8 @@ class TestPriceFilter:
 
 class TestRoutineCountFilter:
     def test_insufficient_metars(self):
-        dist = _make_dist({80: 0.80})
-        prices = {80: 0.50}
+        dist = _make_dist({80: 0.90})
+        prices = {80: 0.70}
         depths = {80: 100.0}
         end = datetime.now(timezone.utc) + timedelta(hours=5)
 
@@ -109,8 +111,8 @@ class TestRoutineCountFilter:
 
 class TestMarketCloseFilter:
     def test_closing_too_soon(self):
-        dist = _make_dist({80: 0.80})
-        prices = {80: 0.50}
+        dist = _make_dist({80: 0.90})
+        prices = {80: 0.70}
         depths = {80: 100.0}
         end = datetime.now(timezone.utc) + timedelta(minutes=15)
 
@@ -121,8 +123,8 @@ class TestMarketCloseFilter:
 
 class TestDepthFilter:
     def test_insufficient_depth(self):
-        dist = _make_dist({80: 0.80})
-        prices = {80: 0.50}
+        dist = _make_dist({80: 0.90})
+        prices = {80: 0.70}
         depths = {80: 5.0}  # Below MIN_DEPTH_USD
         end = datetime.now(timezone.utc) + timedelta(hours=5)
 
@@ -131,8 +133,8 @@ class TestDepthFilter:
         assert "depth" in edges[0].reject_reason
 
     def test_no_depth_data_uses_zero(self):
-        dist = _make_dist({80: 0.80})
-        prices = {80: 0.50}
+        dist = _make_dist({80: 0.90})
+        prices = {80: 0.70}
         end = datetime.now(timezone.utc) + timedelta(hours=5)
 
         # No depths dict → defaults to empty
@@ -143,15 +145,15 @@ class TestDepthFilter:
 
 class TestMultipleBuckets:
     def test_some_pass_some_fail(self):
-        dist = _make_dist({78: 0.05, 79: 0.15, 80: 0.70, 81: 0.10})
-        prices = {78: 0.90, 79: 0.60, 80: 0.50, 81: 0.50}
+        dist = _make_dist({78: 0.05, 79: 0.15, 80: 0.90, 81: 0.10})
+        prices = {78: 0.90, 79: 0.60, 80: 0.70, 81: 0.50}
         depths = {78: 100.0, 79: 100.0, 80: 100.0, 81: 100.0}
         end = datetime.now(timezone.utc) + timedelta(hours=5)
 
         edges = compute_edges(dist, prices, routine_count=5, market_end_time=end, orderbook_depths=depths)
         passing = [e for e in edges if e.passes]
         failing = [e for e in edges if not e.passes]
-        # Bucket 80: edge = 0.20, prob = 0.70 → passes
+        # Bucket 80: edge = 0.20, prob = 0.90 → passes
         assert any(e.bucket_value == 80 for e in passing)
         # Bucket 78: prob = 0.05 → fails probability filter
         assert any(e.bucket_value == 78 for e in failing)
@@ -165,9 +167,11 @@ class TestCheckFiltersMinRoutineOverride:
     def test_default_uses_settings_min_routine_count(self):
         from src.signals.edge_calculator import _check_filters
 
-        # routine_count=2 with default min (3) → rejected.
+        # routine_count=2 with default min (3) → rejected. Prob bumped
+        # above MIN_PROBABILITY=0.85 so it doesn't short-circuit the
+        # earlier probability filter.
         reason = _check_filters(
-            edge=0.2, prob=0.7, price=0.5,
+            edge=0.2, prob=0.9, price=0.7,
             routine_count=2, minutes_to_close=120, depth=100.0,
         )
         assert reason is not None
@@ -177,7 +181,7 @@ class TestCheckFiltersMinRoutineOverride:
         from src.signals.edge_calculator import _check_filters
 
         reason = _check_filters(
-            edge=0.2, prob=0.7, price=0.5,
+            edge=0.2, prob=0.9, price=0.7,
             routine_count=2, minutes_to_close=120, depth=100.0,
             min_routine_count=2,
         )
@@ -187,7 +191,7 @@ class TestCheckFiltersMinRoutineOverride:
         from src.signals.edge_calculator import _check_filters
 
         reason = _check_filters(
-            edge=0.2, prob=0.7, price=0.5,
+            edge=0.2, prob=0.9, price=0.7,
             routine_count=1, minutes_to_close=120, depth=100.0,
             min_routine_count=2,
         )

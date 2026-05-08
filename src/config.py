@@ -72,13 +72,14 @@ class Settings(BaseSettings):
     UNIFIED_PIPELINE_INTERVAL_MINUTES: int = 5
 
     # Trade filters
-    # Side-effective probability floor. After PR-1 the BucketEdge stores
-    # `our_probability` in the chosen-side frame, so 0.50 means "trade
-    # only when the model is at least a coin flip on the side we're
-    # buying". Combined with MIN_EDGE=0.05 this allows entries down to
-    # ~0.45 on whichever side has positive edge — the "earlier, lower
-    # price" zone the user explicitly asked to unlock.
-    MIN_PROBABILITY: float = 0.50
+    # Side-effective probability floor. Raised from 0.50 → 0.85 after the
+    # 2026-05-08 calibration audit: live data showed the 0.6-0.85 model_prob
+    # band realizing ~25-50% win rate (vs ~80% predicted) on bracket
+    # markets, the dominant bleed. Combined with APPLY_CALIBRATION the
+    # raw 0.99 predictions are corrected down toward true ~0.85 and
+    # gated here, dropping marginal NO bets at the modal bucket where
+    # sigma overconfidence had been inventing edge.
+    MIN_PROBABILITY: float = 0.85
     MIN_ENTRY_PRICE: float = 0.40
     MAX_ENTRY_PRICE: float = 0.97
     MIN_DEPTH_USD: float = 10.0
@@ -87,18 +88,36 @@ class Settings(BaseSettings):
     MAX_POSITION_USD: float = 200.0
     DEPTH_POSITION_CAP_PCT: float = 0.20
 
+    # Same-day same-city bracket/exactly cluster total stake cap. Outcomes
+    # across buckets of one bracket are anti-correlated — only one bucket
+    # can win — so each bucket's Kelly stake is mis-priced as if
+    # independent. The cap (default $100, half of MAX_POSITION_USD) sums
+    # already-staked open/pending stakes on the same parsed_location +
+    # target local day before sizing a new bucket, refusing the new bet
+    # when the cluster total would exceed the cap. Set to 0.0 to disable.
+    CLUSTER_STAKE_CAP_USD: float = 100.0
+
+    # Bracket markets (multi-bucket "between X-Y°F on day D" questions)
+    # are gated off after live data showed -21pp model overconfidence
+    # vs realised win rate, leaving the strategy at -1.5% breakeven
+    # margin. Exactly/threshold markets are unaffected. Re-enable via
+    # `.env` once sigma + calibration changes have ≥2 weeks of paper-
+    # trade evidence behind them.
+    BRACKET_MARKETS_ENABLED: bool = False
+
     # Station bias tracking
     DEFAULT_STATION_BIAS_C: float = 1.0
     STATION_BIAS_WINDOW_DAYS: int = 30
     STATION_BIAS_MAX_C: float = 3.0
 
-    # Consensus calibration (Phase 1.2). When True, the unified pipeline
-    # refreshes a linear (slope, intercept) fit from resolved signals
-    # every tick and applies it to the chosen side's probability before
-    # edge filtering. Default False so the live pipeline is unchanged
-    # until the bake-off in `reports/calibration/` confirms a Brier
-    # improvement. See `src/signals/consensus.py`.
-    APPLY_CALIBRATION: bool = False
+    # Consensus calibration. When True, the unified pipeline refreshes a
+    # linear (slope, intercept) fit from resolved signals every tick and
+    # applies it to the chosen side's probability before edge filtering.
+    # Flipped True by default 2026-05-08 after live data showed +10-21pp
+    # overconfidence on bracket/exactly markets. The fit needs at least
+    # `MIN_CALIBRATION_SAMPLES=50` resolved trades; below that, callers
+    # see the raw probability unchanged. See `src/signals/consensus.py`.
+    APPLY_CALIBRATION: bool = True
 
     # Circuit breakers
     DAILY_LOSS_STOP_USD: float = 200.0
@@ -111,6 +130,14 @@ class Settings(BaseSettings):
     # rather than up to 5 minutes.
     FAST_LOCK_POLL_ENABLED: bool = True
     FAST_LOCK_POLL_INTERVAL_SECONDS: int = 30
+
+    # Order reconciliation job — polls PENDING/OPEN trades whose
+    # `fill_price` is still NULL (delayed orders that posted to the CLOB
+    # but the matching engine hasn't filled yet) and updates fill data
+    # from the live order endpoint. Without this, slippage analytics
+    # remain blind. Disable by setting to 0.
+    ORDER_RECONCILE_INTERVAL_MINUTES: int = 5
+    ORDER_RECONCILE_LOOKBACK_HOURS: int = 24
 
     # Lock-rule trader (deterministic physical-condition path)
     LOCK_RULE_ENABLED: bool = True
@@ -141,7 +168,12 @@ class Settings(BaseSettings):
     # Inflate raw inter-model spread — NWP ensembles are under-dispersive vs
     # actual forecast error, ~20-30% for surface T.
     ENSEMBLE_SPREAD_MULTIPLIER: float = 1.3
-    ENSEMBLE_MIN_SIGMA_F: float = 1.0
+    # Raised 1.0 → 2.0 (2026-05-08): a 1°F floor produces probability
+    # distributions that under-disperse vs realised forecast error,
+    # generating spurious NO-side edge on bracket modal-bucket bets at
+    # the 0.7-0.8 prob range. 2°F matches the rough 12h-out RMS of
+    # surface-T forecasts and aligns with CLIMATE_PRIOR_MIN_SIGMA_F.
+    ENSEMBLE_MIN_SIGMA_F: float = 2.0
     ENSEMBLE_MAX_SIGMA_F: float = 5.0
     # If fewer than this many models returned usable peak-hour data, fall back
     # to the deterministic single-source endpoint.

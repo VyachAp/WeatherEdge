@@ -380,6 +380,19 @@ async def job_unified_pipeline() -> None:
             for icao, state in city_states.items():
               try:
                 for market in city_markets[icao]:
+                    # Bracket-class markets gated off by default — see
+                    # ``settings.BRACKET_MARKETS_ENABLED``. Bracket bets
+                    # were the dominant live-PnL bleed pre-2026-05-08.
+                    if (
+                        not settings.BRACKET_MARKETS_ENABLED
+                        and market.parsed_operator in ("bracket", "range")
+                    ):
+                        logger.debug(
+                            "[%s] skip %s: bracket markets disabled (BRACKET_MARKETS_ENABLED=False)",
+                            icao, market.id[:12],
+                        )
+                        continue
+
                     end_time = market.end_date or datetime.now(timezone.utc) + timedelta(hours=24)
 
                     now_utc = datetime.now(timezone.utc)
@@ -617,6 +630,23 @@ async def job_unified_pipeline() -> None:
                             _unified_fired_today.add(dedup_key)
                             _market_to_icao[market.id] = icao
                             continue
+
+                        # Cluster cap: cap total stake across all
+                        # bucket markets in the same parsed_location +
+                        # target-day cluster. Outcomes are anti-correlated
+                        # (only one bucket wins) so independent Kelly
+                        # sizing per bucket over-allocates. Threshold
+                        # markets are unaffected (helper returns 0.0).
+                        if settings.CLUSTER_STAKE_CAP_USD > 0:
+                            cluster_used = await _cluster_stake_used(session, market)
+                            if cluster_used + adjusted_stake > settings.CLUSTER_STAKE_CAP_USD:
+                                logger.info(
+                                    "[%s] skip %s bucket=%d: cluster stake $%.2f + new $%.2f > cap $%.2f",
+                                    icao, side_label, edge.bucket_value,
+                                    cluster_used, adjusted_stake,
+                                    settings.CLUSTER_STAKE_CAP_USD,
+                                )
+                                continue
 
                         # Side-effective probability lands in Signal.model_prob
                         # so consensus calibration treats YES and NO uniformly.
@@ -1021,6 +1051,53 @@ async def _log_evaluation(
     # _upsert_signal or commit) will batch these along with other writes.
 
 
+def _is_bracket_like(market) -> bool:
+    """True for multi-bucket window markets (bracket / range / exactly).
+
+    Used by the bracket-disable gate and the cluster-cap helper. Threshold
+    markets (above/at_least/below/at_most) are NOT bracket-like — they're
+    a single binary outcome, no anti-correlated buckets.
+    """
+    return market.parsed_operator in ("bracket", "range", "exactly")
+
+
+async def _cluster_stake_used(
+    session, market,
+) -> float:
+    """Sum of currently-staked $ across the same bracket/exactly cluster.
+
+    A "cluster" is the set of bucket markets with the same
+    ``parsed_location`` and the same ``end_date.date()`` (UTC). For a
+    multi-bucket question only one bucket can ultimately resolve YES,
+    so each independent Kelly bucket bet over-states diversification —
+    the cluster's combined exposure is the right unit for the cap.
+
+    Excludes dry-run rows and resolved (WON/LOST) rows; includes PENDING
+    + OPEN. Returns 0.0 for non-bracket-like markets so threshold
+    markets aren't accidentally clustered.
+    """
+    if not _is_bracket_like(market) or not market.parsed_location or not market.end_date:
+        return 0.0
+
+    from sqlalchemy import func
+
+    end_day = market.end_date.date()
+    stmt = (
+        select(func.coalesce(func.sum(Trade.stake_usd), 0.0))
+        .join(Market, Trade.market_id == Market.id)
+        .where(
+            Market.parsed_location == market.parsed_location,
+            func.date(Market.end_date) == end_day,
+            Market.parsed_operator.in_(("bracket", "range", "exactly")),
+            Trade.status.in_([TradeStatus.PENDING, TradeStatus.OPEN]),
+            # Live trades only — dry-run rows would over-state the cap.
+            (Trade.exchange_status.is_(None) | (Trade.exchange_status != "dry_run")),
+        )
+    )
+    result = await session.execute(stmt)
+    return float(result.scalar() or 0.0)
+
+
 async def _has_active_trade(
     session, market_id: str, direction,
 ) -> bool:
@@ -1291,6 +1368,20 @@ async def _try_lock_rule_trade(
             icao, decision.side, market.id[:12], stake, settings.MIN_STAKE_USD,
         )
         return 0.0
+
+    # Cluster cap also applies to lock-rule fires on bracket/exactly
+    # markets (range_overshoot/undershoot/in_window branches). Threshold
+    # markets are unaffected because ``_cluster_stake_used`` returns 0.0
+    # for non-bracket-like operators.
+    if settings.CLUSTER_STAKE_CAP_USD > 0:
+        cluster_used = await _cluster_stake_used(session, market)
+        if cluster_used + stake > settings.CLUSTER_STAKE_CAP_USD:
+            logger.info(
+                "[%s] LOCK %s %s: cluster stake $%.2f + new $%.2f > cap $%.2f, skipping",
+                icao, decision.side, market.id[:12],
+                cluster_used, stake, settings.CLUSTER_STAKE_CAP_USD,
+            )
+            return 0.0
 
     # model_prob=1.0 because the lock rule is deterministic (no probability
     # estimate to record). confidence carries the lock margin in °F so the
@@ -1788,6 +1879,15 @@ async def job_fast_lock_poll() -> None:
                     continue
                 if not _is_binary_market(m):
                     continue
+                # Bracket-class markets gated off by default — see
+                # ``settings.BRACKET_MARKETS_ENABLED``. Mirror the unified
+                # pipeline's gate so range-overshoot lock fires can't
+                # bypass the brake.
+                if (
+                    not settings.BRACKET_MARKETS_ENABLED
+                    and m.parsed_operator in ("bracket", "range")
+                ):
+                    continue
                 if not m.parsed_location:
                     continue
                 icao = icao_for_location(m.parsed_location)
@@ -1923,6 +2023,75 @@ async def job_fast_lock_poll() -> None:
             logger.warning("Alerter failed to send fast-poll error")
 
 
+async def job_reconcile_orders() -> None:
+    """Poll PENDING/OPEN trades whose fill data hasn't been written yet.
+
+    The CLOB returns ``status=delayed`` with a real ``order_id`` when the
+    matching engine queues an order; ``client.get_order`` returns ``None``
+    until the engine picks it up. ``_update_fill_details`` correctly
+    skips that case in the live order path, but no other job re-tries
+    the lookup, so partial fills on delayed orders never made it into
+    ``trades.fill_price``/``filled_size`` — slippage analytics were
+    blind across the whole live history.
+
+    Scope: trades within the last ``ORDER_RECONCILE_LOOKBACK_HOURS`` whose
+    ``order_id`` is set, ``fill_price`` is NULL, and ``exchange_status``
+    is one of {``delayed``, ``matched``, ``matching``}. For each, calls
+    ``check_order_status`` (which itself triggers ``_update_fill_details``
+    when the order has reached ``matched``).
+
+    No-op in dry-run / no-private-key mode.
+    """
+    if settings.ORDER_RECONCILE_INTERVAL_MINUTES <= 0:
+        return
+
+    from src.execution.polymarket_client import check_order_status, is_live
+
+    if not is_live():
+        return
+
+    try:
+        async with async_session() as session:
+            cutoff = (
+                datetime.now(timezone.utc)
+                - timedelta(hours=settings.ORDER_RECONCILE_LOOKBACK_HOURS)
+            )
+            stmt = (
+                select(Trade)
+                .where(
+                    Trade.order_id.is_not(None),
+                    Trade.fill_price.is_(None),
+                    Trade.exchange_status.in_(["delayed", "matched", "matching"]),
+                    Trade.opened_at >= cutoff,
+                )
+            )
+            result = await session.execute(stmt)
+            trades = result.scalars().all()
+            if not trades:
+                return
+
+            updated = 0
+            for trade in trades:
+                try:
+                    status = await check_order_status(trade)
+                    if trade.fill_price is not None:
+                        updated += 1
+                except Exception:
+                    logger.warning(
+                        "reconcile: lookup failed for order %s",
+                        trade.order_id, exc_info=True,
+                    )
+                    continue
+            if updated:
+                await session.commit()
+                logger.info(
+                    "reconcile: filled %d/%d delayed/matched orders",
+                    updated, len(trades),
+                )
+    except Exception:
+        logger.warning("Order reconciliation job failed", exc_info=True)
+
+
 # ---------------------------------------------------------------------------
 # Main entry
 # ---------------------------------------------------------------------------
@@ -1977,6 +2146,20 @@ def setup_scheduler() -> AsyncIOScheduler:
         logger.info(
             "Fast lock poll enabled (every %ds)",
             settings.FAST_LOCK_POLL_INTERVAL_SECONDS,
+        )
+
+    if settings.ORDER_RECONCILE_INTERVAL_MINUTES > 0:
+        scheduler.add_job(
+            job_reconcile_orders,
+            IntervalTrigger(minutes=settings.ORDER_RECONCILE_INTERVAL_MINUTES),
+            id="reconcile_orders",
+            next_run_time=datetime.now(timezone.utc) + timedelta(minutes=2),
+            max_instances=1,
+            coalesce=True,
+        )
+        logger.info(
+            "Order reconciliation enabled (every %dm)",
+            settings.ORDER_RECONCILE_INTERVAL_MINUTES,
         )
 
     return scheduler

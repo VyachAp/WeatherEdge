@@ -163,11 +163,13 @@ class TestBinaryMarketEdgeSideSelection:
     def test_picks_yes_when_prob_above_price(self):
         from src.db.models import TradeDirection
 
-        edge, no_calls = self._setup(our_prob_yes=0.70, yes_price=0.50)
+        # Probabilities sit above MIN_PROBABILITY=0.85 so the side-selection
+        # logic can be exercised without colliding with the prob filter.
+        edge, no_calls = self._setup(our_prob_yes=0.90, yes_price=0.70)
         assert edge.direction == TradeDirection.BUY_YES
-        assert edge.our_probability == 0.70
-        assert edge.market_price == 0.50
-        assert edge.edge == 0.20
+        assert edge.our_probability == 0.90
+        assert edge.market_price == 0.70
+        assert edge.edge == pytest.approx(0.20)
         assert edge.passes is True
         # NO depth never fetched on the YES branch.
         assert no_calls == []
@@ -175,12 +177,12 @@ class TestBinaryMarketEdgeSideSelection:
     def test_picks_no_when_prob_below_price(self):
         from src.db.models import TradeDirection
 
-        edge, no_calls = self._setup(our_prob_yes=0.30, yes_price=0.55)
+        edge, no_calls = self._setup(our_prob_yes=0.10, yes_price=0.55)
         assert edge.direction == TradeDirection.BUY_NO
-        # NO frame: prob = 1 - 0.30 = 0.70, price = 1 - 0.55 = 0.45, edge = 0.25
-        assert edge.our_probability == 0.70
-        assert edge.market_price == 0.45
-        assert edge.edge == 0.25
+        # NO frame: prob = 1 - 0.10 = 0.90, price = 1 - 0.55 = 0.45, edge = 0.45
+        assert edge.our_probability == 0.90
+        assert edge.market_price == pytest.approx(0.45)
+        assert edge.edge == pytest.approx(0.45)
         assert edge.passes is True
         # NO depth was lazily fetched.
         assert no_calls == [1]
@@ -189,7 +191,7 @@ class TestBinaryMarketEdgeSideSelection:
         # NO branch picked, but NO depth too thin → rejected by depth filter
         # in NO frame, not silently let through using YES depth.
         edge, _ = self._setup(
-            our_prob_yes=0.30, yes_price=0.55, depth_yes=500.0, depth_no=2.0,
+            our_prob_yes=0.10, yes_price=0.55, depth_yes=500.0, depth_no=2.0,
         )
         assert edge.passes is False
         assert "depth" in (edge.reject_reason or "")
@@ -232,30 +234,30 @@ class TestBinaryMarketEdgeSideSelection:
 
     def test_no_side_passes_min_entry_price_in_no_frame(self):
         # YES price 0.55 → NO price 0.45, which clears the 0.40 floor.
-        edge, _ = self._setup(our_prob_yes=0.30, yes_price=0.55)
-        assert edge.market_price == 0.45
+        edge, _ = self._setup(our_prob_yes=0.10, yes_price=0.55)
+        assert edge.market_price == pytest.approx(0.45)
         assert edge.passes is True  # 0.45 >= MIN_ENTRY_PRICE (0.40)
 
     def test_no_side_fails_min_entry_price_when_yes_near_one(self):
         # YES at 0.99 → NO at 0.01, fails MIN_ENTRY_PRICE. Lock-rule path
         # (with its own LOCK_RULE_MIN_PRICE=0.05) is the right tool here,
-        # not the probability path.
-        edge, _ = self._setup(our_prob_yes=0.40, yes_price=0.99)
-        # Edge would be (1-0.40) - (1-0.99) = 0.60 - 0.01 = 0.59 — huge,
-        # but the price filter should still reject because no_price < 0.40.
+        # not the probability path. P(YES)=0.05 keeps NO_prob=0.95 well
+        # above MIN_PROBABILITY=0.85 so the price filter is the one
+        # that fires (not the probability filter).
+        edge, _ = self._setup(our_prob_yes=0.05, yes_price=0.99)
         assert edge.passes is False
         assert "price" in (edge.reject_reason or "")
 
     def test_no_side_passes_min_probability_in_no_frame(self):
-        # PR-3 floor is 0.50. NO trade with our_prob_yes=0.30 has effective
-        # NO prob = 0.70, well above the 0.50 floor — passes even though
-        # raw P(YES)=0.30 is below the floor. Proves PR-1's side-aware
-        # gate works with PR-3's lower threshold.
+        # NO trade with our_prob_yes=0.10 has effective NO prob = 0.90,
+        # comfortably above MIN_PROBABILITY=0.85 — passes even though
+        # raw P(YES)=0.10 is far below the floor. Proves the side-aware
+        # gate works in the NO frame.
         from src.db.models import TradeDirection
 
-        edge, _ = self._setup(our_prob_yes=0.30, yes_price=0.55)
+        edge, _ = self._setup(our_prob_yes=0.10, yes_price=0.55)
         assert edge.direction == TradeDirection.BUY_NO
-        assert edge.our_probability == 0.70  # NO frame
+        assert edge.our_probability == 0.90  # NO frame
         assert edge.passes is True
 
 
@@ -316,18 +318,19 @@ class TestBinaryMarketEdgeAsymmetricPricing:
         assert "edge" in (edge.reject_reason or "")
 
     def test_yes_side_uses_ask_not_mid(self):
-        # YES bid=0.40, ask=0.55 (tighter spread). With model P(YES)=0.70:
-        #   - Mid-based: edge = 0.70 - 0.475 = +0.225 (passes)
-        #   - Asymmetric (real ask): edge = 0.70 - 0.55 = +0.15 (still passes,
-        #     but smaller and accurate)
+        # YES bid=0.40, ask=0.55 (tighter spread). Model P(YES)=0.90 sits
+        # comfortably above MIN_PROBABILITY=0.85:
+        #   - Mid-based: edge = 0.90 - 0.475 = +0.425 (passes)
+        #   - Asymmetric (real ask): edge = 0.90 - 0.55 = +0.35 (still
+        #     passes, but smaller and accurate — the point of the test)
         edge = self._eval(
-            our_prob_yes=0.70, yes_bid=0.40, yes_ask=0.55,
+            our_prob_yes=0.90, yes_bid=0.40, yes_ask=0.55,
             op="at_least", threshold=82,
         )
         from src.db.models import TradeDirection
         assert edge.direction == TradeDirection.BUY_YES
         assert edge.market_price == 0.55
-        assert abs(edge.edge - 0.15) < 0.001
+        assert abs(edge.edge - 0.35) < 0.001
         assert edge.passes is True
 
     def test_omitting_quote_falls_back_to_mid(self):
