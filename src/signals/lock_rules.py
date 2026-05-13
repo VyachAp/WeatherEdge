@@ -37,8 +37,8 @@ class LockDecision:
       'easy_super'      — observed max ≥ threshold + 2×LOCK_MARGIN_F (routines≥2)
       'easy_standard'   — observed max ≥ threshold + LOCK_MARGIN_F (routines≥MIN)
       'hard'            — observed max << threshold AND no_more_heating
-      'range_overshoot' — current_max > range_high + margin
-      'range_undershoot'— current_max < range_low - margin AND no_more_heating
+      'range_overshoot' — current_max ≥ range_high + 2×LOCK_MARGIN_F (rc≥4)
+      'range_undershoot'— current_max ≤ range_low - 2×LOCK_MARGIN_F (rc≥4) AND no_more_heating
       'range_in_window' — current_max in [low, high] + past peak + no upward
     None when ``side is None``.
     """
@@ -60,6 +60,14 @@ class LockDecision:
 
 
 _NO_LOCK = LockDecision(side=None)
+
+
+# Range/`exactly` lock-rule gates. Range branches (overshoot/undershoot) sit
+# on `exactly` markets that the bot enters at LOCK_RULE_MAX_PRICE near 0.95,
+# so each win pays ~$0.05/$1 staked while each loss costs ~$1/$1 staked —
+# breakeven needs ≥95% accuracy. Tighter gates than threshold markets.
+RANGE_LOCK_MIN_ROUTINES = 4
+RANGE_LOCK_MARGIN_MULTIPLIER = 2.0
 
 
 def _market_daily_max(
@@ -207,7 +215,7 @@ def evaluate_lock(
     # Super-margin (>= 2× LOCK_MARGIN_F) is mathematically bulletproof at
     # routine_count=2 — daily max is monotonic, so two confirming obs
     # already overshooting by 4°F can't be undone by a third.
-    super_margin = 2.0 * margin
+    super_margin = RANGE_LOCK_MARGIN_MULTIPLIER * margin
     easy_overshoot = current_max_f - threshold_f
     easy_min_routines = (
         2 if easy_overshoot >= super_margin else settings.MIN_ROUTINE_COUNT
@@ -290,20 +298,34 @@ def _evaluate_range_lock(
     """Lock evaluation for [low, high] range / single-value-exactly markets.
 
     Three deterministic outcomes:
-      * NO overshoot — observed max already > high + margin.
-      * NO undershoot — observed max << low AND no more heating possible.
+      * NO overshoot — observed max already > high + 2*margin AND
+        routine_count >= RANGE_LOCK_MIN_ROUTINES.
+      * NO undershoot — observed max < low - 2*margin AND no more heating
+        possible AND routine_count >= RANGE_LOCK_MIN_ROUTINES.
       * YES in-range — observed max inside [low, high] AND past peak AND
         no upward signal (solar declining + flat/falling METAR trend) AND
         forecast peak does not exceed high.
+
+    The 2x-margin + rc>=4 gates on overshoot/undershoot reflect that
+    `exactly` markets have asymmetric payoffs at LOCK_RULE_MAX_PRICE=0.95:
+    each win returns ~$1, each loss costs ~$5-10. Two LOST trades over the
+    last 30 days (rc=6 and rc=27 overshoots) cost ~$19 vs ~$17 from all
+    other wins combined. Doubling the margin and raising the routine floor
+    eliminates the borderline edge cases that produced those losses.
     """
-    # NO overshoot.
-    if current_max_f > high_f + margin:
+    range_min_rc = max(settings.MIN_ROUTINE_COUNT, RANGE_LOCK_MIN_ROUTINES)
+
+    # NO overshoot — require 2x margin to filter out borderline early-day fires.
+    if (
+        current_max_f >= high_f + RANGE_LOCK_MARGIN_MULTIPLIER * margin
+        and routine_count >= range_min_rc
+    ):
         return LockDecision(
             side="NO",
             reasons=[
-                f"market-day max {current_max_f:.1f}°F > range upper "
-                f"{high_f:.0f}°F + {margin:.1f}°F margin ({op})",
-                f"routine_count={routine_count}",
+                f"market-day max {current_max_f:.1f}°F >= range upper "
+                f"{high_f:.0f}°F + {RANGE_LOCK_MARGIN_MULTIPLIER * margin:.1f}°F (2x margin) ({op})",
+                f"routine_count={routine_count} (min {range_min_rc})",
             ],
             margin_f=current_max_f - high_f,
             branch="range_overshoot",
@@ -311,17 +333,20 @@ def _evaluate_range_lock(
             observed_max_f=current_max_f,
         )
 
-    # NO undershoot.
-    if current_max_f < low_f - margin:
+    # NO undershoot — symmetric 2x margin + rc gate.
+    if (
+        current_max_f <= low_f - RANGE_LOCK_MARGIN_MULTIPLIER * margin
+        and routine_count >= range_min_rc
+    ):
         has_headroom, evidence = _no_more_heating(state, low_f)
         if has_headroom:
             return LockDecision(
                 side="NO",
                 reasons=[
-                    f"market-day max {current_max_f:.1f}°F < range lower "
-                    f"{low_f:.0f}°F - {margin:.1f}°F margin ({op})",
+                    f"market-day max {current_max_f:.1f}°F <= range lower "
+                    f"{low_f:.0f}°F - {RANGE_LOCK_MARGIN_MULTIPLIER * margin:.1f}°F (2x margin) ({op})",
                     *evidence,
-                    f"routine_count={routine_count}",
+                    f"routine_count={routine_count} (min {range_min_rc})",
                 ],
                 margin_f=low_f - current_max_f,
                 branch="range_undershoot",

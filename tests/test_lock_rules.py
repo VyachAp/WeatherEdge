@@ -552,3 +552,91 @@ class TestRangeMarkets:
         )
         decision = _eval(state, mkt)
         assert decision.side == "YES"
+
+
+class TestRangeLockTighterGates:
+    """Regression tests for the 2x-margin + rc>=4 gates on range branches.
+
+    Backed by 30d of live data where ``exactly`` lock trades at 0.85-0.95
+    entries lost catastrophically on the few mis-fires (rc=6 overshoot
+    -$8.93, rc=27 overshoot -$10.52). Standard 1x margin + rc>=3 gates were
+    permissive enough to fire on borderline mid-day fluctuations. The
+    tightened gates here are the live safety net.
+    """
+
+    def test_overshoot_1x_margin_does_not_lock(self):
+        # current=64 vs exactly=62.6 (range [62, 63]) → overshoot=1°F.
+        # 1x margin = 2°F (LOCK_MARGIN_F default), so 1x rule would fire.
+        # 2x margin = 4°F, so it must NOT fire.
+        c17_in_f = 17.0 * 9.0 / 5.0 + 32.0
+        mkt = _FakeMarket(
+            parsed_threshold=c17_in_f, parsed_operator="exactly",
+            question="Will the highest temperature in Amsterdam be 17°C on June 15?",
+        )
+        state = _state(current_max_f=64.0, routine_count=5)
+        assert _eval(state, mkt).side is None
+
+    def test_overshoot_2x_margin_locks_no(self):
+        # current=67 vs exactly=62.6, overshoot ≈ 4°F = 2x margin → fires.
+        c17_in_f = 17.0 * 9.0 / 5.0 + 32.0
+        mkt = _FakeMarket(
+            parsed_threshold=c17_in_f, parsed_operator="exactly",
+            question="Will the highest temperature in Amsterdam be 17°C on June 15?",
+        )
+        state = _state(current_max_f=67.0, routine_count=5)
+        decision = _eval(state, mkt)
+        assert decision.side == "NO"
+        assert decision.branch == "range_overshoot"
+
+    def test_overshoot_rc_3_does_not_lock(self):
+        # current=70 vs exactly=62.6 (>> 2x margin) but only 3 routines.
+        # Old rule fired at rc>=3; new rule needs rc>=4.
+        c17_in_f = 17.0 * 9.0 / 5.0 + 32.0
+        mkt = _FakeMarket(
+            parsed_threshold=c17_in_f, parsed_operator="exactly",
+            question="Will the highest temperature in Amsterdam be 17°C on June 15?",
+        )
+        state = _state(current_max_f=70.0, routine_count=3)
+        assert _eval(state, mkt).side is None
+
+    def test_overshoot_rc_4_locks(self):
+        # Same as above but with rc=4 — at the new floor.
+        c17_in_f = 17.0 * 9.0 / 5.0 + 32.0
+        mkt = _FakeMarket(
+            parsed_threshold=c17_in_f, parsed_operator="exactly",
+            question="Will the highest temperature in Amsterdam be 17°C on June 15?",
+        )
+        state = _state(current_max_f=70.0, routine_count=4)
+        decision = _eval(state, mkt)
+        assert decision.side == "NO"
+        assert decision.routine_count == 4
+
+    def test_undershoot_1x_margin_does_not_lock(self):
+        # current=61 vs exactly=62.6 (range [62, 63]) → undershoot = 1°F < 2x margin.
+        c17_in_f = 17.0 * 9.0 / 5.0 + 32.0
+        mkt = _FakeMarket(
+            parsed_threshold=c17_in_f, parsed_operator="exactly",
+            question="Will the highest temperature in Amsterdam be 17°C on June 15?",
+        )
+        state = _state(
+            current_max_f=61.0, forecast_peak_f=55.0,
+            solar_declining=True, metar_trend=-0.5, routine_count=5,
+        )
+        # past peak (hours_until_peak=0 default), forecast < threshold → no_more_heating
+        # would otherwise approve, but the 2x-margin gate blocks first.
+        assert _eval(state, mkt).side is None
+
+    def test_undershoot_2x_margin_locks_no(self):
+        # current=58 vs exactly=62.6 → undershoot ≈ 4.6°F > 2x margin (4°F).
+        c17_in_f = 17.0 * 9.0 / 5.0 + 32.0
+        mkt = _FakeMarket(
+            parsed_threshold=c17_in_f, parsed_operator="exactly",
+            question="Will the highest temperature in Amsterdam be 17°C on June 15?",
+        )
+        state = _state(
+            current_max_f=58.0, forecast_peak_f=55.0,
+            solar_declining=True, metar_trend=-0.5, routine_count=5,
+        )
+        decision = _eval(state, mkt)
+        assert decision.side == "NO"
+        assert decision.branch == "range_undershoot"

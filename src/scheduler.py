@@ -1965,6 +1965,13 @@ async def job_fast_lock_poll() -> None:
                 for market in city_markets:
                     if market.id in _locked_markets_fired_today:
                         continue
+                    # Defense-in-depth mirror of the unified pipeline's
+                    # future-day filter. _market_daily_max also rejects the
+                    # strictly-future case via its utc_end <= utc_start
+                    # guard, but keeping the two job paths symmetric prevents
+                    # drift if _market_daily_max semantics ever change.
+                    if _should_skip_future_day(market, now_utc, station_icao=icao):
+                        continue
 
                     decision = evaluate_lock(state, market)
                     if decision.side is None or decision.direction is None:
