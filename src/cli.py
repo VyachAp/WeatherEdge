@@ -1675,7 +1675,24 @@ def bet_sell(
 @bet.command("redeem")
 @click.option("--all", "redeem_all", is_flag=True, help="Redeem all resolved positions.")
 @click.option("--yes", "-y", "skip_confirm", is_flag=True, help="Skip confirmation prompt.")
-def bet_redeem(redeem_all: bool, skip_confirm: bool) -> None:
+@click.option(
+    "--reconcile",
+    "reconcile_only",
+    is_flag=True,
+    help="Skip on-chain redemption; only stamp Trade.redeemed_at for WON trades whose tokens are already gone on-chain.",
+)
+@click.option(
+    "--full-scan",
+    "full_scan",
+    is_flag=True,
+    help="Discover positions by pulling the full CLOB trade history instead of querying the local Trade table. Slower; use as a safety net when local DB may have drifted from on-chain state.",
+)
+def bet_redeem(
+    redeem_all: bool,
+    skip_confirm: bool,
+    reconcile_only: bool,
+    full_scan: bool,
+) -> None:
     """Redeem winnings from resolved Polymarket positions on-chain."""
 
     async def _redeem() -> None:
@@ -1694,99 +1711,15 @@ def bet_redeem(redeem_all: bool, skip_confirm: bool) -> None:
             click.echo("Error: POLYMARKET_PRIVATE_KEY not set in .env")
             raise SystemExit(1)
 
-        if not redeem_all:
-            click.echo("Usage: bet redeem --all")
-            click.echo("  Redeems all resolved positions with non-zero on-chain balance.")
+        if not redeem_all and not reconcile_only:
+            click.echo("Usage: bet redeem --all  (or --reconcile)")
+            click.echo("  --all        Redeem all WON-unredeemed positions (DB-driven).")
+            click.echo("  --full-scan  Use full CLOB trade-history scan (slower; combine with --all).")
+            click.echo("  --reconcile  Stamp redeemed_at on WON trades whose tokens are already gone (no on-chain action).")
             raise SystemExit(1)
 
-        # --- Fetch positions from CLOB ---
-        click.echo("Connecting to Polymarket CLOB...")
-        client = get_clob_client()
-
-        click.echo("Fetching trade history...")
-        trades = get_trades_history(client)
-        if not trades:
-            click.echo("No trades found.")
-            return
-
-        positions = compute_positions(trades)
-        if not positions:
-            click.echo("No open positions found.")
-            return
-
-        click.echo(f"Found {len(positions)} position(s). Checking market resolution...")
-
-        # --- Resolve market info via CLOB API (reliable for neg-risk) ---
-        import httpx
-        import json as _json
-
-        redeemable: list[dict] = []
-
-        async with httpx.AsyncClient(timeout=15) as http:
-            # Group positions by condition_id (market) to avoid duplicate lookups
-            cond_to_assets: dict[str, list[tuple[str, dict]]] = {}
-            for asset_id, pos in positions.items():
-                cond = pos.get("market", "")
-                if not cond:
-                    continue
-                cond_to_assets.setdefault(cond, []).append((asset_id, pos))
-
-            for cond_id, assets in cond_to_assets.items():
-                # CLOB API reliably resolves markets by condition_id
-                mkt = None
-                try:
-                    resp = await http.get(
-                        f"https://clob.polymarket.com/markets/{cond_id}",
-                    )
-                    resp.raise_for_status()
-                    mkt = resp.json()
-                except Exception:
-                    pass
-
-                if not mkt:
-                    continue
-
-                # Check if market is closed/resolved
-                closed = mkt.get("closed") is True or str(mkt.get("closed", "")).lower() == "true"
-                if not closed:
-                    continue
-
-                condition_id = mkt.get("condition_id", "") or mkt.get("conditionId", "")
-                if not condition_id:
-                    continue
-
-                neg_risk = mkt.get("neg_risk") is True or str(mkt.get("neg_risk", "")).lower() == "true"
-
-                # Build token_id → outcome mapping from CLOB tokens array
-                tokens = mkt.get("tokens", [])
-                token_map: dict[str, str] = {}
-                clob_ids: list[str] = []
-                for tok in tokens:
-                    tid = tok.get("token_id", "")
-                    outcome = tok.get("outcome", "")
-                    if tid:
-                        token_map[tid] = outcome.upper()  # "Yes" → "YES"
-                        clob_ids.append(tid)
-
-                for asset_id, pos in assets:
-                    token_side = token_map.get(asset_id, "")
-
-                    redeemable.append({
-                        "asset_id": asset_id,
-                        "question": mkt.get("question", ""),
-                        "condition_id": condition_id,
-                        "token_side": token_side,
-                        "neg_risk": neg_risk,
-                        "clob_ids": clob_ids,
-                        "outcome_prices": [],
-                        "size": pos["size"],
-                    })
-
-        if not redeemable:
-            click.echo("No resolved positions found to redeem.")
-            return
-
-        # --- Web3 setup with RPC failover ---
+        # --- Web3 setup (lifted before CLOB fetch so --reconcile can run
+        # without needing CLOB trade history).
         from web3 import Web3
 
         NEG_RISK_ADAPTER_ADDRESS = "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296"
@@ -1812,9 +1745,6 @@ def bet_redeem(redeem_all: bool, skip_confirm: bool) -> None:
             raise SystemExit(1)
         click.echo(f"Connected to {rpc_url}")
 
-        # Mutable conn box: reconnect() rebuilds w3/ctf/neg_risk_adapter on
-        # the next available RPC so per-call retries can survive a dead
-        # endpoint without losing state.
         class _Conn:
             def __init__(self, w3, ctf, address, rpc_url):
                 self.w3 = w3
@@ -1844,6 +1774,373 @@ def bet_redeem(redeem_all: bool, skip_confirm: bool) -> None:
                 click.echo(f"  RPC switch: {old_url} → {new_url}{why}")
 
         conn = _Conn(w3, ctf, address, rpc_url)
+
+        # --- Reconcile helper: stamp redeemed_at on WON trades whose
+        # conditional tokens are already gone on-chain. Catches positions
+        # redeemed via the Polymarket UI, redeemed before this stamping
+        # logic existed, or that have fallen out of the CLOB trade-history
+        # window. Looked-up token_ids are also persisted back so subsequent
+        # runs avoid re-fetching from Gamma.
+        async def _reconcile_won() -> int:
+            from sqlalchemy import select as _select
+            from src.db.engine import async_session
+            from src.db.models import (
+                Trade as TradeModel,
+                TradeStatus as TradeStatusEnum,
+                TradeDirection,
+            )
+            from src.execution.polymarket_client import get_token_ids
+
+            async with async_session() as session:
+                rows = (
+                    await session.execute(
+                        _select(
+                            TradeModel.id,
+                            TradeModel.market_id,
+                            TradeModel.token_id,
+                            TradeModel.direction,
+                        ).where(
+                            TradeModel.status == TradeStatusEnum.WON,
+                            TradeModel.redeemed_at.is_(None),
+                        )
+                    )
+                ).all()
+
+                if not rows:
+                    click.echo("Reconcile: no WON-unredeemed trades.")
+                    return 0
+
+                click.echo(f"Reconcile: checking {len(rows)} WON-unredeemed trade(s)...")
+
+                # Cache Gamma lookups across trades sharing a market_id.
+                token_id_cache: dict[str, tuple[str, str] | None] = {}
+                stamped_trade_ids: list[int] = []
+                resolved_token_ids: dict[int, str] = {}
+                unresolved = 0
+                error_count = 0
+
+                for trade_id, market_id, token_id, direction in rows:
+                    if not token_id:
+                        if market_id not in token_id_cache:
+                            try:
+                                token_id_cache[market_id] = await get_token_ids(market_id)
+                            except Exception as exc:
+                                click.echo(f"  trade {trade_id}: token lookup failed ({exc})")
+                                token_id_cache[market_id] = None
+                        pair = token_id_cache[market_id]
+                        if pair is None:
+                            unresolved += 1
+                            continue
+                        yes_tok, no_tok = pair
+                        token_id = (
+                            yes_tok if direction == TradeDirection.BUY_YES else no_tok
+                        )
+                        resolved_token_ids[trade_id] = token_id
+
+                    try:
+                        asset_id_int = int(token_id)
+                    except (TypeError, ValueError):
+                        click.echo(f"  trade {trade_id}: invalid token_id {token_id!r}")
+                        unresolved += 1
+                        continue
+
+                    def _check_balance(aid: int = asset_id_int) -> int:
+                        return conn.ctf.functions.balanceOf(conn.address, aid).call()
+
+                    try:
+                        bal = rpc_call_with_retry(
+                            _check_balance, on_transient=conn.reconnect
+                        )
+                    except Exception as exc:
+                        error_count += 1
+                        click.echo(f"  trade {trade_id}: balance check failed ({exc})")
+                        continue
+
+                    if bal == 0:
+                        stamped_trade_ids.append(trade_id)
+
+                if resolved_token_ids:
+                    from sqlalchemy import update as _update
+
+                    for tid, tok in resolved_token_ids.items():
+                        await session.execute(
+                            _update(TradeModel)
+                            .where(TradeModel.id == tid)
+                            .values(token_id=tok)
+                        )
+
+                if stamped_trade_ids:
+                    from sqlalchemy import update as _update
+
+                    await session.execute(
+                        _update(TradeModel)
+                        .where(TradeModel.id.in_(stamped_trade_ids))
+                        .values(redeemed_at=datetime.now(timezone.utc))
+                    )
+
+                await session.commit()
+
+                click.echo(
+                    f"Reconcile: stamped {len(stamped_trade_ids)} trade(s); "
+                    f"unresolved {unresolved}, errors {error_count}"
+                )
+                return len(stamped_trade_ids)
+
+        if reconcile_only:
+            await _reconcile_won()
+            return
+
+        # --- DB-driven position discovery: query WON-unredeemed trades.
+        # `resolve_trades` sets status=WON at the moment of resolution, so
+        # `(status=WON AND redeemed_at IS NULL)` is the redeemability set.
+        # Avoids paginating the entire CLOB trade history every call. The
+        # legacy full-history scan is still available via --full-scan as a
+        # safety net for cases where local DB has drifted from on-chain
+        # state.
+        async def _build_redeemable_from_db() -> list[dict]:
+            from sqlalchemy import select as _select, update as _update
+            from src.db.engine import async_session
+            from src.db.models import (
+                Trade as TradeModel,
+                TradeStatus as TradeStatusEnum,
+                TradeDirection,
+            )
+            from src.execution.polymarket_client import get_token_ids
+            import httpx as _httpx
+
+            async with async_session() as session:
+                rows = (
+                    await session.execute(
+                        _select(
+                            TradeModel.market_id,
+                            TradeModel.direction,
+                            TradeModel.token_id,
+                        ).where(
+                            TradeModel.status == TradeStatusEnum.WON,
+                            TradeModel.redeemed_at.is_(None),
+                        )
+                    )
+                ).all()
+
+                if not rows:
+                    click.echo("No WON-unredeemed trades in DB.")
+                    return []
+
+                # Collapse to one entry per (market_id, direction) — multiple
+                # trades on the same side share a token, and one
+                # redeemPositions call clears them all. Prefer any
+                # already-populated token_id.
+                groups: dict[tuple[str, TradeDirection], str | None] = {}
+                for market_id, direction, token_id in rows:
+                    key = (market_id, direction)
+                    if key not in groups:
+                        groups[key] = token_id
+                    elif groups[key] is None and token_id:
+                        groups[key] = token_id
+
+                click.echo(
+                    f"Found {len(groups)} WON-unredeemed (market, direction) group(s)."
+                )
+
+                # Resolve missing token_ids via Gamma, persist back so future
+                # runs skip the hop. Same shape as _reconcile_won's lookup.
+                token_id_cache: dict[str, tuple[str, str] | None] = {}
+                resolved_back: list[tuple[str, TradeDirection, str]] = []
+                for (market_id, direction), token_id in list(groups.items()):
+                    if token_id:
+                        continue
+                    if market_id not in token_id_cache:
+                        try:
+                            token_id_cache[market_id] = await get_token_ids(market_id)
+                        except Exception as exc:
+                            click.echo(
+                                f"  market {market_id}: token lookup failed ({exc})"
+                            )
+                            token_id_cache[market_id] = None
+                    pair = token_id_cache[market_id]
+                    if pair is None:
+                        continue
+                    yes_tok, no_tok = pair
+                    final = (
+                        yes_tok if direction == TradeDirection.BUY_YES else no_tok
+                    )
+                    groups[(market_id, direction)] = final
+                    resolved_back.append((market_id, direction, final))
+
+                if resolved_back:
+                    for mid, direction, tok in resolved_back:
+                        await session.execute(
+                            _update(TradeModel)
+                            .where(
+                                TradeModel.market_id == mid,
+                                TradeModel.direction == direction,
+                                TradeModel.token_id.is_(None),
+                            )
+                            .values(token_id=tok)
+                        )
+                    await session.commit()
+
+            # --- Per-market metadata fetch (neg_risk + clob token pair).
+            # Bounded by the WON-unredeemed market count, not lifetime
+            # history. The redemption loop still keys index_sets/amounts
+            # off the clob_ids array so we keep this shape stable.
+            unique_market_ids = {
+                m for (m, _), tok in groups.items() if tok
+            }
+            market_meta: dict[str, dict] = {}
+            async with _httpx.AsyncClient(timeout=15) as http:
+                for cond_id in unique_market_ids:
+                    try:
+                        resp = await http.get(
+                            f"https://clob.polymarket.com/markets/{cond_id}",
+                        )
+                        resp.raise_for_status()
+                        market_meta[cond_id] = resp.json()
+                    except Exception as exc:
+                        click.echo(
+                            f"  market {cond_id}: metadata fetch failed ({exc})"
+                        )
+
+            redeemable: list[dict] = []
+            for (market_id, direction), token_id in groups.items():
+                if not token_id:
+                    continue
+                mkt = market_meta.get(market_id)
+                if not mkt:
+                    continue
+                condition_id = (
+                    mkt.get("condition_id", "")
+                    or mkt.get("conditionId", "")
+                    or market_id
+                )
+                if not condition_id:
+                    continue
+                # status=WON already implies resolved; treat closed=false
+                # as a soft signal but still allow the redemption attempt
+                # — the on-chain balanceOf check is authoritative.
+                closed = (
+                    mkt.get("closed") is True
+                    or str(mkt.get("closed", "")).lower() == "true"
+                )
+                if not closed:
+                    click.echo(
+                        f"  market {condition_id}: CLOB reports not closed; "
+                        f"proceeding anyway (status=WON locally)"
+                    )
+                neg_risk = (
+                    mkt.get("neg_risk") is True
+                    or str(mkt.get("neg_risk", "")).lower() == "true"
+                )
+                tokens = mkt.get("tokens", [])
+                clob_ids: list[str] = [
+                    t.get("token_id", "")
+                    for t in tokens
+                    if t.get("token_id")
+                ]
+                token_side = (
+                    "YES" if direction == TradeDirection.BUY_YES else "NO"
+                )
+                redeemable.append(
+                    {
+                        "asset_id": token_id,
+                        "question": mkt.get("question", ""),
+                        "condition_id": condition_id,
+                        "token_side": token_side,
+                        "neg_risk": neg_risk,
+                        "clob_ids": clob_ids,
+                        "outcome_prices": [],
+                        "size": 0,
+                    }
+                )
+            return redeemable
+
+        if full_scan:
+            # --- Legacy: fetch positions from CLOB trade history ---
+            click.echo("\nConnecting to Polymarket CLOB (full-scan)...")
+            client = get_clob_client()
+
+            click.echo("Fetching trade history...")
+            trades = get_trades_history(client)
+            if not trades:
+                click.echo("No trades found.")
+                await _reconcile_won()
+                return
+
+            positions = compute_positions(trades)
+            if not positions:
+                click.echo("No open positions found.")
+                await _reconcile_won()
+                return
+
+            click.echo(
+                f"Found {len(positions)} position(s). Checking market resolution..."
+            )
+
+            import httpx
+
+            redeemable: list[dict] = []
+
+            async with httpx.AsyncClient(timeout=15) as http:
+                cond_to_assets: dict[str, list[tuple[str, dict]]] = {}
+                for asset_id, pos in positions.items():
+                    cond = pos.get("market", "")
+                    if not cond:
+                        continue
+                    cond_to_assets.setdefault(cond, []).append((asset_id, pos))
+
+                for cond_id, assets in cond_to_assets.items():
+                    mkt = None
+                    try:
+                        resp = await http.get(
+                            f"https://clob.polymarket.com/markets/{cond_id}",
+                        )
+                        resp.raise_for_status()
+                        mkt = resp.json()
+                    except Exception:
+                        pass
+
+                    if not mkt:
+                        continue
+
+                    closed = mkt.get("closed") is True or str(mkt.get("closed", "")).lower() == "true"
+                    if not closed:
+                        continue
+
+                    condition_id = mkt.get("condition_id", "") or mkt.get("conditionId", "")
+                    if not condition_id:
+                        continue
+
+                    neg_risk = mkt.get("neg_risk") is True or str(mkt.get("neg_risk", "")).lower() == "true"
+
+                    tokens = mkt.get("tokens", [])
+                    token_map: dict[str, str] = {}
+                    clob_ids: list[str] = []
+                    for tok in tokens:
+                        tid = tok.get("token_id", "")
+                        outcome = tok.get("outcome", "")
+                        if tid:
+                            token_map[tid] = outcome.upper()
+                            clob_ids.append(tid)
+
+                    for asset_id, pos in assets:
+                        token_side = token_map.get(asset_id, "")
+                        redeemable.append({
+                            "asset_id": asset_id,
+                            "question": mkt.get("question", ""),
+                            "condition_id": condition_id,
+                            "token_side": token_side,
+                            "neg_risk": neg_risk,
+                            "clob_ids": clob_ids,
+                            "outcome_prices": [],
+                            "size": pos["size"],
+                        })
+        else:
+            redeemable = await _build_redeemable_from_db()
+
+        if not redeemable:
+            click.echo("No resolved positions found to redeem.")
+            await _reconcile_won()
+            return
 
         bal = rpc_call_with_retry(
             lambda: conn.w3.eth.get_balance(conn.address),
@@ -1884,6 +2181,7 @@ def bet_redeem(redeem_all: bool, skip_confirm: bool) -> None:
 
         if not to_redeem:
             click.echo("\nNo positions with non-zero on-chain balance to redeem.")
+            await _reconcile_won()
             return
 
         # --- Display redeemable positions ---
@@ -2105,6 +2403,11 @@ def bet_redeem(redeem_all: bool, skip_confirm: bool) -> None:
                 await session.commit()
                 if stamped.rowcount:
                     click.echo(f"  Stamped redeemed_at on {stamped.rowcount} local trade row(s)")
+
+        # --- Reconcile any straggler WON-unredeemed trades whose tokens
+        # are already gone (redeemed via UI, redeemed before this stamping
+        # logic existed, or out of CLOB trade-history window).
+        await _reconcile_won()
 
         # --- Final balance ---
         click.echo(f"\n=== Results ===")
