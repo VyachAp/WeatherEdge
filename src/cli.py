@@ -1267,6 +1267,114 @@ def bet_orders(max_orders: int) -> None:
     asyncio.run(_orders())
 
 
+async def _load_active_positions_from_db(
+    *,
+    include_settled: bool = False,
+) -> tuple[list[tuple[str, dict]], dict[str, dict]]:
+    """DB-driven counterpart to ``_load_active_positions``.
+
+    Queries the local ``trades`` table for OPEN + WON-unredeemed rows
+    (and additionally WON-redeemed + LOST when ``include_settled=True``),
+    eager-loads ``Market``, and synthesises position dicts in the same
+    shape the portfolio renderer expects from the CLOB-history helper.
+
+    Fast path — no CLOB trade-history pagination, no per-condition
+    ``/markets/{cid}`` round-trip. Trade rows with a NULL ``token_id``
+    are skipped since they can't be matched to a CLOB asset; reach for
+    ``--full-scan`` if you need to surface those.
+    """
+    from sqlalchemy import or_, select
+    from sqlalchemy.orm import selectinload
+
+    from src.db.engine import async_session
+    from src.db.models import (
+        Trade as TradeModel,
+        TradeDirection,
+        TradeStatus as TradeStatusEnum,
+    )
+
+    async with async_session() as session:
+        active_clause = TradeModel.status == TradeStatusEnum.OPEN
+        won_unredeemed_clause = (
+            (TradeModel.status == TradeStatusEnum.WON)
+            & TradeModel.redeemed_at.is_(None)
+        )
+        clauses = [active_clause, won_unredeemed_clause]
+        if include_settled:
+            clauses.append(
+                (TradeModel.status == TradeStatusEnum.WON)
+                & TradeModel.redeemed_at.is_not(None)
+            )
+            clauses.append(TradeModel.status == TradeStatusEnum.LOST)
+        stmt = (
+            select(TradeModel)
+            .where(or_(*clauses))
+            .options(selectinload(TradeModel.market))
+        )
+        rows = (await session.execute(stmt)).scalars().all()
+
+    positions: dict[str, dict] = {}
+    token_to_market: dict[str, dict] = {}
+
+    for t in rows:
+        token_id = t.token_id
+        if not token_id:
+            continue
+
+        fill_price_eff = t.fill_price if t.fill_price else t.entry_price
+        if not fill_price_eff or fill_price_eff <= 0:
+            continue
+
+        size = t.filled_size or 0.0
+        if size <= 0 and t.stake_usd:
+            size = t.stake_usd / fill_price_eff
+        if size <= 0:
+            continue
+        cost = size * fill_price_eff
+
+        pos = positions.setdefault(
+            token_id,
+            {
+                "asset_id": token_id,
+                "size": 0.0,
+                "cost": 0.0,
+                "side": "LONG",
+                "market": "",
+                "_statuses": set(),
+            },
+        )
+        pos["size"] += size
+        pos["cost"] += cost
+        pos["_statuses"].add(
+            t.status.value if hasattr(t.status, "value") else str(t.status)
+        )
+
+        if token_id not in token_to_market and t.market is not None:
+            mkt = t.market
+            outcome = (
+                "Yes" if t.direction == TradeDirection.BUY_YES else "No"
+            )
+            token_to_market[token_id] = {
+                "question": mkt.question or "",
+                "slug": mkt.slug or "",
+                "tokens": [{"token_id": token_id, "outcome": outcome}],
+                "current_yes_price": mkt.current_yes_price,
+                "_db_direction": (
+                    "BUY_YES"
+                    if t.direction == TradeDirection.BUY_YES
+                    else "BUY_NO"
+                ),
+            }
+
+    for pos in positions.values():
+        pos["avg_price"] = (
+            pos["cost"] / pos["size"] if pos["size"] else 0.0
+        )
+
+    ordered = sorted(positions.items(), key=lambda kv: kv[0])
+    return ordered, token_to_market
+
+
 async def _load_active_positions(
     *,
     show_all: bool = False,
@@ -1367,10 +1475,22 @@ def _resolve_position_target(
 
 
 @bet.command("portfolio")
-@click.option("--all", "show_all", is_flag=True, help="Show all positions ever held (including redeemed).")
-@click.option("--history", is_flag=True, help="Show full trade history instead of positions.")
-def bet_portfolio(show_all: bool, history: bool) -> None:
+@click.option("--all", "show_all", is_flag=True, help="Include settled positions (WON-redeemed + LOST) alongside active ones.")
+@click.option("--history", is_flag=True, help="Show full trade history instead of positions (uses CLOB).")
+@click.option(
+    "--full-scan",
+    "full_scan",
+    is_flag=True,
+    help="Discover positions by paginating the entire CLOB trade history instead of querying the local Trade table. Slower; use as a safety net when local DB may have drifted from on-chain state.",
+)
+def bet_portfolio(show_all: bool, history: bool, full_scan: bool) -> None:
     """Show open positions and P&L from your Polymarket trades.
+
+    Default path is DB-driven: queries the local ``trades`` table for
+    OPEN + WON-unredeemed rows and fetches live prices in parallel from
+    the CLOB orderbook. Pass ``--full-scan`` to fall back to the legacy
+    CLOB-trade-history walk (slower; surfaces positions taken outside
+    the bot).
 
     Each active position is printed with an ``[#N]`` index and an 8-char
     asset_id prefix; either form can be passed to ``bet sell``.
@@ -1384,6 +1504,7 @@ def bet_portfolio(show_all: bool, history: bool) -> None:
             get_trades_history,
             get_usdc_balance,
         )
+        from src.execution.polymarket_client import get_best_bid_ask
 
         if not settings.POLYMARKET_PRIVATE_KEY:
             click.echo("Error: POLYMARKET_PRIVATE_KEY not set in .env")
@@ -1417,15 +1538,15 @@ def bet_portfolio(show_all: bool, history: bool) -> None:
         else:
             click.echo("  No open orders.")
 
-        # --- Trade history & positions ---
-        click.echo("\nFetching trade history...")
-        trades = get_trades_history(client)
-
-        if not trades:
-            click.echo("\n  No trades found.")
-            return
-
         if history:
+            # History view still walks the CLOB trade-match feed — DB
+            # only records bot-initiated trades, so a full audit needs
+            # the on-chain stream.
+            click.echo("\nFetching trade history (CLOB)...")
+            trades = get_trades_history(client)
+            if not trades:
+                click.echo("\n  No trades found.")
+                return
             # Resolve market questions for all unique asset_ids
             import httpx
             asset_ids = {t.get("asset_id", "") for t in trades}
@@ -1461,19 +1582,49 @@ def bet_portfolio(show_all: bool, history: bool) -> None:
             return
 
         # --- Positions ---
-        ordered, token_to_market, _ = await _load_active_positions(show_all=show_all)
+        if full_scan:
+            click.echo("\nLoading positions (CLOB full scan)...")
+            ordered, token_to_market, _ = await _load_active_positions(
+                show_all=show_all
+            )
+            source_label = "CLOB"
+        else:
+            click.echo("\nLoading positions (DB)...")
+            ordered, token_to_market = await _load_active_positions_from_db(
+                include_settled=show_all
+            )
+            source_label = "DB"
 
         if not ordered:
             click.echo("\n=== Positions (0) ===")
-            click.echo(
-                "  No active or unredeemed positions."
-                + ("" if show_all else " Use --all to include redeemed positions.")
-            )
+            hint = ""
+            if not full_scan:
+                hint += " Try --full-scan to walk CLOB trade history."
+            if not show_all:
+                hint += " Use --all to include settled positions."
+            click.echo("  No active or unredeemed positions." + hint)
             return
 
         mode_label = "all-time" if show_all else "active+unredeemed"
-        click.echo(f"\n=== Positions ({len(ordered)}) [{mode_label}] ===")
+        click.echo(
+            f"\n=== Positions ({len(ordered)}) [{mode_label}] [{source_label}] ==="
+        )
         click.echo("  Reference each position by [#N] or its 8-char ID prefix in `bet sell`.")
+
+        # Fetch live best-bid/ask for every position in parallel — turns
+        # the prior per-position sequential round-trips into a single
+        # gather. Each call still hits the 30 s orderbook cache in
+        # polymarket_client, so back-to-back invocations are warm.
+        async def _quote(aid: str) -> tuple[str, tuple[float, float] | None]:
+            try:
+                return aid, await asyncio.to_thread(get_best_bid_ask, aid)
+            except Exception:
+                return aid, None
+
+        quote_results = await asyncio.gather(
+            *(_quote(aid) for aid, _ in ordered)
+        )
+        quotes: dict[str, tuple[float, float] | None] = dict(quote_results)
 
         total_cost = 0.0
         total_value = 0.0
@@ -1495,15 +1646,33 @@ def bet_portfolio(show_all: bool, history: bool) -> None:
                         token_side = (tok.get("outcome") or "").upper()
                         break
 
-            current_price = None
-            try:
-                last = client.get_last_trade_price(asset_id)
-                if last and last.get("price"):
-                    current_price = float(last["price"])
-            except Exception:
-                pass
+            current_price: float | None = None
+            quote = quotes.get(asset_id)
+            if quote is not None:
+                bid, ask = quote
+                current_price = (bid + ask) / 2
+            elif mkt and mkt.get("current_yes_price") is not None:
+                # DB fallback: Market.current_yes_price is the YES mid
+                # at last ingest — invert for BUY_NO holders.
+                yes_p = float(mkt["current_yes_price"])
+                current_price = (
+                    1.0 - yes_p
+                    if mkt.get("_db_direction") == "BUY_NO"
+                    else yes_p
+                )
 
-            current_value = abs(size) * current_price if current_price else None
+            # Resolved markets have no live orderbook; fall back to the
+            # known payout when we know the trade settled (DB path only).
+            statuses = pos.get("_statuses") if isinstance(pos, dict) else None
+            if current_price is None and statuses:
+                if "won" in statuses:
+                    current_price = 1.0
+                elif "lost" in statuses:
+                    current_price = 0.0
+
+            current_value = (
+                abs(size) * current_price if current_price is not None else None
+            )
             if current_value is not None:
                 total_value += current_value
                 pnl = current_value - cost
@@ -1518,7 +1687,13 @@ def bet_portfolio(show_all: bool, history: bool) -> None:
             else:
                 click.echo(f"\n  {header_id}  Token: {asset_id[:20]}...")
             side_label = f"LONG {token_side}" if token_side else pos["side"]
-            click.echo(f"    Side:      {side_label}")
+            status_tag = ""
+            if statuses:
+                if "won" in statuses and "open" not in statuses:
+                    status_tag = "  [WON-unredeemed]"
+                elif "lost" in statuses and "open" not in statuses:
+                    status_tag = "  [LOST]"
+            click.echo(f"    Side:      {side_label}{status_tag}")
             click.echo(f"    Size:      {abs(size):.2f} shares")
             click.echo(f"    Avg entry: ${avg_price:.4f}")
             click.echo(f"    Cost:      ${cost:.2f}")
@@ -1982,23 +2157,57 @@ def bet_redeem(
 
             # --- Per-market metadata fetch (neg_risk + clob token pair).
             # Bounded by the WON-unredeemed market count, not lifetime
-            # history. The redemption loop still keys index_sets/amounts
-            # off the clob_ids array so we keep this shape stable.
+            # history. `Market.id` stores the Gamma integer id, so we hit
+            # Gamma (CLOB's /markets/{id} expects a hex condition_id and
+            # 404s on integers). Normalise the Gamma payload into the
+            # shape the redemption loop already consumes: synthesise a
+            # `tokens` list from `clobTokenIds` and map `negRisk`/
+            # `conditionId` onto snake_case keys.
             unique_market_ids = {
                 m for (m, _), tok in groups.items() if tok
             }
             market_meta: dict[str, dict] = {}
             async with _httpx.AsyncClient(timeout=15) as http:
-                for cond_id in unique_market_ids:
+                for mid in unique_market_ids:
                     try:
                         resp = await http.get(
-                            f"https://clob.polymarket.com/markets/{cond_id}",
+                            "https://gamma-api.polymarket.com/markets",
+                            params={"id": mid},
                         )
                         resp.raise_for_status()
-                        market_meta[cond_id] = resp.json()
+                        payload = resp.json()
+                        if isinstance(payload, list):
+                            if not payload:
+                                raise RuntimeError("empty gamma response")
+                            raw = payload[0]
+                        else:
+                            raw = payload
+
+                        clob_token_ids = raw.get("clobTokenIds", [])
+                        if isinstance(clob_token_ids, str):
+                            try:
+                                clob_token_ids = json.loads(clob_token_ids)
+                            except (ValueError, TypeError):
+                                clob_token_ids = []
+                        tokens = [
+                            {"token_id": str(t)}
+                            for t in clob_token_ids
+                            if t
+                        ]
+
+                        market_meta[mid] = {
+                            "question": raw.get("question", ""),
+                            "condition_id": raw.get("conditionId", "")
+                            or raw.get("condition_id", ""),
+                            "closed": raw.get("closed"),
+                            "neg_risk": raw.get("negRisk")
+                            if raw.get("negRisk") is not None
+                            else raw.get("neg_risk"),
+                            "tokens": tokens,
+                        }
                     except Exception as exc:
                         click.echo(
-                            f"  market {cond_id}: metadata fetch failed ({exc})"
+                            f"  market {mid}: metadata fetch failed ({exc})"
                         )
 
             redeemable: list[dict] = []
