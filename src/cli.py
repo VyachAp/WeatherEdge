@@ -2157,15 +2157,20 @@ def bet_redeem(
                         )
                     await session.commit()
 
-            # --- Per-market metadata: DB-first, with token-id fallback.
+            # --- Per-market metadata: DB-first, with data-api fallback.
             # Gamma's `GET /markets?id=<market_id>` drops resolved
             # markets and returns [], so we cache `condition_id` /
             # `neg_risk` / `clob_token_ids` on the `markets` row at scan
             # time (see `ingest_markets`). Redemption reads from there.
-            # For legacy rows where those columns are NULL we attempt
-            # one fallback fetch keyed by `clob_token_ids=<token_id>`,
-            # which often succeeds when the `id` lookup doesn't, and
-            # persist the result back so subsequent runs hit DB only.
+            # For legacy rows where those columns are NULL (markets
+            # resolved before that caching shipped) we hit
+            # data-api.polymarket.com/positions — one bulk call keyed
+            # by our wallet returns every on-chain position with
+            # `asset` (= token_id), `conditionId`, and `negativeRisk`,
+            # including resolved-but-unredeemed. CLOB
+            # `/markets/<conditionId>` then fills the sibling token_id
+            # for `clob_token_ids`. Result persisted back so subsequent
+            # runs hit DB only.
             unique_market_ids = {
                 m for (m, _), tok in groups.items() if tok
             }
@@ -2216,10 +2221,6 @@ def bet_redeem(
                     else:
                         missing_meta_ids.append(mid)
 
-                # Fallback for rows with no cached metadata (legacy
-                # markets that resolved before this caching existed).
-                # Use any token_id we already have to look the market
-                # up by `clob_token_ids` instead of `id`.
                 refreshed: list[tuple[str, str, bool, list[str]]] = []
                 if missing_meta_ids:
                     tok_for_mid: dict[str, str] = {}
@@ -2231,7 +2232,125 @@ def bet_redeem(
                         ):
                             tok_for_mid[g_mid] = g_tok
 
-                    async with _httpx.AsyncClient(timeout=15) as http:
+                    # Derive the funder address that holds the
+                    # positions (proxy/safe if set, else EOA). Matches
+                    # the pattern in src/bet_helpers.py:202.
+                    funder_addr: str | None = None
+                    if settings.POLYMARKET_PRIVATE_KEY:
+                        try:
+                            from eth_account import Account as _Account
+
+                            _acct = _Account.from_key(
+                                settings.POLYMARKET_PRIVATE_KEY
+                            )
+                            funder_addr = (
+                                settings.POLYMARKET_FUNDER_ADDRESS
+                                or _acct.address
+                            )
+                        except Exception as exc:
+                            click.echo(
+                                f"  warning: could not derive funder "
+                                f"address ({exc})"
+                            )
+
+                    # token_id -> {conditionId, negativeRisk}
+                    asset_to_meta: dict[str, dict] = {}
+                    # conditionId -> list of token_ids we own
+                    cond_to_assets: dict[str, list[str]] = {}
+
+                    async with _httpx.AsyncClient(timeout=20) as http:
+                        if funder_addr:
+                            try:
+                                resp = await http.get(
+                                    "https://data-api.polymarket.com/positions",
+                                    params={
+                                        "user": funder_addr,
+                                        "sizeThreshold": "0",
+                                        "limit": "500",
+                                    },
+                                )
+                                resp.raise_for_status()
+                                positions_payload = resp.json()
+                                if isinstance(positions_payload, list):
+                                    for p in positions_payload:
+                                        asset = str(p.get("asset", ""))
+                                        cond = str(p.get("conditionId", ""))
+                                        if not asset or not cond:
+                                            continue
+                                        asset_to_meta[asset] = {
+                                            "conditionId": cond,
+                                            "negativeRisk": bool(
+                                                p.get("negativeRisk", False)
+                                            ),
+                                            "question": p.get("title", "")
+                                            or p.get("eventTitle", ""),
+                                        }
+                                        cond_to_assets.setdefault(
+                                            cond, []
+                                        ).append(asset)
+                            except Exception as exc:
+                                click.echo(
+                                    f"  warning: data-api positions lookup "
+                                    f"failed ({exc})"
+                                )
+
+                        # Sibling-token cache keyed by conditionId.
+                        sibling_cache: dict[str, list[str]] = {}
+
+                        async def _full_token_pair(
+                            cond_id: str, known_tok: str
+                        ) -> list[str]:
+                            """Return [yes_tok, no_tok] for cond_id.
+
+                            Prefer the data-api response (free when we
+                            own both sides); fall back to one CLOB
+                            call. Order in the returned list mirrors
+                            what _market_to_row would persist — we
+                            don't try to assert YES-first because the
+                            actual redeemPositions call uses
+                            condition_id + indexSet, not token order.
+                            """
+                            if cond_id in sibling_cache:
+                                return sibling_cache[cond_id]
+                            owned = cond_to_assets.get(cond_id, [])
+                            owned = [str(t) for t in owned if t]
+                            if len(owned) >= 2:
+                                # Dedupe preserving order.
+                                seen: set[str] = set()
+                                pair: list[str] = []
+                                for t in owned:
+                                    if t in seen:
+                                        continue
+                                    seen.add(t)
+                                    pair.append(t)
+                                    if len(pair) == 2:
+                                        break
+                                if len(pair) == 2:
+                                    sibling_cache[cond_id] = pair
+                                    return pair
+                            try:
+                                r = await http.get(
+                                    f"https://clob.polymarket.com/markets/{cond_id}"
+                                )
+                                r.raise_for_status()
+                                raw = r.json()
+                                toks = raw.get("tokens") or []
+                                tok_ids = [
+                                    str(t.get("token_id", ""))
+                                    for t in toks
+                                    if t.get("token_id")
+                                ]
+                                if len(tok_ids) >= 2:
+                                    sibling_cache[cond_id] = tok_ids[:2]
+                                    return tok_ids[:2]
+                            except Exception as exc:
+                                click.echo(
+                                    f"  warning: CLOB sibling lookup for "
+                                    f"{cond_id} failed ({exc})"
+                                )
+                            sibling_cache[cond_id] = [known_tok]
+                            return [known_tok]
+
                         for mid in missing_meta_ids:
                             fallback_tok = tok_for_mid.get(mid)
                             if not fallback_tok:
@@ -2240,63 +2359,41 @@ def bet_redeem(
                                     f"unavailable (no token_id to fall back on)"
                                 )
                                 continue
-                            try:
-                                resp = await http.get(
-                                    "https://gamma-api.polymarket.com/markets",
-                                    params={"clob_token_ids": fallback_tok},
-                                )
-                                resp.raise_for_status()
-                                payload = resp.json()
-                                if isinstance(payload, list):
-                                    if not payload:
-                                        raise RuntimeError("empty gamma response")
-                                    raw = payload[0]
-                                else:
-                                    raw = payload
-
-                                clob_token_ids = raw.get("clobTokenIds", [])
-                                if isinstance(clob_token_ids, str):
-                                    try:
-                                        clob_token_ids = _json.loads(clob_token_ids)
-                                    except (ValueError, TypeError):
-                                        clob_token_ids = []
-                                clob_token_ids = [
-                                    str(t) for t in clob_token_ids if t
-                                ]
-                                cond_id = (
-                                    raw.get("conditionId", "")
-                                    or raw.get("condition_id", "")
-                                )
-                                if not cond_id or len(clob_token_ids) < 2:
-                                    click.echo(
-                                        f"  market {mid}: redemption metadata "
-                                        f"unavailable (resolved before metadata caching)"
-                                    )
-                                    continue
-                                neg_risk_raw = raw.get("negRisk")
-                                if neg_risk_raw is None:
-                                    neg_risk_raw = raw.get("neg_risk")
-                                neg_risk = bool(neg_risk_raw) if isinstance(
-                                    neg_risk_raw, bool
-                                ) else str(neg_risk_raw).strip().lower() == "true"
-
-                                market_meta[mid] = {
-                                    "question": raw.get("question", ""),
-                                    "condition_id": cond_id,
-                                    "closed": raw.get("closed"),
-                                    "neg_risk": neg_risk,
-                                    "tokens": [
-                                        {"token_id": t} for t in clob_token_ids
-                                    ],
-                                }
-                                refreshed.append(
-                                    (mid, cond_id, neg_risk, clob_token_ids)
-                                )
-                            except Exception as exc:
+                            meta = asset_to_meta.get(fallback_tok)
+                            if not meta:
                                 click.echo(
                                     f"  market {mid}: redemption metadata "
-                                    f"unavailable ({exc})"
+                                    f"unavailable (no position found at "
+                                    f"data-api for token {fallback_tok})"
                                 )
+                                continue
+                            cond_id = meta["conditionId"]
+                            neg_risk = bool(meta["negativeRisk"])
+                            pair = await _full_token_pair(
+                                cond_id, fallback_tok
+                            )
+                            if len(pair) < 2:
+                                click.echo(
+                                    f"  market {mid}: redemption metadata "
+                                    f"unavailable (could not resolve sibling "
+                                    f"token for condition {cond_id})"
+                                )
+                                continue
+                            market_meta[mid] = {
+                                "question": meta.get("question", "")
+                                or (cached_by_id.get(mid) or {}).get(
+                                    "question", ""
+                                ),
+                                "condition_id": cond_id,
+                                "closed": True,
+                                "neg_risk": neg_risk,
+                                "tokens": [
+                                    {"token_id": t} for t in pair
+                                ],
+                            }
+                            refreshed.append(
+                                (mid, cond_id, neg_risk, pair)
+                            )
 
                 if refreshed:
                     for mid, cond_id, neg_risk, clob_ids in refreshed:
