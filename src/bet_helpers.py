@@ -382,10 +382,15 @@ def get_clob_client():
     Only requires POLYMARKET_PRIVATE_KEY (AUTO_EXECUTE is irrelevant).
     Honours POLYMARKET_SIGNATURE_TYPE / POLYMARKET_FUNDER_ADDRESS for
     UI-onboarded wallets.
-    """
-    from src.execution.polymarket_client import build_clob_client
 
-    client = build_clob_client()
+    Delegates to ``polymarket_client``'s singleton so the CLI never
+    holds two separate clients — one built here, one lazy-built for
+    ``get_best_bid_ask`` — each independently authenticating against
+    ``/auth/api-key``.
+    """
+    from src.execution import polymarket_client as pmc
+
+    client = pmc._get_client()
     if client is None:
         raise RuntimeError("POLYMARKET_PRIVATE_KEY is not set")
     return client

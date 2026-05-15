@@ -522,6 +522,26 @@ async def fetch_weather_markets(client: httpx.AsyncClient | None = None) -> list
 # ---------------------------------------------------------------------------
 
 
+def _parse_clob_token_ids(raw: Any) -> list[str] | None:
+    """Normalise Gamma's `clobTokenIds` field to a plain list of strings.
+
+    Gamma sometimes returns the list as a JSON-encoded string; accept
+    both shapes. Returns None when no usable pair is present.
+    """
+    val = raw
+    if isinstance(val, str):
+        try:
+            val = json.loads(val)
+        except (json.JSONDecodeError, TypeError):
+            return None
+    if not isinstance(val, list):
+        return None
+    cleaned = [str(t) for t in val if t]
+    if len(cleaned) < 2:
+        return None
+    return cleaned
+
+
 def _market_to_row(raw: dict[str, Any], parsed: ParsedQuestion, now: datetime) -> dict[str, Any]:
     outcomes = raw.get("outcomes")
     if isinstance(outcomes, str):
@@ -551,6 +571,17 @@ def _market_to_row(raw: dict[str, Any], parsed: ParsedQuestion, now: datetime) -
     if yes_price is None:
         yes_price = _safe_float(raw.get("outcomePrices"))
 
+    neg_risk_raw = raw.get("negRisk")
+    if neg_risk_raw is None:
+        neg_risk_raw = raw.get("neg_risk")
+    neg_risk: bool | None
+    if neg_risk_raw is None:
+        neg_risk = None
+    elif isinstance(neg_risk_raw, bool):
+        neg_risk = neg_risk_raw
+    else:
+        neg_risk = str(neg_risk_raw).strip().lower() == "true"
+
     return dict(
         id=raw.get("id") or raw.get("conditionId") or "",
         question=raw.get("question", ""),
@@ -567,6 +598,9 @@ def _market_to_row(raw: dict[str, Any], parsed: ParsedQuestion, now: datetime) -
         parsed_threshold=parsed.threshold,
         parsed_operator=parsed.operator,
         parsed_target_date=parsed.target_date,
+        condition_id=raw.get("conditionId") or None,
+        neg_risk=neg_risk,
+        clob_token_ids=_parse_clob_token_ids(raw.get("clobTokenIds")),
         fetched_at=now,
     )
 

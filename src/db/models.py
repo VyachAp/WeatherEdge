@@ -53,6 +53,13 @@ class Market(Base):
     parsed_threshold = Column(Float)
     parsed_operator = Column(String)
     parsed_target_date = Column(String)
+    # Redemption metadata captured from Gamma at scan time. Gamma drops
+    # resolved markets from `GET /markets?id=...`, so we must persist
+    # `condition_id`/`neg_risk`/`clob_token_ids` while the market is
+    # still active — `bet redeem` reads from here instead of refetching.
+    condition_id = Column(String, index=True)  # hex 0x… on-chain conditionId
+    neg_risk = Column(Boolean)
+    clob_token_ids = Column(JSONB)  # [yes_token_id, no_token_id]
     fetched_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
 
     snapshots = relationship("MarketSnapshot", back_populates="market")

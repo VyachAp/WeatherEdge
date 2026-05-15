@@ -7,6 +7,7 @@ Runs in dry-run mode when POLYMARKET_PRIVATE_KEY is not configured.
 from __future__ import annotations
 
 import logging
+import threading
 import time as _time
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
@@ -52,12 +53,28 @@ logger = logging.getLogger(__name__)
 # error records while leaving legitimate API errors intact.
 
 class _CloudflareNoiseFilter(logging.Filter):
+    """Drop SDK request-error lines that we already handle as control flow.
+
+    Suppressed records:
+    - Cloudflare's HTML 403 page (the SDK transparently falls back to a GET).
+    - 400 on POST ``/auth/api-key`` with body ``Could not create api key`` —
+      the SDK then derives the key via GET, which succeeds.
+    - 404 on ``/book`` (``No orderbook exists for the requested token id``) —
+      surfaced for resolved markets; ``_fetch_orderbook`` returns None.
+    """
+
     def filter(self, record: logging.LogRecord) -> bool:  # noqa: D401
         try:
             msg = record.getMessage()
         except Exception:  # noqa: BLE001
             return True
-        return "<!DOCTYPE html>" not in msg and "Cloudflare" not in msg
+        if "<!DOCTYPE html>" in msg or "Cloudflare" in msg:
+            return False
+        if "/auth/api-key" in msg and "Could not create api key" in msg:
+            return False
+        if "/book" in msg and "No orderbook exists" in msg:
+            return False
+        return True
 
 
 def _install_cloudflare_filter() -> None:
@@ -82,6 +99,7 @@ _install_cloudflare_filter()
 _client = None
 _api_creds_set = False
 _version_mismatch_alerted = False  # one-shot alert dedup per process
+_client_build_lock = threading.Lock()  # serialise concurrent _get_client builds
 
 
 def build_clob_client():
@@ -125,28 +143,40 @@ def build_clob_client():
 
 
 def _get_client():
-    """Lazily initialise the CLOB client singleton."""
+    """Lazily initialise the CLOB client singleton.
+
+    Thread-safe via double-checked locking: ``bet portfolio`` fans out
+    ``get_best_bid_ask`` calls through ``asyncio.to_thread``, so without
+    the lock every worker would race past the ``is None`` check and
+    independently rebuild the client (each call posts to
+    ``/auth/api-key``, producing a flurry of 400s before the SDK falls
+    back to GET-derive).
+    """
     global _client, _api_creds_set  # noqa: PLW0603
 
     if _client is not None:
         return _client
 
-    _client = build_clob_client()
-    if _client is None:
-        return None
+    with _client_build_lock:
+        if _client is not None:
+            return _client
 
-    _api_creds_set = True
-    from eth_account import Account
-    eoa_address = Account.from_key(settings.POLYMARKET_PRIVATE_KEY).address
-    funder = settings.POLYMARKET_FUNDER_ADDRESS or eoa_address
-    logger.info(
-        "Polymarket CLOB client initialised (eoa=%s funder=%s sig_type=%d)",
-        eoa_address,
-        funder,
-        settings.POLYMARKET_SIGNATURE_TYPE,
-    )
+        built = build_clob_client()
+        if built is None:
+            return None
 
-    return _client
+        _api_creds_set = True
+        from eth_account import Account
+        eoa_address = Account.from_key(settings.POLYMARKET_PRIVATE_KEY).address
+        funder = settings.POLYMARKET_FUNDER_ADDRESS or eoa_address
+        logger.info(
+            "Polymarket CLOB client initialised (eoa=%s funder=%s sig_type=%d)",
+            eoa_address,
+            funder,
+            settings.POLYMARKET_SIGNATURE_TYPE,
+        )
+        _client = built
+        return _client
 
 
 def is_live() -> bool:
@@ -846,7 +876,14 @@ def get_orderbook_depth(token_id: str, price: float) -> float:
 
 
 def _fetch_orderbook(token_id: str):
-    """Return a cached or freshly fetched orderbook for *token_id*, or None."""
+    """Return a cached or freshly fetched orderbook for *token_id*, or None.
+
+    A 404 from CLOB ``/book`` ("No orderbook exists for the requested
+    token id") is the canonical response for resolved markets — short-
+    circuit without retrying so ``bet portfolio`` doesn't burn 3×
+    backoff per stale token. The 404's noisy SDK log line is suppressed
+    by ``_CloudflareNoiseFilter``.
+    """
     client = _get_client()
     if client is None:
         return None
@@ -862,6 +899,8 @@ def _fetch_orderbook(token_id: str):
             _orderbook_cache[token_id] = (_time.monotonic(), book)
             return book
         except Exception as exc:
+            if getattr(exc, "status_code", None) == 404:
+                return None
             if attempt < _OB_MAX_RETRIES:
                 _time.sleep(_OB_RETRY_BACKOFF[attempt])
             else:

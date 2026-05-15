@@ -2073,9 +2073,11 @@ def bet_redeem(
         # safety net for cases where local DB has drifted from on-chain
         # state.
         async def _build_redeemable_from_db() -> list[dict]:
+            import json as _json
             from sqlalchemy import select as _select, update as _update
             from src.db.engine import async_session
             from src.db.models import (
+                Market as MarketModel,
                 Trade as TradeModel,
                 TradeStatus as TradeStatusEnum,
                 TradeDirection,
@@ -2155,60 +2157,159 @@ def bet_redeem(
                         )
                     await session.commit()
 
-            # --- Per-market metadata fetch (neg_risk + clob token pair).
-            # Bounded by the WON-unredeemed market count, not lifetime
-            # history. `Market.id` stores the Gamma integer id, so we hit
-            # Gamma (CLOB's /markets/{id} expects a hex condition_id and
-            # 404s on integers). Normalise the Gamma payload into the
-            # shape the redemption loop already consumes: synthesise a
-            # `tokens` list from `clobTokenIds` and map `negRisk`/
-            # `conditionId` onto snake_case keys.
+            # --- Per-market metadata: DB-first, with token-id fallback.
+            # Gamma's `GET /markets?id=<market_id>` drops resolved
+            # markets and returns [], so we cache `condition_id` /
+            # `neg_risk` / `clob_token_ids` on the `markets` row at scan
+            # time (see `ingest_markets`). Redemption reads from there.
+            # For legacy rows where those columns are NULL we attempt
+            # one fallback fetch keyed by `clob_token_ids=<token_id>`,
+            # which often succeeds when the `id` lookup doesn't, and
+            # persist the result back so subsequent runs hit DB only.
             unique_market_ids = {
                 m for (m, _), tok in groups.items() if tok
             }
             market_meta: dict[str, dict] = {}
-            async with _httpx.AsyncClient(timeout=15) as http:
-                for mid in unique_market_ids:
-                    try:
-                        resp = await http.get(
-                            "https://gamma-api.polymarket.com/markets",
-                            params={"id": mid},
-                        )
-                        resp.raise_for_status()
-                        payload = resp.json()
-                        if isinstance(payload, list):
-                            if not payload:
-                                raise RuntimeError("empty gamma response")
-                            raw = payload[0]
-                        else:
-                            raw = payload
 
-                        clob_token_ids = raw.get("clobTokenIds", [])
-                        if isinstance(clob_token_ids, str):
-                            try:
-                                clob_token_ids = json.loads(clob_token_ids)
-                            except (ValueError, TypeError):
-                                clob_token_ids = []
+            async with async_session() as session:
+                cached_rows = (
+                    await session.execute(
+                        _select(
+                            MarketModel.id,
+                            MarketModel.question,
+                            MarketModel.condition_id,
+                            MarketModel.neg_risk,
+                            MarketModel.clob_token_ids,
+                        ).where(MarketModel.id.in_(unique_market_ids))
+                    )
+                ).all()
+
+                missing_meta_ids: list[str] = []
+                cached_by_id: dict[str, dict] = {}
+                for mid, question, cond_id, neg_risk_db, cached_clob_ids in cached_rows:
+                    cached_by_id[mid] = {
+                        "question": question or "",
+                        "condition_id": cond_id or "",
+                        "neg_risk": neg_risk_db,
+                        "clob_token_ids": cached_clob_ids or [],
+                    }
+
+                for mid in unique_market_ids:
+                    cached = cached_by_id.get(mid)
+                    if (
+                        cached
+                        and cached["condition_id"]
+                        and cached["clob_token_ids"]
+                    ):
                         tokens = [
                             {"token_id": str(t)}
-                            for t in clob_token_ids
+                            for t in cached["clob_token_ids"]
                             if t
                         ]
-
                         market_meta[mid] = {
-                            "question": raw.get("question", ""),
-                            "condition_id": raw.get("conditionId", "")
-                            or raw.get("condition_id", ""),
-                            "closed": raw.get("closed"),
-                            "neg_risk": raw.get("negRisk")
-                            if raw.get("negRisk") is not None
-                            else raw.get("neg_risk"),
+                            "question": cached["question"],
+                            "condition_id": cached["condition_id"],
+                            "closed": True,  # status=WON locally implies resolved
+                            "neg_risk": bool(cached["neg_risk"]),
                             "tokens": tokens,
                         }
-                    except Exception as exc:
-                        click.echo(
-                            f"  market {mid}: metadata fetch failed ({exc})"
+                    else:
+                        missing_meta_ids.append(mid)
+
+                # Fallback for rows with no cached metadata (legacy
+                # markets that resolved before this caching existed).
+                # Use any token_id we already have to look the market
+                # up by `clob_token_ids` instead of `id`.
+                refreshed: list[tuple[str, str, bool, list[str]]] = []
+                if missing_meta_ids:
+                    tok_for_mid: dict[str, str] = {}
+                    for (g_mid, _g_direction), g_tok in groups.items():
+                        if (
+                            g_tok
+                            and g_mid in missing_meta_ids
+                            and g_mid not in tok_for_mid
+                        ):
+                            tok_for_mid[g_mid] = g_tok
+
+                    async with _httpx.AsyncClient(timeout=15) as http:
+                        for mid in missing_meta_ids:
+                            fallback_tok = tok_for_mid.get(mid)
+                            if not fallback_tok:
+                                click.echo(
+                                    f"  market {mid}: redemption metadata "
+                                    f"unavailable (no token_id to fall back on)"
+                                )
+                                continue
+                            try:
+                                resp = await http.get(
+                                    "https://gamma-api.polymarket.com/markets",
+                                    params={"clob_token_ids": fallback_tok},
+                                )
+                                resp.raise_for_status()
+                                payload = resp.json()
+                                if isinstance(payload, list):
+                                    if not payload:
+                                        raise RuntimeError("empty gamma response")
+                                    raw = payload[0]
+                                else:
+                                    raw = payload
+
+                                clob_token_ids = raw.get("clobTokenIds", [])
+                                if isinstance(clob_token_ids, str):
+                                    try:
+                                        clob_token_ids = _json.loads(clob_token_ids)
+                                    except (ValueError, TypeError):
+                                        clob_token_ids = []
+                                clob_token_ids = [
+                                    str(t) for t in clob_token_ids if t
+                                ]
+                                cond_id = (
+                                    raw.get("conditionId", "")
+                                    or raw.get("condition_id", "")
+                                )
+                                if not cond_id or len(clob_token_ids) < 2:
+                                    click.echo(
+                                        f"  market {mid}: redemption metadata "
+                                        f"unavailable (resolved before metadata caching)"
+                                    )
+                                    continue
+                                neg_risk_raw = raw.get("negRisk")
+                                if neg_risk_raw is None:
+                                    neg_risk_raw = raw.get("neg_risk")
+                                neg_risk = bool(neg_risk_raw) if isinstance(
+                                    neg_risk_raw, bool
+                                ) else str(neg_risk_raw).strip().lower() == "true"
+
+                                market_meta[mid] = {
+                                    "question": raw.get("question", ""),
+                                    "condition_id": cond_id,
+                                    "closed": raw.get("closed"),
+                                    "neg_risk": neg_risk,
+                                    "tokens": [
+                                        {"token_id": t} for t in clob_token_ids
+                                    ],
+                                }
+                                refreshed.append(
+                                    (mid, cond_id, neg_risk, clob_token_ids)
+                                )
+                            except Exception as exc:
+                                click.echo(
+                                    f"  market {mid}: redemption metadata "
+                                    f"unavailable ({exc})"
+                                )
+
+                if refreshed:
+                    for mid, cond_id, neg_risk, clob_ids in refreshed:
+                        await session.execute(
+                            _update(MarketModel)
+                            .where(MarketModel.id == mid)
+                            .values(
+                                condition_id=cond_id,
+                                neg_risk=neg_risk,
+                                clob_token_ids=clob_ids,
+                            )
                         )
+                    await session.commit()
 
             redeemable: list[dict] = []
             for (market_id, direction), token_id in groups.items():
