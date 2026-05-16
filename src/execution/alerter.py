@@ -327,12 +327,16 @@ class Alerter:
         e = _escape_md2
         date_str = datetime.now(timezone.utc).strftime("%B %d, %Y")
 
+        failed_line = (
+            f"⚠ Failed orders: {e(exception_count)}\n" if exception_count else ""
+        )
+
         text = (
             f"\U0001f4cb *Daily Summary* — {e(date_str)}\n"
             f"\n"
             f"\U0001f50e Signals detected: {e(signal_count)}\n"
             f"\U0001f4c8 Trades opened: {e(opened_count)}\n"
-            f"{'\u26a0 Failed orders: ' + e(exception_count) + chr(10) if exception_count else ''}"
+            f"{failed_line}"
             f"\u2705 Resolved: {e(won_count)} won, {e(lost_count)} lost\n"
             f"\U0001f4b0 P&L today: {e(f'${daily_pnl:+,.2f}')}\n"
             f"\n"
