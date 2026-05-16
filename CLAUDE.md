@@ -28,7 +28,7 @@ python scripts/backtest_lock_rule.py --days 30  # lock-rule backtest
 
 ### Pipeline (critical path)
 
-The unified pipeline runs in `src/scheduler.py::job_unified_pipeline` every 5 min. `job_fast_lock_poll` runs every 30 s.
+The unified pipeline runs in `src/scheduler/__init__.py::job_unified_pipeline` every 5 min. `job_fast_lock_poll` runs every 30 s.
 
 ```
 circuit_breakers ─► get_active_weather_markets ─► group by ICAO (skip _EXCLUDED_ICAOS)
@@ -57,7 +57,7 @@ circuit_breakers ─► get_active_weather_markets ─► group by ICAO (skip _E
 
 `job_fast_lock_poll` only fires the **EASY** lock direction (observed max already clears threshold + margin). The **HARD** direction (no-more-heating: market-day max below threshold AND past-peak signal AND forecast peak < threshold) needs full forecast context and stays in `job_unified_pipeline`. For the **forecast-exceedance projection** check, fast-poll reuses the previous unified tick's forecast / bias / climate-normals via `_state_cache` (30-min TTL keyed by ICAO).
 
-### Scheduler Jobs (`src/scheduler.py`)
+### Scheduler Jobs (`src/scheduler/__init__.py`)
 
 | Job | Schedule | Purpose |
 |-----|----------|---------|
@@ -126,13 +126,13 @@ When Open-Meteo fails entirely, `WeatherState` is still returned: `forecast_peak
 
 After every successful aggregation, `aggregate_state` stashes its inputs (`forecast`, `bias_c`, `climate_prior_*`, `history`, timestamp) into the module-level `_state_cache` keyed by ICAO (30-min TTL). Fast-poll reads via `get_cached_aggregation_inputs(icao)`.
 
-### Lock-rule trader (`src/signals/lock_rules.py`, `scheduler._try_lock_rule_trade`)
+### Lock-rule trader (`src/signals/lock_rules.py` decision + `src/execution/lock_rule_executor.py` side effects)
 
 Deterministic complement to the probability engine. Returns a `LockDecision(side, reasons, margin_f)`.
 
 Operators in scope:
 - **Threshold** (`above`, `at_least`, `below`, `at_most`) — EASY/HARD branches below.
-- **Range / bracket / `exactly`** — routed through `_evaluate_range_lock`. `market_range_f` (in `scheduler.py`) builds the `[low_f, high_f]` window: parsed `(low, high)` for explicit brackets, synthetic single-bucket range for `exactly` (e.g. `=10°C` → `[50, 51]°F`). Fires NO on overshoot (`current_max_f >= high_f + RANGE_LOCK_MARGIN_MULTIPLIER × LOCK_MARGIN_F`, 2× = 4°F), NO on undershoot (`current_max_f <= low_f - 2 × LOCK_MARGIN_F` AND `_no_more_heating`), YES on in-range (past-peak with no upward signal). Both overshoot and undershoot require `routine_count >= RANGE_LOCK_MIN_ROUTINES=4`.
+- **Range / bracket / `exactly`** — routed through `_evaluate_range_lock`. `market_range_f` (in `execution/binary_market.py`) builds the `[low_f, high_f]` window: parsed `(low, high)` for explicit brackets, synthetic single-bucket range for `exactly` (e.g. `=10°C` → `[50, 51]°F`). Fires NO on overshoot (`current_max_f >= high_f + RANGE_LOCK_MARGIN_MULTIPLIER × LOCK_MARGIN_F`, 2× = 4°F), NO on undershoot (`current_max_f <= low_f - 2 × LOCK_MARGIN_F` AND `_no_more_heating`), YES on in-range (past-peak with no upward signal). Both overshoot and undershoot require `routine_count >= RANGE_LOCK_MIN_ROUTINES=4`.
 
 **Lowest/minimum temperature markets are filtered upstream** in `polymarket.parse_question` (`_LOWEST_TEMP_RE`) — the pipeline assumes daily-max physics. A defensive guard in `evaluate_lock` also drops them by question-text match.
 
@@ -170,7 +170,7 @@ Optional Polymarket-discovery line via `projected_market_lookup.lookup_projected
 
 ### Edge calculator (`src/signals/edge_calculator.py`)
 
-`compute_edges()` (brackets) and `_binary_market_edge()` in `scheduler.py` (binary thresholds) both delegate filter checks to `_check_filters()`.
+`compute_edges()` (brackets) and `binary_market_edge()` (binary thresholds) — both in `signals/edge_calculator.py` — delegate filter checks to `_check_filters()`.
 
 All filters must pass:
 
@@ -255,8 +255,8 @@ Per-city routine-count and bias-runaway checks live in the aggregator and edge f
 
 1. Add `"city name": (lat, lon)` to `CITIES` in `src/signals/mapper.py`.
 2. Add `"city name": "ICAO"` to `CITY_ICAO`.
-3. Confirm the ICAO is **not** in `_EXCLUDED_ICAOS` in `src/scheduler.py` (currently `{"VHHH", "LLBG"}` where Polymarket's resolution source diverges from the routine METAR feed). Removing requires verifying the actual resolver station first.
-4. If the city uses °C in its market title, confirm `_market_unit` in `scheduler.py` handles it.
+3. Confirm the ICAO is **not** in `_EXCLUDED_ICAOS` in `src/scheduler/__init__.py` (currently `{"VHHH", "LLBG"}` where Polymarket's resolution source diverges from the routine METAR feed). Removing requires verifying the actual resolver station first.
+4. If the city uses °C in its market title, confirm `market_unit` in `src/execution/binary_market.py` handles it.
 5. Seed `StationBias` if you have historical data — otherwise the default +1.0°C bias applies until enough settlements accumulate.
 
 ### Tune trade filters
@@ -293,15 +293,24 @@ Tests in `tests/test_<module>.py`. Mock external APIs at the module boundary (e.
 
 | File | Purpose | Key exports |
 |------|---------|-------------|
-| `src/scheduler.py` | APScheduler jobs, health server, edge helpers, lock-rule executor, fast-poll projection, per-station cache rollover, DB-backed dedup, cluster-cap, order reconciliation, telemetry writer | `job_*` (see Scheduler Jobs table), `_try_lock_rule_trade`, `_fast_poll_projection_check`, `_has_active_trade`, `_cluster_stake_used`, `_upsert_signal`, `_log_evaluation`, `_binary_market_edge`, `_EXCLUDED_ICAOS`, `run_scheduler` |
+| `src/scheduler/__init__.py` | APScheduler jobs + setup. Re-exports the extracted helpers so existing `from src.scheduler import _has_active_trade` callers keep working. Package shape — the body is currently a single `__init__.py`; future internal split into `jobs.py` + `setup.py` is deferred. | `job_*` (see Scheduler Jobs table), `_try_lock_rule_trade`, `_fast_poll_projection_check`, `_has_active_trade`, `_cluster_stake_used`, `_upsert_signal`, `_log_evaluation`, `_binary_market_edge`, `_EXCLUDED_ICAOS`, `run_scheduler`, `configure_logging`, `backfill_markets` |
+| `src/execution/binary_market.py` | Pure per-market shape helpers — binary-vs-bracket detection, °F bucket grid, unit display, future-day skip. No I/O / no DB / no scheduler state. | `is_binary_market`, `market_range_f`, `should_skip_future_day`, `market_unit`, `display_bucket`, `make_binary_buckets`, `is_bracket_like` |
+| `src/execution/lock_rule_executor.py` | Side-effect wrapper around `signals.lock_rules.evaluate_lock`. Owns: filter gating, sizing, Signal/Trade persistence, FAK order placement, Telegram alert dispatch. Mirrors `probability_engine` (pure) vs `polymarket_client` (side effects). | `try_lock_rule_trade`, `extract_bracket_buckets`, `extract_market_prices`, `minimal_state_for_easy_lock` |
+| `src/persistence/dedup.py` | DB-backed dedup helpers — race-safe `INSERT … ON CONFLICT DO UPDATE … RETURNING` upsert + PENDING/OPEN trade-existence check. | `has_active_trade`, `upsert_signal` |
+| `src/persistence/cache_rollover.py` | Per-station local-day in-process cache rollover + the dedup dicts that are reset on station-local midnight. | `locked_markets_fired_today`, `unified_fired_today`, `last_routine_seen`, `market_to_icao`, `local_day_seen`, `maybe_clear_per_station_caches`, `record_lock_fire` |
+| `src/risk/cluster_cap.py` | Anti-correlation guard summing currently-staked $ across same parsed_location + same end_date.date() bracket/exactly cluster. Returns 0 for non-bracket markets. | `cluster_stake_used` |
+| `src/monitoring/logging.py` | Structured JSON logging for the production scheduler. | `JSONFormatter`, `configure_logging` |
+| `src/monitoring/health.py` | stdlib asyncio health-check server. Closes over a scheduler-status callable to avoid circular import. | `start_health_server` |
 | `src/signals/state_aggregator.py` | Per-ICAO weather state + det/ensemble blend + residual-slope fit + fast-poll input cache | `WeatherState`, `aggregate_state`, `build_state_from_metars`, `_blend_forecasts`, `_compute_residual_slope`, `get_cached_aggregation_inputs`, `clear_state_cache` |
 | `src/signals/probability_engine.py` | Signal-based bucket distribution | `BucketDistribution`, `compute_distribution` |
-| `src/signals/edge_calculator.py` | Per-bucket edge + filter checks (`min_routine_count` overridable) | `BucketEdge`, `compute_edges`, `_check_filters`, `MIN_EDGE` |
+| `src/signals/edge_calculator.py` | Per-bucket edge + filter checks + binary-market YES/NO side selection (was `scheduler._binary_market_edge`). | `BucketEdge`, `compute_edges`, `binary_market_edge`, `_check_filters`, `MIN_EDGE` |
 | `src/signals/lock_rules.py` | Deterministic physical-lock decisions | `LockDecision`, `evaluate_lock`, `RANGE_LOCK_MIN_ROUTINES`, `RANGE_LOCK_MARGIN_MULTIPLIER` |
-| `src/signals/forecast_exceedance.py` | Exceedance alerts + DB calibration history; v2 slope-projection with v1 parallel-logged | `check_and_record_daily_max_alert`, `_project_daily_max`, `_project_with_residual` |
+| `src/signals/projection.py` | Pure daily-max projection math (v1 halflife + v2 residual-slope). Split out of `forecast_exceedance` so backtest / replay code can import without DB or Telegram coupling. | `project_daily_max`, `project_with_residual`, `legacy_project_daily_max`, `peak_passed`, `effective_trend`, `pick_latest_routine`, `closest_hour_index`, `c_to_f` |
+| `src/signals/forecast_exceedance.py` | Side-effect wrapper: DB row write + Telegram push trigger. Imports pure math from `signals.projection`. | `check_and_record_daily_max_alert` |
+| `src/signals/evaluation_log.py` | Append-only telemetry writer for `evaluation_logs` (one row per per-side edge evaluation, passing OR rejected). | `log_evaluation` |
 | `src/signals/projected_market_lookup.py` | Find the active binary closest to a projected daily max | `lookup_projected_binary` |
 | `src/signals/mapper.py` | Geocoding, ICAO lookup, operator/date/threshold normalisation, station-local timezones | `CITIES`, `CITY_ICAO`, `icao_for_location`, `cities_for_icao`, `geocode`, `icao_timezone`, `unit_for_station`, `normalize_operator`, `convert_threshold`, `f_to_c` |
-| `src/signals/calibration.py` | Linear recalibration `actual ≈ slope*predicted + intercept` from resolved signals + 30-min TTL cache. Wired into `_binary_market_edge` post-side-selection when `settings.APPLY_CALIBRATION=True` | `get_calibration_coefficients`, `refresh_calibration`, `apply_calibration`, `MIN_CALIBRATION_SAMPLES` |
+| `src/signals/calibration.py` | Linear recalibration `actual ≈ slope*predicted + intercept` from resolved signals + 30-min TTL cache. Wired into `binary_market_edge` post-side-selection when `settings.APPLY_CALIBRATION=True` | `get_calibration_coefficients`, `refresh_calibration`, `apply_calibration`, `MIN_CALIBRATION_SAMPLES` |
 | `src/signals/reverse_lookup.py` | Find markets by city/station/observation | `find_markets_for_city`, `find_markets_for_station`, `find_markets_for_observation`, `find_markets_for_event` |
 | `src/ingestion/polymarket.py` | Gamma API scanner + question parser | `scan_and_ingest`, `ingest_markets`, `get_active_weather_markets`, `parse_question`, `is_weather_market`, `parse_temperature_brackets` |
 | `src/ingestion/openmeteo.py` | Deterministic + ensemble hourly forecast, solar/cloud/dewpoint helpers | `OpenMeteoForecast`, `fetch_deterministic_forecast`, `fetch_ensemble_forecast`, `solar_declining`, `cloud_rising`, `dewpoint_trend` |

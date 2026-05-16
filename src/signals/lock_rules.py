@@ -194,7 +194,7 @@ def evaluate_lock(
 
     # ---- Range / "exactly" markets ----
     if op in ("range", "bracket", "exactly"):
-        from src.scheduler import market_range_f
+        from src.execution.binary_market import market_range_f
 
         if routine_count < settings.MIN_ROUTINE_COUNT:
             return _NO_LOCK

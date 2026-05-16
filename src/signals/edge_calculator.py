@@ -115,6 +115,142 @@ def compute_edges(
     return edges
 
 
+def binary_market_edge(
+    dist: BucketDistribution,
+    market,
+    end_time: datetime,
+    routine_count: int,
+    depth_yes: float,
+    depth_no_fn=None,
+    yes_bid: float | None = None,
+    yes_ask: float | None = None,
+) -> BucketEdge | None:
+    """Pick the best side (YES or NO) of a binary market and gate it.
+
+    Computes ``our_prob_yes`` from the distribution under the operator,
+    then evaluates *both* sides at their actual BUY-side cost:
+
+      * YES: price = ``yes_ask`` (what a YES buyer pays)
+      * NO:  price = ``1 - yes_bid`` (what a NO buyer pays; equivalent to
+             the NO-token ask given the ``YES + NO = 1`` constraint)
+
+    The (yes_bid, yes_ask) quote is optional. When omitted, both sides
+    fall back to ``market.current_yes_price`` symmetrically — preserves
+    legacy behavior for callers (and tests) that don't have a quote.
+
+    Why asymmetric pricing matters: after a sharp move the orderbook can
+    have stale dust on the dead side (e.g. bid=0.20, ask=0.55 on a
+    market that's actually trading near YES=0). The arithmetic mid then
+    invents a phantom "edge" that wouldn't fill. Charging each side its
+    real ask cost makes both sides correctly fail the MIN_EDGE filter.
+
+    For a binary market ``edge_NO == -edge_YES`` only when the spread is
+    zero; with a real spread the two sides see independent edges.
+
+    ``depth_no_fn`` is an optional zero-arg callable returning NO-side
+    orderbook depth in USD; only invoked when the chosen direction is
+    NO, so the additional CLOB call is skipped on the (more common) YES
+    side.
+
+    Returns the passing-side ``BucketEdge`` if one passes; otherwise the
+    higher-edge candidate (with ``passes=False`` and a reject reason),
+    so callers can still log what was attempted.
+    """
+    # Local imports avoid a startup-time cycle on `binary_market`
+    # (which lives in src.execution and pulls in this module's parent
+    # package indirectly via the polymarket question parser).
+    from src.execution.binary_market import market_range_f
+    from src.signals.calibration import apply_calibration
+
+    op = market.parsed_operator
+    mid_price = market.current_yes_price or 0.0
+    # Per-side BUY costs. Fall back to the symmetric mid when a real
+    # quote isn't supplied (keeps legacy callers + tests working).
+    yes_buy_price = yes_ask if (yes_ask is not None and yes_ask > 0) else mid_price
+    no_buy_price = (1.0 - yes_bid) if (yes_bid is not None and yes_bid > 0) else (1.0 - mid_price)
+    bucket_value: int
+
+    if op in ("above", "at_least"):
+        threshold = int(market.parsed_threshold)
+        bucket_value = threshold
+        our_prob_yes = sum(p for b, p in dist.probabilities.items() if b >= threshold)
+    elif op in ("below", "at_most"):
+        threshold = int(market.parsed_threshold)
+        bucket_value = threshold
+        our_prob_yes = sum(p for b, p in dist.probabilities.items() if b < threshold)
+    elif op in ("exactly", "range", "bracket"):
+        rng = market_range_f(market)
+        if rng is None:
+            return None
+        low, high = rng
+        bucket_value = (low + high) // 2
+        our_prob_yes = sum(p for b, p in dist.probabilities.items() if low <= b <= high)
+    else:
+        return None
+
+    our_prob_yes = round(our_prob_yes, 4)
+    yes_edge = round(our_prob_yes - yes_buy_price, 4)
+    no_prob = round(1.0 - our_prob_yes, 4)
+    no_price = round(no_buy_price, 4)
+    no_edge = round(no_prob - no_price, 4)
+    # Keep the variable name `yes_price` for the BucketEdge.market_price
+    # field on the YES branch — reads as "what a YES buyer pays".
+    yes_price = round(yes_buy_price, 4)
+
+    now = datetime.now(timezone.utc)
+    minutes_to_close = (end_time - now).total_seconds() / 60.0
+
+    # Pick the side whose edge is positive. If both are non-positive,
+    # the higher-edge side is still returned (with passes=False) so the
+    # caller's log line shows what was considered.
+    if no_edge > yes_edge:
+        direction = TradeDirection.BUY_NO
+        side_prob = no_prob
+        side_price = no_price
+        side_edge = no_edge
+        side_depth = depth_no_fn() if depth_no_fn is not None else 0.0
+    else:
+        direction = TradeDirection.BUY_YES
+        side_prob = our_prob_yes
+        side_price = yes_price
+        side_edge = yes_edge
+        side_depth = depth_yes
+
+    # Apply calibration when enabled — corrects the side-effective
+    # probability based on resolved-signal history. No-op when
+    # `APPLY_CALIBRATION=False`, when fewer than `MIN_CALIBRATION_SAMPLES`
+    # resolved signals exist, or when the cache is stale (refresh happens
+    # at the top of each tick).
+    side_prob_raw = side_prob
+    side_prob, calibrated = apply_calibration(side_prob_raw)
+    if calibrated:
+        side_edge = round(side_prob - side_price, 4)
+        logger.debug(
+            "calibrated %s: prob %.3f→%.3f, edge %.3f→%.3f",
+            direction.value, side_prob_raw, side_prob,
+            round(side_prob_raw - side_price, 4), side_edge,
+        )
+
+    reason = _check_filters(
+        edge=side_edge, prob=side_prob, price=side_price,
+        routine_count=routine_count,
+        minutes_to_close=minutes_to_close,
+        depth=side_depth,
+    )
+
+    return BucketEdge(
+        bucket_value=bucket_value,
+        our_probability=side_prob,
+        market_price=side_price,
+        edge=side_edge,
+        passes=reason is None,
+        reject_reason=reason,
+        direction=direction,
+        raw_probability=side_prob_raw,
+        calibrated=calibrated,
+    )
+
+
 def _check_filters(
     edge: float,
     prob: float,

@@ -3,10 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import signal
-import sys
 from datetime import date, datetime, timedelta, timezone
 from typing import TYPE_CHECKING
 
@@ -20,15 +18,48 @@ from src.config import settings
 from src.db.engine import async_session, engine
 from src.db.models import EvaluationLog, Market, Signal, Trade, TradeStatus
 from src.execution.alerter import get_alerter
+from src.execution.binary_market import (
+    display_bucket as _display_bucket,
+    is_binary_market as _is_binary_market,
+    is_bracket_like as _is_bracket_like,
+    make_binary_buckets as _make_binary_buckets,
+    market_range_f,
+    market_unit as _market_unit,
+    should_skip_future_day as _should_skip_future_day,
+)
+from src.execution.lock_rule_executor import (
+    extract_bracket_buckets as _extract_bracket_buckets,
+    extract_market_prices as _extract_market_prices,
+    minimal_state_for_easy_lock as _minimal_state_for_easy_lock,
+    try_lock_rule_trade as _try_lock_rule_trade,
+)
 from src.ingestion.polymarket import scan_and_ingest
+from src.monitoring.health import start_health_server as _start_health_server
+from src.monitoring.logging import configure_logging
+from src.persistence import cache_rollover
+from src.persistence.cache_rollover import (
+    last_routine_seen as _last_routine_seen,
+    local_day_seen as _local_day_seen,
+    locked_markets_fired_today as _locked_markets_fired_today,
+    market_to_icao as _market_to_icao,
+    maybe_clear_per_station_caches as _maybe_clear_per_station_caches,
+    unified_fired_today as _unified_fired_today,
+)
+from src.persistence.dedup import (
+    has_active_trade as _has_active_trade,
+    upsert_signal as _upsert_signal,
+)
 from src.resolution import (
     get_current_bankroll,
     get_current_exposure,
     resolve_trades,
 )
+from src.risk.cluster_cap import cluster_stake_used as _cluster_stake_used
 from src.risk.drawdown import DrawdownLevel, DrawdownMonitor
 from src.risk.kelly import size_locked_position, size_position
 from src.signals.calibration import get_calibration_coefficients
+from src.signals.edge_calculator import binary_market_edge as _binary_market_edge
+from src.signals.evaluation_log import log_evaluation as _log_evaluation
 from src.signals.lock_rules import evaluate_lock
 from src.execution.polymarket_client import is_live, place_order
 
@@ -45,96 +76,27 @@ _scheduler: AsyncIOScheduler | None = None
 _drawdown_monitor: DrawdownMonitor | None = None
 _shutdown_event: asyncio.Event | None = None
 
-# Fast-lock-poll bookkeeping. In-process only; reset on process restart.
-# `_locked_markets_fired_today` prevents re-firing on a market we've already
-# placed a lock order for. Cleared per-station at the station's local-day
-# rollover by `_maybe_clear_per_station_caches` (run from the unified
-# pipeline tick), not at a single global UTC time.
-# `_unified_fired_today` is the dry-run-only sibling for the probability path
-# (keyed by `(market_id, direction, bucket)` since brackets can fire several
-# buckets per market). In dry-run, `place_order` is a no-op and the resulting
-# Trade row stays `status=PENDING` (with `exchange_status='dry_run'`), so
-# `current_exposure` — which filters on `status=OPEN` — doesn't grow and
-# nothing else blocks the next 5-min tick from re-emitting the same alert.
-# This set closes that gap. Live trades remain undeduped — the OPEN-trade
-# exposure is the source of truth there.
-# `_last_routine_seen` skips METARs the fast loop already processed.
-# `_market_to_icao` lets the per-station rollover find which market_ids
-# in `_locked_markets_fired_today` / `_unified_fired_today` belong to a
-# given station.
-# `_local_day_seen` tracks each station's last-observed local date so we
-# can detect rollover.
-_locked_markets_fired_today: set[str] = set()
-_unified_fired_today: set[tuple[str, str, int]] = set()
-_last_routine_seen: dict[str, datetime] = {}
-_market_to_icao: dict[str, str] = {}
-_local_day_seen: dict[str, date] = {}
+# Per-station rollover dicts live in ``persistence.cache_rollover`` — both
+# the unified pipeline and the fast-lock-poll job mutate them. They're
+# re-exported above as ``_locked_markets_fired_today`` /
+# ``_unified_fired_today`` / ``_last_routine_seen`` / ``_market_to_icao``
+# / ``_local_day_seen`` (and the rollover sweep helper
+# ``_maybe_clear_per_station_caches``) so existing callers in this module
+# keep their identifiers.
 
 # ---------------------------------------------------------------------------
-# Structured JSON logging
+# Health server — module-local thin wrapper that closes over `_scheduler`
 # ---------------------------------------------------------------------------
-
-
-class _JSONFormatter(logging.Formatter):
-    def format(self, record: logging.LogRecord) -> str:
-        entry: dict[str, object] = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "level": record.levelname,
-            "logger": record.name,
-            "message": record.getMessage(),
-        }
-        if record.exc_info and record.exc_info[0]:
-            entry["exception"] = self.formatException(record.exc_info)
-        return json.dumps(entry)
-
-
-def configure_logging() -> None:
-    """Replace root handlers with a single JSON-to-stdout handler."""
-    handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter(_JSONFormatter())
-    root = logging.getLogger()
-    root.handlers = [handler]
-    root.setLevel(logging.INFO)
-    # Suppress noisy third-party loggers (httpx URLs can leak Telegram tokens, etc.)
-    from src.logging_utils import NOISY_LOGGERS
-    for name in NOISY_LOGGERS:
-        logging.getLogger(name).setLevel(logging.WARNING)
-
-
-# ---------------------------------------------------------------------------
-# Health-check HTTP server (stdlib only)
-# ---------------------------------------------------------------------------
-
-
-async def _health_handler(
-    reader: asyncio.StreamReader,
-    writer: asyncio.StreamWriter,
-) -> None:
-    try:
-        await reader.read(4096)  # consume request
-        body = json.dumps({
-            "status": "ok",
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "scheduler_running": _scheduler is not None and _scheduler.running,
-        })
-        response = (
-            "HTTP/1.1 200 OK\r\n"
-            "Content-Type: application/json\r\n"
-            f"Content-Length: {len(body)}\r\n"
-            "\r\n"
-            f"{body}"
-        )
-        writer.write(response.encode())
-        await writer.drain()
-    finally:
-        writer.close()
-        await writer.wait_closed()
 
 
 async def start_health_server(port: int = 8080) -> asyncio.Server:
-    server = await asyncio.start_server(_health_handler, "0.0.0.0", port)
-    logger.info("Health-check server listening on port %d", port)
-    return server
+    """Backcompat wrapper. Delegates to ``monitoring.health`` but supplies
+    the scheduler-running callable so the extracted module stays free of
+    a circular import on this file."""
+    return await _start_health_server(
+        scheduler_running=lambda: _scheduler is not None and _scheduler.running,
+        port=port,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -172,52 +134,6 @@ _UNIFIED_CONCURRENCY = 8  # Max concurrent city aggregations
 # stream we consume (e.g. uses a different airport, an HKO-style city station,
 # or a different rounding convention) — skip them entirely in the pipeline.
 _EXCLUDED_ICAOS: set[str] = {"VHHH", "LLBG"}  # Hong Kong, Tel Aviv
-
-
-def _maybe_clear_per_station_caches() -> None:
-    """Drop per-station dedup / cache entries when a station's local day
-    has rolled over since we last looked.
-
-    Replaces the legacy global wipe at 22:00 UTC: each station now resets
-    on its own local midnight, which is the actual data-day boundary the
-    routine-METAR / lock-rule logic uses (see lock_rules._market_daily_max).
-
-    Cheap to call every unified-pipeline tick — most calls are no-ops
-    because nothing rolled over in the last 5 minutes.
-    """
-    from src.signals.mapper import ICAO_TIMEZONE, icao_timezone, today_local
-    from src.signals.state_aggregator import clear_state_cache_for_icao
-
-    for icao in ICAO_TIMEZONE.keys():
-        try:
-            tz = icao_timezone(icao)
-            today = today_local(tz)
-        except Exception:
-            continue
-        prev = _local_day_seen.get(icao)
-        if prev is None:
-            # First time we're seeing this station — record today's
-            # local date but don't wipe state. Avoids clobbering dedup
-            # entries written by fast-poll before the first unified tick.
-            _local_day_seen[icao] = today
-            continue
-        if prev == today:
-            continue
-        # Local day rolled over — drop dedup market_ids that belong to
-        # this station, the per-station routine cursor, and the cached
-        # forecast/bias inputs so the next tick re-fetches.
-        mids_for_icao = [m for m, ic in _market_to_icao.items() if ic == icao]
-        for mid in mids_for_icao:
-            _locked_markets_fired_today.discard(mid)
-            _market_to_icao.pop(mid, None)
-        if mids_for_icao:
-            mids_set = set(mids_for_icao)
-            _unified_fired_today.difference_update(
-                {k for k in _unified_fired_today if k[0] in mids_set}
-            )
-        _last_routine_seen.pop(icao, None)
-        clear_state_cache_for_icao(icao)
-        _local_day_seen[icao] = today
 
 
 async def job_resolve_trades() -> None:
@@ -745,798 +661,6 @@ async def job_unified_pipeline() -> None:
         await alerter.send_system_error(exc, "unified pipeline")
 
 
-def _is_binary_market(market) -> bool:
-    """True if market is a single-outcome binary YES/NO market.
-
-    All temperature markets we trade are binary at the CLOB level (one
-    YES token, one NO token) — the "bracket" operator from the parser
-    refers to questions like "Will the highest be between 88-89°F?" which
-    are *single binary* markets asking about a 2°F window, not a multi-
-    outcome bracket. We unify them here and let downstream routing pick
-    threshold-vs-range handling based on market_range_f().
-    """
-    op = market.parsed_operator
-    if op is None:
-        return False
-    if op in ("above", "at_least", "below", "at_most"):
-        return market.parsed_threshold is not None
-    if op == "exactly":
-        return market.parsed_threshold is not None
-    if op in ("range", "bracket"):
-        # bracket-operator markets need a parseable °F window in the
-        # question text; otherwise they're true multi-outcome brackets
-        # (very rare in practice for weather markets).
-        return market_range_f(market) is not None
-    return False
-
-
-def market_range_f(market) -> tuple[int, int] | None:
-    """Inclusive integer °F range for a range-style binary market.
-
-    Recognized shapes:
-      * "Will the highest temperature in X be between 88-89°F on …?"
-        → (88, 89)  — a 2°F-wide window
-      * "Will the highest temperature in X be 17°C on …?"
-        → (62, 63)  — integer °F values that round to 17°C
-      * "Will the highest temperature in X be 88°F on …?"
-        → (88, 88)  — single-degree window
-
-    Returns None for one-sided threshold markets (above/below) and for
-    questions where neither pattern matches.
-    """
-    import math
-
-    op = market.parsed_operator
-
-    # 1. Explicit "between X-Y°[FC]" in the question text.
-    if op in ("range", "bracket"):
-        from src.ingestion.polymarket import parse_bracket_from_question
-
-        parsed = parse_bracket_from_question(market.question or "")
-        if parsed is not None:
-            low_f, high_f_excl = parsed  # high is exclusive (+1)
-            return (int(round(low_f)), int(round(high_f_excl)) - 1)
-        return None
-
-    # 2. "Exactly" — Celsius single-value or Fahrenheit single-value.
-    if op == "exactly" and market.parsed_threshold is not None:
-        if _market_unit(market) == "°C":
-            c_int = round((market.parsed_threshold - 32.0) * 5.0 / 9.0)
-            lo_c = c_int - 0.5
-            hi_c = c_int + 0.5
-            lo_f = lo_c * 9.0 / 5.0 + 32.0
-            hi_f = hi_c * 9.0 / 5.0 + 32.0
-            f_lo = int(math.ceil(lo_f - 1e-9))
-            f_hi = int(math.floor(hi_f - 1e-9))
-            if f_hi < f_lo:
-                return (f_lo, f_lo)
-            return (f_lo, f_hi)
-        f = int(round(market.parsed_threshold))
-        return (f, f)
-
-    return None
-
-
-def _should_skip_future_day(market, now: datetime, station_icao: str | None = None) -> bool:
-    """True when the market's data day is *strictly later* than today
-    in the **station's local timezone**.
-
-    Each Polymarket weather market resolves to a single local-day max at
-    the station that resolves it. The data day is computed by
-    ``resolve_target_local_day(end_date, station_tz)`` (see mapper for the
-    derivation). A market for tomorrow's local data still has no
-    observations — skip. A market for today's local data, or yesterday's
-    that hasn't yet been settled, stays in scope.
-
-    Falls back to the legacy UTC-date comparison when no station is
-    available — keeps the rule defined for callers that don't know the
-    station yet.
-    """
-    if not market.end_date:
-        return False
-    if station_icao is None:
-        return market.end_date.date() > now.date()
-
-    from src.signals.mapper import (
-        icao_timezone,
-        resolve_target_local_day,
-        today_local,
-    )
-    tz = icao_timezone(station_icao)
-    target = resolve_target_local_day(market.end_date, tz)
-    if target is None:
-        return False
-    return target > today_local(tz)
-
-
-def _market_unit(market) -> str:
-    """Return '°C' or '°F' based on the market's original question text."""
-    q = (market.question or "").upper()
-    if "°C" in q or "CELSIUS" in q:
-        return "°C"
-    return "°F"
-
-
-def _display_bucket(bucket_f: int, unit: str) -> int:
-    """Convert an internal °F bucket to the market's display unit, rounded."""
-    if unit == "°C":
-        return round((bucket_f - 32) * 5 / 9)
-    return bucket_f
-
-
-def _make_binary_buckets(market, state) -> list[int]:
-    """Generate the integer °F bucket grid for a single-binary market.
-
-    The grid spans from one degree below the observed max up through the
-    forecast peak (or the threshold/range upper bound, whichever is
-    higher) plus a 10°F headroom — wide enough to capture upside tails
-    without wasting compute on far-out buckets.
-    """
-    rng = market_range_f(market)
-    if rng is not None:
-        upper = max(rng[1], int(state.forecast_peak_f))
-    elif market.parsed_threshold is not None:
-        upper = max(int(market.parsed_threshold), int(state.forecast_peak_f))
-    else:
-        upper = int(state.forecast_peak_f)
-    low = int(state.current_max_f) - 1
-    return list(range(low, upper + 11))
-
-
-def _binary_market_edge(
-    dist,
-    market,
-    end_time,
-    routine_count,
-    depth_yes: float,
-    depth_no_fn=None,
-    yes_bid: float | None = None,
-    yes_ask: float | None = None,
-):
-    """Pick the best side (YES or NO) of a binary market and gate it.
-
-    Computes ``our_prob_yes`` from the distribution under the operator,
-    then evaluates *both* sides at their actual BUY-side cost:
-
-      * YES: price = ``yes_ask`` (what a YES buyer pays)
-      * NO:  price = ``1 - yes_bid`` (what a NO buyer pays; equivalent to
-             the NO-token ask given the ``YES + NO = 1`` constraint)
-
-    The (yes_bid, yes_ask) quote is optional. When omitted, both sides
-    fall back to ``market.current_yes_price`` symmetrically — preserves
-    legacy behavior for callers (and tests) that don't have a quote.
-
-    Why asymmetric pricing matters: after a sharp move the orderbook can
-    have stale dust on the dead side (e.g. bid=0.20, ask=0.55 on a
-    market that's actually trading near YES=0). The arithmetic mid then
-    invents a phantom "edge" that wouldn't fill. Charging each side its
-    real ask cost makes both sides correctly fail the MIN_EDGE filter.
-
-    For a binary market ``edge_NO == -edge_YES`` only when the spread is
-    zero; with a real spread the two sides see independent edges.
-
-    ``depth_no_fn`` is an optional zero-arg callable returning NO-side
-    orderbook depth in USD; only invoked when the chosen direction is
-    NO, so the additional CLOB call is skipped on the (more common) YES
-    side.
-
-    Returns the passing-side ``BucketEdge`` if one passes; otherwise the
-    higher-edge candidate (with ``passes=False`` and a reject reason),
-    so callers can still log what was attempted.
-    """
-    from src.db.models import TradeDirection
-    from src.signals.edge_calculator import BucketEdge, _check_filters
-
-    op = market.parsed_operator
-    mid_price = market.current_yes_price or 0.0
-    # Per-side BUY costs. Fall back to the symmetric mid when a real
-    # quote isn't supplied (keeps legacy callers + tests working).
-    yes_buy_price = yes_ask if (yes_ask is not None and yes_ask > 0) else mid_price
-    no_buy_price = (1.0 - yes_bid) if (yes_bid is not None and yes_bid > 0) else (1.0 - mid_price)
-    bucket_value: int
-
-    if op in ("above", "at_least"):
-        threshold = int(market.parsed_threshold)
-        bucket_value = threshold
-        our_prob_yes = sum(p for b, p in dist.probabilities.items() if b >= threshold)
-    elif op in ("below", "at_most"):
-        threshold = int(market.parsed_threshold)
-        bucket_value = threshold
-        our_prob_yes = sum(p for b, p in dist.probabilities.items() if b < threshold)
-    elif op in ("exactly", "range", "bracket"):
-        rng = market_range_f(market)
-        if rng is None:
-            return None
-        low, high = rng
-        bucket_value = (low + high) // 2
-        our_prob_yes = sum(p for b, p in dist.probabilities.items() if low <= b <= high)
-    else:
-        return None
-
-    our_prob_yes = round(our_prob_yes, 4)
-    yes_edge = round(our_prob_yes - yes_buy_price, 4)
-    no_prob = round(1.0 - our_prob_yes, 4)
-    no_price = round(no_buy_price, 4)
-    no_edge = round(no_prob - no_price, 4)
-    # Keep the variable name `yes_price` for the BucketEdge.market_price
-    # field on the YES branch — reads as "what a YES buyer pays".
-    yes_price = round(yes_buy_price, 4)
-
-    now = datetime.now(timezone.utc)
-    minutes_to_close = (end_time - now).total_seconds() / 60.0
-
-    # Pick the side whose edge is positive. If both are non-positive,
-    # the higher-edge side is still returned (with passes=False) so the
-    # caller's log line shows what was considered.
-    if no_edge > yes_edge:
-        direction = TradeDirection.BUY_NO
-        side_prob = no_prob
-        side_price = no_price
-        side_edge = no_edge
-        side_depth = depth_no_fn() if depth_no_fn is not None else 0.0
-    else:
-        direction = TradeDirection.BUY_YES
-        side_prob = our_prob_yes
-        side_price = yes_price
-        side_edge = yes_edge
-        side_depth = depth_yes
-
-    # Apply calibration when enabled — corrects the side-effective
-    # probability based on resolved-signal history. No-op when
-    # `APPLY_CALIBRATION=False`, when fewer than `MIN_CALIBRATION_SAMPLES`
-    # resolved signals exist, or when the cache is stale (refresh happens
-    # at the top of each tick).
-    from src.signals.calibration import apply_calibration
-    side_prob_raw = side_prob
-    side_prob, calibrated = apply_calibration(side_prob_raw)
-    if calibrated:
-        side_edge = round(side_prob - side_price, 4)
-        logger.debug(
-            "calibrated %s: prob %.3f→%.3f, edge %.3f→%.3f",
-            direction.value, side_prob_raw, side_prob,
-            round(side_prob_raw - side_price, 4), side_edge,
-        )
-
-    reason = _check_filters(
-        edge=side_edge, prob=side_prob, price=side_price,
-        routine_count=routine_count,
-        minutes_to_close=minutes_to_close,
-        depth=side_depth,
-    )
-
-    return BucketEdge(
-        bucket_value=bucket_value,
-        our_probability=side_prob,
-        market_price=side_price,
-        edge=side_edge,
-        passes=reason is None,
-        reject_reason=reason,
-        direction=direction,
-        raw_probability=side_prob_raw,
-        calibrated=calibrated,
-    )
-
-
-async def _log_evaluation(
-    session,
-    *,
-    market_id: str,
-    direction,
-    signal_kind: str,
-    model_prob: float,
-    market_prob: float,
-    edge: float,
-    passes: bool,
-    reject_reason: str | None,
-    depth_usd: float | None,
-    minutes_to_close: float | None,
-    routine_count: int | None,
-    raw_model_prob: float | None = None,
-    calibrated: bool = False,
-) -> None:
-    """Append one ``EvaluationLog`` row capturing this edge evaluation.
-
-    Called by BOTH the probability path and ``_try_lock_rule_trade`` for
-    EVERY candidate (passing or rejected). Without this row, MIN_EDGE /
-    MIN_PROBABILITY / MIN_DEPTH_USD tuning is blind because ``signals``
-    only carries passing edges and is now de-duplicated to one row per
-    (market, side). Append-only, no UPSERT — each tick's evaluation is a
-    separate calibration data point.
-    """
-    session.add(EvaluationLog(
-        market_id=market_id,
-        direction=direction,
-        signal_kind=signal_kind,
-        model_prob=model_prob,
-        raw_model_prob=raw_model_prob,
-        calibrated=calibrated,
-        market_prob=market_prob,
-        edge=edge,
-        passes=passes,
-        reject_reason=reject_reason,
-        depth_usd=depth_usd,
-        minutes_to_close=minutes_to_close,
-        routine_count=routine_count,
-    ))
-    # Don't flush here — the next session.flush() in the caller (e.g.
-    # _upsert_signal or commit) will batch these along with other writes.
-
-
-def _is_bracket_like(market) -> bool:
-    """True for multi-bucket window markets (bracket / range / exactly).
-
-    Used by the bracket-disable gate and the cluster-cap helper. Threshold
-    markets (above/at_least/below/at_most) are NOT bracket-like — they're
-    a single binary outcome, no anti-correlated buckets.
-    """
-    return market.parsed_operator in ("bracket", "range", "exactly")
-
-
-async def _cluster_stake_used(
-    session, market,
-) -> float:
-    """Sum of currently-staked $ across the same bracket/exactly cluster.
-
-    A "cluster" is the set of bucket markets with the same
-    ``parsed_location`` and the same ``end_date.date()`` (UTC). For a
-    multi-bucket question only one bucket can ultimately resolve YES,
-    so each independent Kelly bucket bet over-states diversification —
-    the cluster's combined exposure is the right unit for the cap.
-
-    Excludes dry-run rows and resolved (WON/LOST) rows; includes PENDING
-    + OPEN. Returns 0.0 for non-bracket-like markets so threshold
-    markets aren't accidentally clustered.
-    """
-    if not _is_bracket_like(market) or not market.parsed_location or not market.end_date:
-        return 0.0
-
-    from sqlalchemy import func
-
-    end_day = market.end_date.date()
-    stmt = (
-        select(func.coalesce(func.sum(Trade.stake_usd), 0.0))
-        .join(Market, Trade.market_id == Market.id)
-        .where(
-            Market.parsed_location == market.parsed_location,
-            func.date(Market.end_date) == end_day,
-            Market.parsed_operator.in_(("bracket", "range", "exactly")),
-            Trade.status.in_([TradeStatus.PENDING, TradeStatus.OPEN]),
-            # Live trades only — dry-run rows would over-state the cap.
-            (Trade.exchange_status.is_(None) | (Trade.exchange_status != "dry_run")),
-        )
-    )
-    result = await session.execute(stmt)
-    return float(result.scalar() or 0.0)
-
-
-async def _has_active_trade(
-    session, market_id: str, direction,
-) -> bool:
-    """True iff a PENDING or OPEN Trade row already exists for this pair.
-
-    Hard guard against duplicate firing. Replaces the load-bearing role of
-    the in-process ``_unified_fired_today`` / ``_locked_markets_fired_today``
-    sets — those are kept as same-tick speed-ups but no longer the only
-    line of defence. In live mode this is the only thing that prevents
-    the bot from re-betting the same market+side every tick until the
-    Kelly exposure cap kicks in. In dry-run it stops the Signal/Trade
-    table from accumulating one row per tick.
-
-    Notes:
-      - Filters on status only, no Market.end_date check needed: PENDING/
-        OPEN trades on resolved markets are fixed up by ``resolve_trades``
-        within minutes of expiry, so a stale row blocking an already-
-        resolved market is a non-issue (we wouldn't trade into it anyway).
-      - The migration ``i9j0k1l2m3n4`` collapsed pre-existing duplicate
-        PENDING rows so this guard doesn't permanently lock out markets
-        that already accumulated multiple dry-run attempts.
-    """
-    result = await session.execute(
-        select(Trade.id).where(
-            Trade.market_id == market_id,
-            Trade.direction == direction,
-            Trade.status.in_([TradeStatus.PENDING, TradeStatus.OPEN]),
-        ).limit(1)
-    )
-    return result.scalar_one_or_none() is not None
-
-
-async def _upsert_signal(
-    session,
-    *,
-    market_id: str,
-    direction,
-    model_prob: float,
-    market_prob: float,
-    edge: float,
-    confidence: float | None,
-    signal_kind: str = "probability",
-    lock_branch: str | None = None,
-    lock_routine_count: int | None = None,
-    lock_observed_max_f: float | None = None,
-    raw_model_prob: float | None = None,
-    calibrated: bool = False,
-) -> Signal:
-    """Insert-or-refresh the unique ``(market_id, direction)`` Signal row.
-
-    Schema-level ``uq_signals_market_direction`` (migration
-    ``i9j0k1l2m3n4``) means we'd otherwise collide on every re-evaluation
-    tick. Implemented as a single atomic ``INSERT ... ON CONFLICT DO
-    UPDATE ... RETURNING`` so the path is race-safe without relying on
-    APScheduler's ``max_instances=1`` to serialize the SELECT/INSERT
-    window. Refreshes ``created_at`` so callers can see "this signal was
-    last evaluated at X" in the DB.
-
-    ``signal_kind`` and the ``lock_*`` fields land on the row regardless
-    of whether it's INSERT or UPDATE; a market that flips between the
-    probability and lock paths between ticks (e.g. early-day probability
-    edge → lock fires when the threshold gets crossed) will overwrite
-    the kind/branch on the next tick. That's the intended semantic:
-    Signal reflects the current trading rationale, not history.
-    """
-    now = datetime.now(timezone.utc)
-    stmt = (
-        pg_insert(Signal)
-        .values(
-            market_id=market_id,
-            direction=direction,
-            model_prob=model_prob,
-            raw_model_prob=raw_model_prob,
-            calibrated=calibrated,
-            market_prob=market_prob,
-            edge=edge,
-            confidence=confidence,
-            signal_kind=signal_kind,
-            lock_branch=lock_branch,
-            lock_routine_count=lock_routine_count,
-            lock_observed_max_f=lock_observed_max_f,
-            created_at=now,
-        )
-        .on_conflict_do_update(
-            constraint="uq_signals_market_direction",
-            set_={
-                "model_prob": model_prob,
-                "raw_model_prob": raw_model_prob,
-                "calibrated": calibrated,
-                "market_prob": market_prob,
-                "edge": edge,
-                "confidence": confidence,
-                "signal_kind": signal_kind,
-                "lock_branch": lock_branch,
-                "lock_routine_count": lock_routine_count,
-                "lock_observed_max_f": lock_observed_max_f,
-                "created_at": now,
-            },
-        )
-        .returning(Signal)
-    )
-    result = await session.scalars(
-        stmt, execution_options={"populate_existing": True}
-    )
-    return result.one()
-
-
-async def _try_lock_rule_trade(
-    *,
-    session,
-    market,
-    state,
-    yes_price: float,
-    token_ids,
-    yes_depth: float,
-    end_time: datetime,
-    bankroll: float,
-    exposure: float,
-    monitor: DrawdownMonitor,
-    alerter,
-    icao: str,
-    yes_bid: float | None = None,
-    yes_ask: float | None = None,
-) -> float | None:
-    """Evaluate lock-rule conditions and place order if triggered.
-
-    ``yes_bid`` / ``yes_ask``: optional live quote. When supplied, the
-    side we're buying is charged its real ask cost (yes_ask for YES,
-    1-yes_bid for NO) instead of the symmetric mid carried in
-    ``yes_price``. This prevents a wide post-move spread from making a
-    locked market look mid-priced and slipping through the
-    ``LOCK_RULE_MAX_PRICE`` guard.
-
-    Returns:
-      None — no lock fired; caller should fall through to probability path.
-      0.0  — lock fired but was not executable (price out of range, order
-             failed, depth insufficient, etc.). Caller should `continue`.
-      >0   — stake in USD that was actually placed. Caller should `continue`
-             and add to exposure counter.
-    """
-    from src.execution.polymarket_client import get_orderbook_depth
-    from src.signals.edge_calculator import _check_filters
-
-    decision = evaluate_lock(state, market)
-    if decision.side is None or decision.direction is None:
-        # No lock fired — nothing to log; the probability path will emit
-        # its own EvaluationLog row for this market on this tick.
-        return None
-
-    # Effective price needs to land before _has_active_trade so the
-    # EvaluationLog row carries the actual market_prob even on early
-    # rejections (active trade exists, etc.).
-    if decision.side == "YES":
-        effective_price = (
-            yes_ask if (yes_ask is not None and yes_ask > 0) else yes_price
-        )
-    else:
-        effective_price = (
-            (1.0 - yes_bid) if (yes_bid is not None and yes_bid > 0)
-            else (1.0 - yes_price)
-        )
-
-    now = datetime.now(timezone.utc)
-    minutes_to_close = (end_time - now).total_seconds() / 60.0
-
-    async def _log_lock_eval(passes: bool, reject_reason: str | None, depth_usd: float | None) -> None:
-        await _log_evaluation(
-            session,
-            market_id=market.id,
-            direction=decision.direction,
-            signal_kind="lock",
-            model_prob=1.0,
-            market_prob=effective_price,
-            edge=1.0 - effective_price,
-            passes=passes,
-            reject_reason=reject_reason,
-            depth_usd=depth_usd,
-            minutes_to_close=minutes_to_close,
-            routine_count=decision.routine_count,
-        )
-
-    # Hard guard against double-betting. Mirrors the probability path.
-    # ``_locked_markets_fired_today`` is the same-tick speed-up; the DB
-    # check is the durable line of defence (survives restarts and gates
-    # both modes). Returning 0.0 (not None) so the caller treats this as
-    # "lock evaluated but not executed" and skips the probability path
-    # for this market on this tick.
-    if market.id in _locked_markets_fired_today:
-        logger.info(
-            "[%s] LOCK %s %s: already fired this tick (in-process dedup)",
-            icao, decision.side, market.id[:12],
-        )
-        await _log_lock_eval(False, "fired this tick", None)
-        return 0.0
-    if await _has_active_trade(session, market.id, decision.direction):
-        logger.info(
-            "[%s] LOCK %s %s: active trade exists for this market+side, skipping",
-            icao, decision.side, market.id[:12],
-        )
-        _locked_markets_fired_today.add(market.id)
-        _market_to_icao[market.id] = icao
-        await _log_lock_eval(False, "active trade exists", None)
-        return 0.0
-    if not (
-        settings.LOCK_RULE_MIN_PRICE
-        <= effective_price
-        <= settings.LOCK_RULE_MAX_PRICE
-    ):
-        logger.info(
-            "[%s] lock %s %s: price %.2f outside [%.2f, %.2f]",
-            icao, decision.side, market.id[:12], effective_price,
-            settings.LOCK_RULE_MIN_PRICE, settings.LOCK_RULE_MAX_PRICE,
-        )
-        await _log_lock_eval(
-            False,
-            f"price {effective_price:.2f} outside [{settings.LOCK_RULE_MIN_PRICE}, {settings.LOCK_RULE_MAX_PRICE}]",
-            None,
-        )
-        return 0.0
-
-    # Depth against the side we're actually buying.
-    if decision.side == "YES":
-        buy_depth = yes_depth
-    else:
-        buy_depth = (
-            get_orderbook_depth(token_ids[1], effective_price)
-            if token_ids else 0.0
-        )
-
-    # Reuse the existing filter helper for routine-count / close-buffer / depth.
-    # Pass stub prob/edge/price values that will pass those specific checks; we're
-    # not edge-gating here, only piggy-backing on the shared sanity filters.
-    # The lock-rule already gates routine_count per its own rules (allowing
-    # 2 routines for super-margin EASY locks), so the filter just guards
-    # the floor of 2 here — preventing single-METAR fluke trades regardless.
-    reject = _check_filters(
-        edge=1.0,
-        prob=1.0,
-        price=max(settings.MIN_ENTRY_PRICE, min(settings.MAX_ENTRY_PRICE, effective_price)),
-        routine_count=state.routine_count_today,
-        minutes_to_close=minutes_to_close,
-        depth=buy_depth,
-        min_routine_count=2,
-    )
-    if reject is not None:
-        logger.info(
-            "[%s] lock %s %s rejected by filter: %s",
-            icao, decision.side, market.id[:12], reject,
-        )
-        await _log_lock_eval(False, reject, buy_depth or None)
-        return 0.0
-
-    # Lock candidate cleared all gates — emit the "passes" log row before
-    # the order goes out so backtests can correlate evaluations with trade
-    # outcomes via market_id+direction+created_at.
-    await _log_lock_eval(True, None, buy_depth or None)
-
-    pos = size_locked_position(
-        bankroll=bankroll,
-        price=effective_price,
-        current_exposure=exposure,
-        orderbook_depth=buy_depth or None,
-    )
-    dd_state = monitor.check(bankroll)
-    stake = pos.stake_usd * dd_state.size_multiplier
-
-    logger.info(
-        "[%s] LOCK %s %s: margin=%.1f°F, price=%.2f, stake=$%.2f "
-        "(raw=$%.2f, dd_mult=%.2f) | %s",
-        icao, decision.side, market.id[:12], decision.margin_f,
-        effective_price, stake, pos.stake_usd, dd_state.size_multiplier,
-        "; ".join(decision.reasons),
-    )
-
-    if stake < settings.MIN_STAKE_USD:
-        logger.info(
-            "[%s] LOCK %s %s: stake $%.2f < min $%.2f, skipping",
-            icao, decision.side, market.id[:12], stake, settings.MIN_STAKE_USD,
-        )
-        return 0.0
-
-    # Cluster cap also applies to lock-rule fires on bracket/exactly
-    # markets (range_overshoot/undershoot/in_window branches). Threshold
-    # markets are unaffected because ``_cluster_stake_used`` returns 0.0
-    # for non-bracket-like operators.
-    if settings.CLUSTER_STAKE_CAP_USD > 0:
-        cluster_used = await _cluster_stake_used(session, market)
-        if cluster_used + stake > settings.CLUSTER_STAKE_CAP_USD:
-            logger.info(
-                "[%s] LOCK %s %s: cluster stake $%.2f + new $%.2f > cap $%.2f, skipping",
-                icao, decision.side, market.id[:12],
-                cluster_used, stake, settings.CLUSTER_STAKE_CAP_USD,
-            )
-            return 0.0
-
-    # model_prob=1.0 because the lock rule is deterministic (no probability
-    # estimate to record). confidence carries the lock margin in °F so the
-    # detail view can show "how locked was this". Lock fields tag the
-    # branch + observation context so post-mortems can split realised P&L
-    # by which lock path produced the signal.
-    sig_row = await _upsert_signal(
-        session,
-        market_id=market.id,
-        direction=decision.direction,
-        model_prob=1.0,
-        market_prob=effective_price,
-        edge=1.0 - effective_price,
-        confidence=decision.margin_f,
-        signal_kind="lock",
-        lock_branch=decision.branch,
-        lock_routine_count=decision.routine_count,
-        lock_observed_max_f=decision.observed_max_f,
-    )
-
-    trade = Trade(
-        signal_id=sig_row.id,
-        market_id=market.id,
-        direction=decision.direction,
-        stake_usd=stake,
-        entry_price=effective_price,
-        status=TradeStatus.PENDING,
-    )
-    session.add(trade)
-    await session.flush()
-
-    order_ok = await place_order(
-        trade, session,
-        submit_yes_bid=yes_bid,
-        submit_yes_ask=yes_ask,
-        submit_depth_usd=buy_depth or None,
-    )
-    if not order_ok:
-        logger.warning(
-            "[%s] LOCK %s %s: order placement failed",
-            icao, decision.side, market.id[:12],
-        )
-        return 0.0
-
-    # In dry-run, ``place_order`` is a no-op and never updates fill fields.
-    # Don't pretend the trade opened: keep status PENDING and emit a
-    # clearly-labelled indicative alert. ``stake_usd`` stays at the requested
-    # value so paper-trade analysis can read it directly; OPEN-filtered
-    # exposure / PnL math is unaffected because the row is PENDING and
-    # ``exchange_status='dry_run'``. Return positive so the caller's
-    # in-process dedup blocks repeat firings on the same market today.
-    is_dry_run = trade.exchange_status == "dry_run"
-
-    if is_dry_run:
-        indicative_price = trade.entry_price or effective_price
-        trade.status = TradeStatus.PENDING
-        indicative_stake = trade.stake_usd
-    else:
-        # FAK orders may fill partially or not at all when liquidity is thin.
-        # ``_update_fill_details`` already replaced trade.stake_usd with the
-        # actual filled cost (zeroed when nothing matched). Use that value as
-        # the source of truth for exposure / dedup so we don't book an order
-        # that never landed.
-        actual_stake = trade.stake_usd or 0.0
-        if actual_stake <= 0:
-            trade.status = TradeStatus.PENDING
-            logger.info(
-                "[%s] LOCK %s %s: order posted but no fill (book empty at limit); "
-                "leaving open for next-tick retry",
-                icao, decision.side, market.id[:12],
-            )
-            return 0.0
-        trade.status = TradeStatus.OPEN
-        indicative_stake = actual_stake
-        indicative_price = trade.fill_price or effective_price
-
-    unit = _market_unit(market)
-    rng = market_range_f(market)
-    if rng is not None and rng[0] != rng[1]:
-        threshold_disp = (
-            f"[{_display_bucket(rng[0], unit)}-{_display_bucket(rng[1], unit)}]"
-        )
-        op_symbol = "∈"
-    elif market.parsed_threshold is not None:
-        threshold_disp = str(_display_bucket(int(market.parsed_threshold), unit))
-        op_symbol = {
-            "above": "≥", "at_least": "≥",
-            "below": "<", "at_most": "≤",
-            "exactly": "=",
-        }.get(market.parsed_operator, "?")
-    else:
-        threshold_disp = "?"
-        op_symbol = "?"
-    header = (
-        "\U0001f512 *LOCK trade (dry-run)*" if is_dry_run
-        else "\U0001f512 *LOCK trade*"
-    )
-    fill_label = "Indicative" if is_dry_run else "Filled"
-    await alerter._enqueue(
-        f"{header} [{icao}] {decision.side}\n"
-        f"Threshold: {op_symbol}{threshold_disp}{unit} | Margin: {decision.margin_f:+.1f}°F\n"
-        f"{fill_label}: ${indicative_stake:.2f} (req ${stake:.2f}) @ {indicative_price:.3f}\n"
-        f"Reason: {decision.reasons[0] if decision.reasons else 'locked'}\n"
-        f"Market: {market.question[:60]}",
-    )
-    return indicative_stake
-
-
-def _extract_bracket_buckets(market) -> list[int]:
-    """Extract temperature bucket values from a bracket market's outcomes."""
-    import re
-    buckets: list[int] = []
-    outcomes = market.outcomes or []
-    for outcome in outcomes:
-        if isinstance(outcome, str):
-            match = re.search(r"(\d+)", outcome)
-            if match:
-                buckets.append(int(match.group(1)))
-        elif isinstance(outcome, dict):
-            val = outcome.get("value") or outcome.get("title", "")
-            match = re.search(r"(\d+)", str(val))
-            if match:
-                buckets.append(int(match.group(1)))
-    return sorted(set(buckets))
-
-
-def _extract_market_prices(market, buckets: list[int]) -> dict[int, float]:
-    """Map bucket values to current YES prices for bracket markets."""
-    prices: dict[int, float] = {}
-    if market.current_yes_price and buckets:
-        prices[buckets[0]] = market.current_yes_price
-    return prices
-
-
 async def job_daily_settlement() -> None:
     """Daily 22:00 UTC — bankroll/drawdown bookkeeping, daily digest.
 
@@ -1769,34 +893,6 @@ async def backfill_markets(days: int) -> int:
 # ---------------------------------------------------------------------------
 # Fast lock poll — between-tick latency fix
 # ---------------------------------------------------------------------------
-
-
-def _minimal_state_for_easy_lock(
-    icao: str,
-    routine_points: list[tuple[datetime, float]],
-):
-    """Build a WeatherState with only routine history — sufficient for the
-    EASY lock direction (observed max already clears threshold), which doesn't
-    read forecast/solar/trend fields. HARD-direction locks still need the
-    main pipeline's forecast context and run there.
-    """
-    from src.signals.state_aggregator import WeatherState
-
-    return WeatherState(
-        station_icao=icao,
-        current_max_f=max(t for _, t in routine_points),
-        metar_trend_rate=0.0,
-        dewpoint_trend_rate=0.0,
-        forecast_peak_f=0.0,
-        hours_until_peak=0.0,
-        solar_declining=False,
-        solar_decline_magnitude=0.0,
-        cloud_rising=False,
-        cloud_rise_magnitude=0.0,
-        routine_count_today=len(routine_points),
-        has_forecast=False,
-        routine_history=tuple(sorted(routine_points, key=lambda p: p[0])),
-    )
 
 
 async def _fast_poll_projection_check(
