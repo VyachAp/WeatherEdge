@@ -48,6 +48,18 @@ from src.persistence.dedup import has_active_trade, upsert_signal
 from src.risk.cluster_cap import cluster_stake_used
 from src.risk.drawdown import DrawdownMonitor
 from src.risk.kelly import size_locked_position
+from src.signals.decision_log import (
+    OUTCOME_CLUSTER_CAP,
+    OUTCOME_DRAWDOWN_PAUSED,
+    OUTCOME_DUP_DB,
+    OUTCOME_DUP_INPROC,
+    OUTCOME_NO_FILL,
+    OUTCOME_ORDER_FAILED,
+    OUTCOME_STAKE_BELOW_MIN,
+    OUTCOME_TRADE_FILLED,
+    OUTCOME_TRADE_PENDING,
+    log_decision,
+)
 from src.signals.evaluation_log import log_evaluation
 from src.signals.lock_rules import evaluate_lock
 
@@ -137,6 +149,14 @@ async def try_lock_rule_trade(
             icao, decision.side, market.id[:12],
         )
         await _log_lock_eval(False, "fired this tick", None)
+        await log_decision(
+            session,
+            market_id=market.id,
+            direction=decision.direction,
+            signal_kind="lock",
+            outcome=OUTCOME_DUP_INPROC,
+            metadata={"branch": decision.branch, "side": decision.side},
+        )
         return 0.0
     if await has_active_trade(session, market.id, decision.direction):
         logger.info(
@@ -145,6 +165,14 @@ async def try_lock_rule_trade(
         )
         cache_rollover.record_lock_fire(market.id, icao)
         await _log_lock_eval(False, "active trade exists", None)
+        await log_decision(
+            session,
+            market_id=market.id,
+            direction=decision.direction,
+            signal_kind="lock",
+            outcome=OUTCOME_DUP_DB,
+            metadata={"branch": decision.branch, "side": decision.side},
+        )
         return 0.0
     if not (
         settings.LOCK_RULE_MIN_PRICE
@@ -235,6 +263,19 @@ async def try_lock_rule_trade(
             "[%s] LOCK %s %s: stake $%.2f < min $%.2f, skipping",
             icao, decision.side, market.id[:12], stake, settings.MIN_STAKE_USD,
         )
+        paused = dd_state.size_multiplier == 0.0
+        await log_decision(
+            session,
+            market_id=market.id,
+            direction=decision.direction,
+            signal_kind="lock",
+            outcome=OUTCOME_DRAWDOWN_PAUSED if paused else OUTCOME_STAKE_BELOW_MIN,
+            requested_stake_usd=pos.stake_usd,
+            actual_stake_usd=stake,
+            dd_multiplier=dd_state.size_multiplier,
+            dd_level=dd_state.level.value,
+            metadata={"branch": decision.branch, "margin_f": decision.margin_f},
+        )
         return 0.0
 
     # Cluster cap also applies to lock-rule fires on bracket/exactly
@@ -248,6 +289,19 @@ async def try_lock_rule_trade(
                 "[%s] LOCK %s %s: cluster stake $%.2f + new $%.2f > cap $%.2f, skipping",
                 icao, decision.side, market.id[:12],
                 cluster_used, stake, settings.CLUSTER_STAKE_CAP_USD,
+            )
+            await log_decision(
+                session,
+                market_id=market.id,
+                direction=decision.direction,
+                signal_kind="lock",
+                outcome=OUTCOME_CLUSTER_CAP,
+                requested_stake_usd=stake,
+                metadata={
+                    "branch": decision.branch,
+                    "cluster_used_usd": cluster_used,
+                    "cap_usd": settings.CLUSTER_STAKE_CAP_USD,
+                },
             )
             return 0.0
 
@@ -299,6 +353,20 @@ async def try_lock_rule_trade(
                 "stake_usd": stake,
             },
         )
+        await log_decision(
+            session,
+            market_id=market.id,
+            direction=decision.direction,
+            signal_kind="lock",
+            outcome=OUTCOME_ORDER_FAILED,
+            requested_stake_usd=stake,
+            dd_multiplier=dd_state.size_multiplier,
+            dd_level=dd_state.level.value,
+            metadata={
+                "branch": decision.branch,
+                "exchange_status": trade.exchange_status,
+            },
+        )
         return 0.0
 
     # In dry-run, ``place_order`` is a no-op and never updates fill fields.
@@ -314,6 +382,22 @@ async def try_lock_rule_trade(
         indicative_price = trade.entry_price or effective_price
         trade.status = TradeStatus.PENDING
         indicative_stake = trade.stake_usd
+        await log_decision(
+            session,
+            market_id=market.id,
+            direction=decision.direction,
+            signal_kind="lock",
+            outcome=OUTCOME_TRADE_PENDING,
+            requested_stake_usd=stake,
+            actual_stake_usd=indicative_stake,
+            dd_multiplier=dd_state.size_multiplier,
+            dd_level=dd_state.level.value,
+            metadata={
+                "branch": decision.branch,
+                "margin_f": decision.margin_f,
+                "is_dry_run": True,
+            },
+        )
     else:
         # FAK orders may fill partially or not at all when liquidity is thin.
         # ``_update_fill_details`` already replaced trade.stake_usd with the
@@ -335,10 +419,35 @@ async def try_lock_rule_trade(
                     "requested_stake_usd": stake,
                 },
             )
+            await log_decision(
+                session,
+                market_id=market.id,
+                direction=decision.direction,
+                signal_kind="lock",
+                outcome=OUTCOME_NO_FILL,
+                requested_stake_usd=stake,
+                metadata={"branch": decision.branch, "margin_f": decision.margin_f},
+            )
             return 0.0
         trade.status = TradeStatus.OPEN
         indicative_stake = actual_stake
         indicative_price = trade.fill_price or effective_price
+        await log_decision(
+            session,
+            market_id=market.id,
+            direction=decision.direction,
+            signal_kind="lock",
+            outcome=OUTCOME_TRADE_FILLED,
+            requested_stake_usd=stake,
+            actual_stake_usd=actual_stake,
+            dd_multiplier=dd_state.size_multiplier,
+            dd_level=dd_state.level.value,
+            metadata={
+                "branch": decision.branch,
+                "margin_f": decision.margin_f,
+                "fill_price": indicative_price,
+            },
+        )
 
     unit = market_unit(market)
     rng = market_range_f(market)

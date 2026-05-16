@@ -59,6 +59,18 @@ from src.risk.drawdown import DrawdownLevel, DrawdownMonitor
 from src.risk.kelly import size_locked_position, size_position
 from src.signals.calibration import get_calibration_coefficients
 from src.signals.edge_calculator import binary_market_edge as _binary_market_edge
+from src.signals.decision_log import (
+    OUTCOME_CLUSTER_CAP,
+    OUTCOME_DRAWDOWN_PAUSED,
+    OUTCOME_DUP_DB,
+    OUTCOME_DUP_INPROC,
+    OUTCOME_NO_FILL,
+    OUTCOME_ORDER_FAILED,
+    OUTCOME_STAKE_BELOW_MIN,
+    OUTCOME_TRADE_FILLED,
+    OUTCOME_TRADE_PENDING,
+    log_decision,
+)
 from src.signals.evaluation_log import log_evaluation as _log_evaluation
 from src.signals.lock_rules import evaluate_lock
 from src.execution.polymarket_client import is_live, place_order
@@ -522,6 +534,28 @@ async def job_unified_pipeline() -> None:
                                 icao, side_label, edge.bucket_value,
                                 adjusted_stake, settings.MIN_STAKE_USD,
                             )
+                            # Split outcome by *cause*: PAUSED drawdown
+                            # produces multiplier=0 → adjusted=0; Kelly +
+                            # caps producing a tiny stake is a different
+                            # signal. Separate outcomes let dashboards
+                            # attribute zero-throughput days correctly.
+                            paused = dd_state.size_multiplier == 0.0
+                            await log_decision(
+                                session,
+                                market_id=market.id,
+                                direction=edge.direction,
+                                signal_kind="probability",
+                                outcome=OUTCOME_DRAWDOWN_PAUSED if paused else OUTCOME_STAKE_BELOW_MIN,
+                                requested_stake_usd=pos.stake_usd,
+                                actual_stake_usd=adjusted_stake,
+                                dd_multiplier=dd_state.size_multiplier,
+                                dd_level=dd_state.level.value,
+                                metadata={
+                                    "bucket": edge.bucket_value,
+                                    "edge": edge.edge,
+                                    "side": side_label,
+                                },
+                            )
                             continue
 
                         # Hard guard: don't double-bet a (market, direction).
@@ -540,6 +574,15 @@ async def job_unified_pipeline() -> None:
                                 "[%s] skip %s bucket=%d: already fired this tick",
                                 icao, side_label, edge.bucket_value,
                             )
+                            await log_decision(
+                                session,
+                                market_id=market.id,
+                                direction=edge.direction,
+                                signal_kind="probability",
+                                outcome=OUTCOME_DUP_INPROC,
+                                requested_stake_usd=adjusted_stake,
+                                metadata={"bucket": edge.bucket_value, "side": side_label},
+                            )
                             continue
                         if await _has_active_trade(session, market.id, edge.direction):
                             logger.info(
@@ -548,6 +591,15 @@ async def job_unified_pipeline() -> None:
                             )
                             _unified_fired_today.add(dedup_key)
                             _market_to_icao[market.id] = icao
+                            await log_decision(
+                                session,
+                                market_id=market.id,
+                                direction=edge.direction,
+                                signal_kind="probability",
+                                outcome=OUTCOME_DUP_DB,
+                                requested_stake_usd=adjusted_stake,
+                                metadata={"bucket": edge.bucket_value, "side": side_label},
+                            )
                             continue
 
                         # Cluster cap: cap total stake across all
@@ -564,6 +616,19 @@ async def job_unified_pipeline() -> None:
                                     icao, side_label, edge.bucket_value,
                                     cluster_used, adjusted_stake,
                                     settings.CLUSTER_STAKE_CAP_USD,
+                                )
+                                await log_decision(
+                                    session,
+                                    market_id=market.id,
+                                    direction=edge.direction,
+                                    signal_kind="probability",
+                                    outcome=OUTCOME_CLUSTER_CAP,
+                                    requested_stake_usd=adjusted_stake,
+                                    metadata={
+                                        "bucket": edge.bucket_value,
+                                        "cluster_used_usd": cluster_used,
+                                        "cap_usd": settings.CLUSTER_STAKE_CAP_USD,
+                                    },
                                 )
                                 continue
 
@@ -622,6 +687,22 @@ async def job_unified_pipeline() -> None:
                             )
                             _unified_fired_today.add(dedup_key)
                             _market_to_icao[market.id] = icao
+                            await log_decision(
+                                session,
+                                market_id=market.id,
+                                direction=edge.direction,
+                                signal_kind="probability",
+                                outcome=OUTCOME_TRADE_PENDING,
+                                requested_stake_usd=adjusted_stake,
+                                actual_stake_usd=trade.stake_usd,
+                                dd_multiplier=dd_state.size_multiplier,
+                                dd_level=dd_state.level.value,
+                                metadata={
+                                    "bucket": edge.bucket_value,
+                                    "edge": edge.edge,
+                                    "is_dry_run": True,
+                                },
+                            )
                         elif order_ok and (trade.stake_usd or 0.0) > 0:
                             trade.status = TradeStatus.OPEN
                             actual_stake = trade.stake_usd
@@ -636,6 +717,22 @@ async def job_unified_pipeline() -> None:
                                 f"Filled: ${actual_stake:.2f} (req ${adjusted_stake:.2f}) @ {fill:.3f}\n"
                                 f"Market: {market.question[:60]}",
                             )
+                            await log_decision(
+                                session,
+                                market_id=market.id,
+                                direction=edge.direction,
+                                signal_kind="probability",
+                                outcome=OUTCOME_TRADE_FILLED,
+                                requested_stake_usd=adjusted_stake,
+                                actual_stake_usd=actual_stake,
+                                dd_multiplier=dd_state.size_multiplier,
+                                dd_level=dd_state.level.value,
+                                metadata={
+                                    "bucket": edge.bucket_value,
+                                    "edge": edge.edge,
+                                    "fill_price": fill,
+                                },
+                            )
                         elif order_ok:
                             # FAK posted but didn't match — leave PENDING so
                             # the next pipeline tick can re-evaluate. No
@@ -644,6 +741,33 @@ async def job_unified_pipeline() -> None:
                             logger.info(
                                 "[%s] %s %s bucket=%d: FAK posted, no fill at quoted price",
                                 icao, side_label, market.id[:12], edge.bucket_value,
+                            )
+                            await log_decision(
+                                session,
+                                market_id=market.id,
+                                direction=edge.direction,
+                                signal_kind="probability",
+                                outcome=OUTCOME_NO_FILL,
+                                requested_stake_usd=adjusted_stake,
+                                metadata={"bucket": edge.bucket_value, "edge": edge.edge},
+                            )
+                        else:
+                            # place_order returned False — the FAK never
+                            # posted (no token IDs, no client, raised). Trade
+                            # row stays PENDING. Log so dashboards distinguish
+                            # this from no_fill (which IS posted, just unmatched).
+                            await log_decision(
+                                session,
+                                market_id=market.id,
+                                direction=edge.direction,
+                                signal_kind="probability",
+                                outcome=OUTCOME_ORDER_FAILED,
+                                requested_stake_usd=adjusted_stake,
+                                metadata={
+                                    "bucket": edge.bucket_value,
+                                    "edge": edge.edge,
+                                    "exchange_status": trade.exchange_status,
+                                },
                             )
 
               except Exception:

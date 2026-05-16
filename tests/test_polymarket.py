@@ -10,6 +10,7 @@ import httpx
 import pytest
 
 from src.db.models import Market, MarketSnapshot
+from src.ingestion import polymarket as polymarket_mod
 from src.ingestion.polymarket import (
     ParsedQuestion,
     fetch_weather_markets,
@@ -18,6 +19,18 @@ from src.ingestion.polymarket import (
     parse_bracket_from_question,
     parse_question,
 )
+
+
+@pytest.fixture(autouse=True)
+def _reset_rate_semaphore():
+    """``polymarket._rate_semaphore`` is module-level so it binds to the
+    first event loop pytest opens; later tests then trip
+    ``RuntimeError: ... bound to a different event loop`` when the
+    fetcher actually acquires it. Reset to a fresh semaphore around
+    every test so the per-loop binding is current.
+    """
+    polymarket_mod._rate_semaphore = asyncio.Semaphore(10)
+    yield
 
 # ---------------------------------------------------------------------------
 # Fixtures — sample Gamma API responses
@@ -306,11 +319,14 @@ class TestFetchWeatherMarkets:
         client.get = mock_get
         client.aclose = AsyncMock()
 
-        # Should not raise — returns empty list after retries exhaust
+        # Should not raise — returns empty list when every endpoint errors.
+        # Exact call_count isn't asserted: the event-slug enumeration probes
+        # one URL per (city × upcoming-day) without retries, and the legacy
+        # keyword + tag fallbacks each retry 3x. The contract that matters
+        # is graceful degradation — no exception, empty result.
         markets = await fetch_weather_markets(client=client)
         assert markets == []
-        # 3 retries for first paginated call + 3 for 1 tag call = 6
-        assert call_count == 6
+        assert call_count > 0
 
 
 # ---------------------------------------------------------------------------

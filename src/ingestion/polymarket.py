@@ -496,11 +496,21 @@ async def _fetch_event_markets_by_slug(
     trending markets (empirically verified 2026-05-16). Each successful
     response is a single-element list with the daily event and its
     bucket-markets embedded under ``markets``.
+
+    Direct httpx call (not ``_get_json``) because 404 / empty / transport
+    errors are *normal*: most (city × day) tuples have no event, and
+    Gamma briefly 5xxs under load. Bailing fast on failure costs us
+    nothing — full scan runs every 15 min. ``_get_json``'s 3-retry chain
+    with exponential backoff would multiply ~600 enumeration calls into
+    hundreds of seconds of pointless waiting on outages.
     """
     try:
-        data = await _get_json(
-            client, f"{GAMMA_BASE}/events", params={"slug": slug}
+        resp = await client.get(
+            f"{GAMMA_BASE}/events", params={"slug": slug}, timeout=10
         )
+        if resp.status_code != 200:
+            return []
+        data = resp.json()
     except Exception:
         logger.debug("event slug fetch failed: %s", slug, exc_info=True)
         return []

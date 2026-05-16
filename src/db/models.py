@@ -203,6 +203,49 @@ class EvaluationLog(Base):
     )
 
 
+class DecisionLog(Base):
+    """Append-only telemetry: one row per per-side trading decision.
+
+    Complements :class:`EvaluationLog`. ``evaluation_logs`` answers "did
+    the edge clear ``_check_filters``?" — this table answers "what
+    happened next." Outcomes cover the full post-filter pipeline:
+    ``signal_written`` / ``trade_pending`` / ``trade_filled`` (success
+    branches) and ``dup_blocked_inproc`` / ``dup_blocked_db`` /
+    ``stake_below_min`` / ``drawdown_paused`` / ``cluster_cap_hit`` /
+    ``cap_exceeded`` / ``no_token_ids`` / ``no_client`` / ``no_fill`` /
+    ``order_failed`` (skip / failure branches).
+
+    Today's debug session (2026-05-16) cost ~4 hours because 762
+    passing evaluations materialised into 0 Signal rows and we had no
+    telemetry on the gap. This table closes that.
+
+    Column name is ``metadata_json`` (not ``metadata``) because
+    ``Base.metadata`` is reserved by SQLAlchemy's declarative base.
+    """
+
+    __tablename__ = "decision_logs"
+    __table_args__ = (
+        Index("ix_decision_logs_outcome_created", "outcome", "created_at"),
+        Index("ix_decision_logs_market_created", "market_id", "created_at"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    market_id = Column(String, ForeignKey("markets.id"), nullable=False)
+    direction = Column(Enum(TradeDirection), nullable=False)
+    signal_kind = Column(String, nullable=False)  # 'probability' | 'lock'
+    outcome = Column(String, nullable=False)
+    requested_stake_usd = Column(Float)
+    actual_stake_usd = Column(Float)
+    dd_multiplier = Column(Float)
+    dd_level = Column(String)
+    metadata_json = Column(JSONB)
+    created_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+
 class BankrollLog(Base):
     __tablename__ = "bankroll_log"
 
