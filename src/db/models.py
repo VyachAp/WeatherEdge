@@ -92,6 +92,12 @@ class Signal(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     market_id = Column(String, ForeignKey("markets.id"), nullable=False)
     model_prob = Column(Float, nullable=False)
+    # Engine probability *before* `apply_calibration` was applied. The
+    # calibration regression must fit from this, not from `model_prob`,
+    # otherwise it learns a correction on top of its own correction.
+    # NULL on pre-migration rows; `consensus.py` falls back to `model_prob`.
+    raw_model_prob = Column(Float)
+    calibrated = Column(Boolean)
     market_prob = Column(Float, nullable=False)
     edge = Column(Float, nullable=False)
     direction = Column(Enum(TradeDirection), nullable=False)
@@ -176,6 +182,10 @@ class EvaluationLog(Base):
     direction = Column(Enum(TradeDirection), nullable=False)
     signal_kind = Column(String, nullable=False)  # 'probability' | 'lock'
     model_prob = Column(Float, nullable=False)
+    # Raw engine probability + flag indicating whether calibration was
+    # applied this tick. See Signal.raw_model_prob for rationale.
+    raw_model_prob = Column(Float)
+    calibrated = Column(Boolean)
     market_prob = Column(Float, nullable=False)
     edge = Column(Float, nullable=False)
     passes = Column(Boolean, nullable=False)

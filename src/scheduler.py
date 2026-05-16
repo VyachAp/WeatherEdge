@@ -566,6 +566,8 @@ async def job_unified_pipeline() -> None:
                         depth_usd=eval_side_depth or None,
                         minutes_to_close=eval_minutes_to_close,
                         routine_count=state.routine_count_today,
+                        raw_model_prob=edge_result.raw_probability,
+                        calibrated=edge_result.calibrated,
                     )
 
                     edges = [edge_result]
@@ -662,6 +664,8 @@ async def job_unified_pipeline() -> None:
                             market_prob=edge.market_price,
                             edge=edge.edge,
                             confidence=edge.our_probability,
+                            raw_model_prob=edge.raw_probability,
+                            calibrated=edge.calibrated,
                         )
 
                         trade = Trade(
@@ -1007,6 +1011,8 @@ def _binary_market_edge(
         passes=reason is None,
         reject_reason=reason,
         direction=direction,
+        raw_probability=side_prob_raw,
+        calibrated=calibrated,
     )
 
 
@@ -1024,6 +1030,8 @@ async def _log_evaluation(
     depth_usd: float | None,
     minutes_to_close: float | None,
     routine_count: int | None,
+    raw_model_prob: float | None = None,
+    calibrated: bool = False,
 ) -> None:
     """Append one ``EvaluationLog`` row capturing this edge evaluation.
 
@@ -1039,6 +1047,8 @@ async def _log_evaluation(
         direction=direction,
         signal_kind=signal_kind,
         model_prob=model_prob,
+        raw_model_prob=raw_model_prob,
+        calibrated=calibrated,
         market_prob=market_prob,
         edge=edge,
         passes=passes,
@@ -1143,6 +1153,8 @@ async def _upsert_signal(
     lock_branch: str | None = None,
     lock_routine_count: int | None = None,
     lock_observed_max_f: float | None = None,
+    raw_model_prob: float | None = None,
+    calibrated: bool = False,
 ) -> Signal:
     """Insert-or-refresh the unique ``(market_id, direction)`` Signal row.
 
@@ -1172,6 +1184,8 @@ async def _upsert_signal(
             market_id=market_id,
             direction=direction,
             model_prob=model_prob,
+            raw_model_prob=raw_model_prob,
+            calibrated=calibrated,
             market_prob=market_prob,
             edge=edge,
             confidence=confidence,
@@ -1183,6 +1197,8 @@ async def _upsert_signal(
         session.add(sig_row)
     else:
         sig_row.model_prob = model_prob
+        sig_row.raw_model_prob = raw_model_prob
+        sig_row.calibrated = calibrated
         sig_row.market_prob = market_prob
         sig_row.edge = edge
         sig_row.confidence = confidence

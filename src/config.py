@@ -26,6 +26,12 @@ class Settings(BaseSettings):
     MIN_EDGE: float = 0.05
     KELLY_FRACTION: float = 0.25
     MAX_POSITION_PCT: float = 0.05
+    # Hard ceiling on the probability passed into the Kelly formula.
+    # Defensive bound against probability-engine overconfidence: at p=1.0
+    # Kelly bets 100% of bankroll; at p=0.90 it bets a reasonable
+    # fraction. Recorded model_prob is untouched — cap is sizing-only.
+    # See `src/risk/kelly.py::size_position`.
+    KELLY_PROB_CAP: float = 0.90
     INITIAL_BANKROLL: float = 750.0
     AWC_USER_AGENT: str = "WeatherEdge/1.0 (weather-trading-bot; contact@example.com)"
     AWC_RATE_LIMIT_RPS: float = 2.0

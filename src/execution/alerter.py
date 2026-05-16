@@ -281,6 +281,18 @@ class Alerter:
             )
         ).scalar_one()
 
+        # `place_order` failures land as PENDING + exchange_status `exception:<ClassName>`.
+        # Surface the daily count so silent stream isn't invisible (446 had piled up at audit).
+        exception_count = (
+            await session.execute(
+                select(func.count(Trade.id)).where(
+                    Trade.opened_at >= today_start,
+                    Trade.status == TradeStatus.PENDING,
+                    Trade.exchange_status.like("exception:%"),
+                )
+            )
+        ).scalar_one()
+
         # Daily P&L from resolved trades
         daily_pnl = (
             await session.execute(
@@ -320,6 +332,7 @@ class Alerter:
             f"\n"
             f"\U0001f50e Signals detected: {e(signal_count)}\n"
             f"\U0001f4c8 Trades opened: {e(opened_count)}\n"
+            f"{'\u26a0 Failed orders: ' + e(exception_count) + chr(10) if exception_count else ''}"
             f"\u2705 Resolved: {e(won_count)} won, {e(lost_count)} lost\n"
             f"\U0001f4b0 P&L today: {e(f'${daily_pnl:+,.2f}')}\n"
             f"\n"

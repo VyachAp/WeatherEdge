@@ -497,7 +497,7 @@ async def place_order(
 
     except Exception as exc:
         logger.exception("Order execution error for market %s", trade.market_id)
-        trade.exchange_status = "exception"
+        trade.exchange_status = f"exception:{type(exc).__name__}"[:50]
         await _maybe_alert_version_mismatch(str(exc), trade.market_id)
         return False
 

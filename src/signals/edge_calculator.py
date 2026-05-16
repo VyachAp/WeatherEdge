@@ -43,6 +43,15 @@ class BucketEdge:
     passes: bool
     reject_reason: str | None
     direction: TradeDirection = field(default=TradeDirection.BUY_YES)
+    # Engine probability *before* calibration was applied. `our_probability`
+    # is the post-calibration value used for sizing/edge gates; this field
+    # is the calibration regression's ground-truth input. None when the
+    # producer didn't go through `apply_calibration` (e.g. bracket path).
+    raw_probability: float | None = None
+    # Whether `apply_calibration` actually corrected `our_probability` this
+    # evaluation. False when APPLY_CALIBRATION is off, cache is cold, or
+    # MIN_CALIBRATION_SAMPLES hasn't been met.
+    calibrated: bool = False
 
 
 def compute_edges(

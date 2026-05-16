@@ -364,7 +364,15 @@ class TestProjectDailyMaxResidualSlope:
     """Lever A — slope-extrapolated residual replaces the halflife decay
     when the slope and at least RESIDUAL_SLOPE_MIN_POINTS routines are
     available. Captures forecast falling further behind hour-over-hour.
+
+    Note: live `.env` disables v2 via `PROJECTION_RESIDUAL_SLOPE_ENABLED`;
+    these tests force-enable it to keep covering the v2 math contract.
     """
+
+    @pytest.fixture(autouse=True)
+    def _force_v2_enabled(self, monkeypatch):
+        from src.config import settings
+        monkeypatch.setattr(settings, "PROJECTION_RESIDUAL_SLOPE_ENABLED", True)
 
     def _slope_state(
         self,

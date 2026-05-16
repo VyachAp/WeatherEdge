@@ -45,13 +45,20 @@ async def get_calibration_coefficients(
     ``(slope, intercept)``.  Returns ``None`` when fewer than
     :data:`MIN_CALIBRATION_SAMPLES` resolved signals exist.
 
-    Convention: ``Signal.model_prob`` is stored in the **side-effective
-    frame** — i.e. it is the model's probability of the side the trade
-    actually bet on (= P(YES) for BUY_YES trades, = 1-P(YES) for BUY_NO).
-    That keeps this regression's input range consistent across both
-    directions: ``predicted`` is "model's confidence in winning",
-    ``actual`` is "did we win", and the slope/intercept describe how
-    well-calibrated those confidences are.
+    Convention: probabilities are stored in the **side-effective frame**
+    — i.e. the model's probability of the side the trade actually bet on
+    (= P(YES) for BUY_YES, = 1-P(YES) for BUY_NO). That keeps the
+    regression's input range consistent across both directions:
+    ``predicted`` is "model's confidence in winning", ``actual`` is "did
+    we win", and the slope/intercept describe how well-calibrated those
+    confidences are.
+
+    ``predicted`` reads from ``Signal.raw_model_prob`` — the engine
+    output *before* calibration was applied. Reading ``Signal.model_prob``
+    here (the calibrated value) created a feedback loop that defeated
+    the point of recalibration. Legacy rows where ``raw_model_prob IS
+    NULL`` fall back to ``model_prob`` so they continue to contribute,
+    with the caveat that those values are already calibrated.
     """
     stmt = (
         select(Signal)
@@ -65,10 +72,17 @@ async def get_calibration_coefficients(
     if len(signals) < MIN_CALIBRATION_SAMPLES:
         return None
 
+    # Fit from raw_model_prob — the engine output *before* this regression
+    # was applied. Fitting from model_prob (the calibrated value) created
+    # a feedback loop: the regression learns a correction on top of its
+    # own correction. Legacy rows have raw_model_prob=NULL; fall back to
+    # model_prob there so they still contribute (with the documented
+    # caveat that those rows are already-calibrated values).
     predicted = []
     actual = []
     for sig in signals:
-        predicted.append(sig.model_prob)
+        raw = sig.raw_model_prob if sig.raw_model_prob is not None else sig.model_prob
+        predicted.append(raw)
         won = any(t.status == TradeStatus.WON for t in sig.trades)
         actual.append(1.0 if won else 0.0)
 

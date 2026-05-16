@@ -67,8 +67,15 @@ def size_position(
     # Clamp market_prob to avoid division blowup
     market_prob = max(0.01, min(0.99, market_prob))
 
+    # Cap the probability used in Kelly to bound oversizing when the
+    # engine claims certainty. The audit on 2026-05-16 showed the
+    # `model_prob ≈ 1.0` bin only won 78 % of the time; a 0.90 cap roughly
+    # halves Kelly there without affecting well-calibrated bins.
+    # The recorded `model_prob` on the Signal/EvaluationLog rows is
+    # untouched — this is sizing-only.
+    effective_prob = min(model_prob, settings.KELLY_PROB_CAP)
     payout = 1.0 / market_prob
-    edge = model_prob * payout - 1.0
+    edge = effective_prob * payout - 1.0
 
     if edge <= 0:
         return PositionSize(stake_usd=0, kelly_pct=0, capped=False, reason="no edge")
