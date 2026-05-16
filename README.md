@@ -108,6 +108,7 @@ python -m src.cli scan            # One-shot: fetch markets & ingest snapshots
 python -m src.cli backfill -d 7   # Backfill historical market snapshots
 python -m src.cli status          # Bankroll, positions, recent signals
 python -m src.cli paper-trade -d 30   # Dry-run simulation against history
+python -m src.cli evals-report -d 7   # Filter-tuning markdown report (reject reasons, distributions, slippage)
 python -m src.cli backtest-v2 -d 30   # Replay probability pipeline
 python -m src.cli approve         # On-chain USDC/CTF contract approvals (one-time)
 python -m src.cli test-trade      # Place a tiny FOK to validate live execution

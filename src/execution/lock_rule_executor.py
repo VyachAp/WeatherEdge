@@ -215,6 +215,19 @@ async def try_lock_rule_trade(
         icao, decision.side, market.id[:12], decision.margin_f,
         effective_price, stake, pos.stake_usd, dd_state.size_multiplier,
         "; ".join(decision.reasons),
+        extra={
+            "event": "lock_sized",
+            "icao": icao,
+            "market_id": market.id,
+            "side": decision.side,
+            "branch": decision.branch,
+            "margin_f": decision.margin_f,
+            "effective_price": effective_price,
+            "stake_usd": stake,
+            "raw_stake_usd": pos.stake_usd,
+            "dd_multiplier": dd_state.size_multiplier,
+            "routine_count": decision.routine_count,
+        },
     )
 
     if stake < settings.MIN_STAKE_USD:
@@ -278,6 +291,13 @@ async def try_lock_rule_trade(
         logger.warning(
             "[%s] LOCK %s %s: order placement failed",
             icao, decision.side, market.id[:12],
+            extra={
+                "event": "lock_order_failed",
+                "icao": icao,
+                "market_id": market.id,
+                "side": decision.side,
+                "stake_usd": stake,
+            },
         )
         return 0.0
 
@@ -307,6 +327,13 @@ async def try_lock_rule_trade(
                 "[%s] LOCK %s %s: order posted but no fill (book empty at limit); "
                 "leaving open for next-tick retry",
                 icao, decision.side, market.id[:12],
+                extra={
+                    "event": "lock_no_fill",
+                    "icao": icao,
+                    "market_id": market.id,
+                    "side": decision.side,
+                    "requested_stake_usd": stake,
+                },
             )
             return 0.0
         trade.status = TradeStatus.OPEN

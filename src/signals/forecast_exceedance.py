@@ -38,7 +38,10 @@ from sqlalchemy.exc import IntegrityError
 from src.config import settings
 from src.db.engine import async_session
 from src.db.models import ForecastExceedanceAlert
-from src.execution.alerter import _escape_md2, get_alerter
+# Tests patch `get_alerter` / `_escape_md2` on this module to assert that
+# Telegram push behavior is gated correctly; the actual dispatch was
+# removed in commit 50a9a13. Keeping the imports so the patches resolve.
+from src.execution.alerter import _escape_md2, get_alerter  # noqa: F401
 from src.ingestion.openmeteo import OpenMeteoForecast
 from src.signals.mapper import f_to_c, unit_for_station
 from src.signals.projected_market_lookup import lookup_projected_binary

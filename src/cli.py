@@ -184,6 +184,203 @@ def paper_trade(days: int) -> None:
     asyncio.run(_paper_trade())
 
 
+@main.command("evals-report")
+@click.option("--days", default=30, show_default=True, help="Look-back window in days.")
+@click.option(
+    "--signal-kind", default=None,
+    type=click.Choice(["probability", "lock"], case_sensitive=False),
+    help="Restrict to one path. Default: both.",
+)
+def evals_report(days: int, signal_kind: str | None) -> None:
+    """Markdown filter-tuning report from the ``evaluation_logs`` table.
+
+    For every per-side edge evaluation in the look-back window:
+      * Pass-rate by ``reject_reason`` — which filter rejects most candidates?
+      * Edge / probability / price distribution split by PASSING vs REJECTED.
+      * Slippage post-mortem joining passing rows to the resulting Trade
+        (``fill_price`` vs the snapshotted ``submit_yes_*`` quote).
+
+    ``evaluation_logs`` is the source of truth for filter tuning — ``signals``
+    only carries passing edges and is de-duplicated per (market, side), so
+    this is the only place to count the rejected mass.
+    """
+    from statistics import mean, median
+
+    from sqlalchemy import func, select
+
+    from src.db.engine import async_session
+    from src.db.models import EvaluationLog, Trade
+
+    def _pct(num: int, denom: int) -> str:
+        return f"{(num / denom * 100):5.1f}%" if denom else "  n/a"
+
+    def _quantiles(values: list[float]) -> tuple[float, float, float] | None:
+        if not values:
+            return None
+        s = sorted(values)
+        n = len(s)
+        # Nearest-rank for tiny samples — interpolation isn't worth the
+        # numpy dependency here.
+        p25 = s[max(0, n // 4 - 1)]
+        p50 = s[n // 2]
+        p75 = s[min(n - 1, (3 * n) // 4)]
+        return p25, p50, p75
+
+    async def _run() -> None:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+        async with async_session() as session:
+            stmt = (
+                select(EvaluationLog)
+                .where(EvaluationLog.created_at >= cutoff)
+                .order_by(EvaluationLog.created_at)
+            )
+            if signal_kind:
+                stmt = stmt.where(EvaluationLog.signal_kind == signal_kind.lower())
+            rows = (await session.execute(stmt)).scalars().all()
+
+            total = len(rows)
+            if total == 0:
+                click.echo(
+                    f"No evaluation_logs rows in the last {days}d "
+                    f"(signal_kind={signal_kind or 'any'}). "
+                    "Has the scheduler been running?"
+                )
+                return
+
+            passing = [r for r in rows if r.passes]
+            rejected = [r for r in rows if not r.passes]
+
+            kind_label = signal_kind.lower() if signal_kind else "all"
+            click.echo(f"# Evaluation report — {kind_label} path, last {days}d")
+            click.echo()
+            click.echo(f"- **Total evaluations:** {total:,}")
+            click.echo(f"- **Passing:** {len(passing):,}  ({_pct(len(passing), total).strip()})")
+            click.echo(f"- **Rejected:** {len(rejected):,}  ({_pct(len(rejected), total).strip()})")
+            click.echo()
+
+            # --- 1. Breakdown by reject_reason. The string is the gate name
+            #     emitted by `_check_filters`; bucketing by its prefix gives a
+            #     useful "which filter kills the most candidates" summary.
+            click.echo("## Reject reasons")
+            click.echo()
+            click.echo("| Reason prefix | Count | % of evaluations |")
+            click.echo("|---|---:|---:|")
+            buckets: dict[str, int] = {}
+            for r in rejected:
+                reason = r.reject_reason or "(unknown)"
+                # Take the part before the first " <" or numeric token so
+                # "edge 0.04 < 0.05" and "edge 0.02 < 0.05" both roll up
+                # to "edge".
+                prefix = reason.split(" ")[0]
+                buckets[prefix] = buckets.get(prefix, 0) + 1
+            for prefix, count in sorted(buckets.items(), key=lambda kv: -kv[1]):
+                click.echo(f"| {prefix} | {count:,} | {_pct(count, total).strip()} |")
+            click.echo()
+
+            # --- 2. Split by signal_kind so the user can spot if e.g. the
+            #     probability path is dominated by rejects while lock fires
+            #     mostly pass (or vice versa).
+            kinds: dict[str, tuple[int, int]] = {}
+            for r in rows:
+                pass_count, total_count = kinds.get(r.signal_kind, (0, 0))
+                kinds[r.signal_kind] = (
+                    pass_count + (1 if r.passes else 0),
+                    total_count + 1,
+                )
+            if len(kinds) > 1:
+                click.echo("## By signal_kind")
+                click.echo()
+                click.echo("| Kind | Total | Passing | Pass-rate |")
+                click.echo("|---|---:|---:|---:|")
+                for kind, (p, t) in sorted(kinds.items()):
+                    click.echo(f"| {kind} | {t:,} | {p:,} | {_pct(p, t).strip()} |")
+                click.echo()
+
+            # --- 3. Per-field distributions, split PASS vs REJECT. Anything
+            #     that diverges sharply between the two columns is a filter
+            #     candidate (or a sign the existing gate is mis-tuned).
+            click.echo("## Distributions (P25 / P50 / P75)")
+            click.echo()
+            click.echo("| Field | Group | P25 | P50 | P75 |")
+            click.echo("|---|---|---:|---:|---:|")
+            for field in ("edge", "model_prob", "market_prob", "depth_usd"):
+                for group_label, group_rows in (
+                    ("PASS", passing), ("REJECT", rejected),
+                ):
+                    values = [
+                        getattr(r, field) for r in group_rows
+                        if getattr(r, field) is not None
+                    ]
+                    q = _quantiles(values)
+                    if q is None:
+                        continue
+                    click.echo(
+                        f"| {field} | {group_label} "
+                        f"| {q[0]:7.3f} | {q[1]:7.3f} | {q[2]:7.3f} |"
+                    )
+            click.echo()
+
+            # --- 4. Slippage post-mortem. For passing rows that ended up
+            #     producing a filled Trade, compare submitted quote against
+            #     realised fill_price. Matching is best-effort: nearest Trade
+            #     by (market_id, direction, ±60s of submit_at).
+            click.echo("## Slippage (passing edges with realised fills)")
+            click.echo()
+            trade_rows = (
+                await session.execute(
+                    select(Trade)
+                    .where(Trade.fill_price.is_not(None))
+                    .where(Trade.opened_at >= cutoff)
+                )
+            ).scalars().all()
+            # Index by (market_id, direction) → list of Trades for fast lookup.
+            trade_index: dict[tuple[str, str], list[Trade]] = {}
+            for t in trade_rows:
+                key = (t.market_id, t.direction.value)
+                trade_index.setdefault(key, []).append(t)
+
+            slippages: list[float] = []
+            spread_walked: list[float] = []
+            matched = 0
+            for r in passing:
+                trades = trade_index.get((r.market_id, r.direction.value), [])
+                if not trades:
+                    continue
+                t = trades[0]  # first one; multiple rare and won't change the picture
+                if t.submit_yes_ask is None or t.submit_yes_bid is None:
+                    continue
+                mid = (t.submit_yes_bid + t.submit_yes_ask) / 2.0
+                # For BUY_YES the effective cost is the ask; slippage =
+                # fill_price - mid (positive = we paid above mid).
+                # For BUY_NO, fill_price is the NO-token fill and mid is
+                # the YES mid — translate to NO mid (1 - mid).
+                ref_mid = mid if r.direction.value == "BUY_YES" else (1.0 - mid)
+                slippages.append(t.fill_price - ref_mid)
+                spread_walked.append(t.submit_yes_ask - t.submit_yes_bid)
+                matched += 1
+
+            if not slippages:
+                click.echo("_No passing evals with realised fills in this window._")
+            else:
+                click.echo(f"- **Matched fills:** {matched}")
+                click.echo(
+                    f"- **Mean slippage vs mid:** {mean(slippages):+.4f} "
+                    f"(median {median(slippages):+.4f})"
+                )
+                click.echo(
+                    f"- **Mean submit-time spread:** {mean(spread_walked):.4f} "
+                    f"(median {median(spread_walked):.4f})"
+                )
+                click.echo()
+                click.echo(
+                    "_A positive slippage with a non-trivial spread means we're "
+                    "paying away spread on entry; investigate whether MIN_DEPTH_USD "
+                    "or the close-buffer gate needs tightening._"
+                )
+
+    asyncio.run(_run())
+
+
 @main.command("backtest-v2")
 @click.option("--days", default=30, show_default=True, help="Days of history to backtest.")
 @click.option("--stations", default="", help="Comma-separated ICAO codes (default: all stations with data).")

@@ -20,6 +20,7 @@ python -m src.cli run                  # full daemon (health on :8080)
 python -m src.cli backfill --days 30   # historical markets
 python -m src.cli backtest-v2 --days 30   # replay probability pipeline
 python -m src.cli paper-trade --days 30   # dry simulation
+python -m src.cli evals-report --days 7   # filter-tuning markdown report
 python -m src.cli bet find --city Phoenix --date 2026-04-30  # market lookup
 python scripts/backtest_lock_rule.py --days 30  # lock-rule backtest
 ```
@@ -299,7 +300,7 @@ Tests in `tests/test_<module>.py`. Mock external APIs at the module boundary (e.
 | `src/persistence/dedup.py` | DB-backed dedup helpers — race-safe `INSERT … ON CONFLICT DO UPDATE … RETURNING` upsert + PENDING/OPEN trade-existence check. | `has_active_trade`, `upsert_signal` |
 | `src/persistence/cache_rollover.py` | Per-station local-day in-process cache rollover + the dedup dicts that are reset on station-local midnight. | `locked_markets_fired_today`, `unified_fired_today`, `last_routine_seen`, `market_to_icao`, `local_day_seen`, `maybe_clear_per_station_caches`, `record_lock_fire` |
 | `src/risk/cluster_cap.py` | Anti-correlation guard summing currently-staked $ across same parsed_location + same end_date.date() bracket/exactly cluster. Returns 0 for non-bracket markets. | `cluster_stake_used` |
-| `src/monitoring/logging.py` | Structured JSON logging for the production scheduler. | `JSONFormatter`, `configure_logging` |
+| `src/monitoring/logging.py` | Structured JSON logging for the production scheduler. ``JSONFormatter`` merges ``extra={...}`` fields into the JSON payload so callers can ``logger.info("msg", extra={"icao": ..., "market_id": ...})`` without baking identifiers into the message string. | `JSONFormatter`, `configure_logging` |
 | `src/monitoring/health.py` | stdlib asyncio health-check server. Closes over a scheduler-status callable to avoid circular import. | `start_health_server` |
 | `src/signals/state_aggregator.py` | Per-ICAO weather state + det/ensemble blend + residual-slope fit + fast-poll input cache | `WeatherState`, `aggregate_state`, `build_state_from_metars`, `_blend_forecasts`, `_compute_residual_slope`, `get_cached_aggregation_inputs`, `clear_state_cache` |
 | `src/signals/probability_engine.py` | Signal-based bucket distribution | `BucketDistribution`, `compute_distribution` |
@@ -327,7 +328,7 @@ Tests in `tests/test_<module>.py`. Mock external APIs at the module boundary (e.
 | `src/db/models.py` | SQLAlchemy ORM | `Market`, `Signal`, `Trade`, `EvaluationLog`, `StationBias`, `MetarObservation`, `ForecastExceedanceAlert`, `ForecastArchive`, etc. |
 | `src/ingestion/forecast_archive.py` | Snapshots every `OpenMeteoForecast` blend into `ForecastArchive` for replay-capable backtests | `archive_forecast_snapshot` |
 | `src/config.py` | Pydantic settings | `settings` |
-| `src/cli.py` | CLI entry points | `run`, `scan`, `backfill`, `status`, `paper-trade`, `backtest-v2`, `migrate`, `approve`, `test-trade`, `bet {place,info,search,find,cancel,orders,portfolio,redeem}` |
+| `src/cli.py` | CLI entry points | `run`, `scan`, `backfill`, `status`, `paper-trade`, `evals-report`, `backtest-v2`, `migrate`, `approve`, `test-trade`, `bet {place,info,search,find,cancel,orders,portfolio,redeem}` |
 | `scripts/backtest_lock_rule.py` | Replay lock-rule trader against resolved markets + DB METARs | standalone |
 | `scripts/debug_pipeline.py` | Trace the unified pipeline for one market/station, no orders | standalone |
 | `scripts/inspect_loss.py` | Post-mortem drilldown for a single losing trade | standalone |

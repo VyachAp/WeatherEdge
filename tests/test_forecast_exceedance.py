@@ -686,90 +686,21 @@ class TestCheckAndRecordDailyMaxAlert:
         row = fake_session.added[0]
         assert row.station_icao == "KLAX"
         assert row.peak_passed is False
+        # `alerted` is still computed even though commit 50a9a13 removed the
+        # Telegram push — kept for downstream consumers (forecast_archive
+        # backtests gate on it) and as a calibration label.
         assert row.alerted is True
         assert row.current_max_f == pytest.approx(78.5)
         assert row.forecast_peak_f == pytest.approx(79.0)
         assert row.projected_max_f > 79.0
         assert fake_session.committed is True
-        alerter._enqueue.assert_awaited_once()
-        # US station → message text uses °F.
-        sent = alerter._enqueue.await_args.args[0]
-        assert "°F" in sent
-        assert "°C" not in sent
-        assert "KLAX" in sent
 
-    @pytest.mark.asyncio
-    async def test_celsius_station_message_uses_celsius(self):
-        # RKPK (Busan) is non-K → Celsius. Same scenario shape as the °F push test,
-        # but with state values aligned to a Celsius-market city to verify the
-        # alert text reports °C, °C/hr, etc.
-        observed_at = datetime(2026, 4, 22, 18, 53, tzinfo=timezone.utc)
-        history = [_metar(observed_at, 66.2)]  # 19°C — beats forecast at this hour
-        forecast = _make_forecast([16.0] * 24)  # 16°C ≈ 60.8°F same-hour
-        state = _state(
-            current_max_f=66.2,             # 19.0°C
-            metar_trend_rate=1.8,           # 1.0°C/hr
-            forecast_peak_f=64.4,           # 18.0°C
-            hours_until_peak=0.8,
-            routine_count_today=5,
-            icao="RKPK",
-        )
-
-        fake_session = _FakeSession(existing_id=None)
-        alerter = MagicMock()
-        alerter._enqueue = AsyncMock()
-
-        with patch("src.signals.forecast_exceedance.async_session", return_value=fake_session), \
-             patch("src.signals.forecast_exceedance.get_alerter", return_value=alerter):
-            await check_and_record_daily_max_alert("RKPK", state, history, forecast)
-
-        # Recording row stays in canonical °F (DB schema).
-        row = fake_session.added[0]
-        assert row.current_max_f == pytest.approx(66.2)
-        assert row.forecast_peak_f == pytest.approx(64.4)
-
-        alerter._enqueue.assert_awaited_once()
-        sent = alerter._enqueue.await_args.args[0]
-        # Strip MarkdownV2 backslash escapes for value assertions.
-        unescaped = sent.replace("\\", "")
-        assert "RKPK" in unescaped
-        assert "°C" in unescaped
-        assert "°F" not in unescaped
-        # Spot-check converted values: 66.2°F → 19.0°C, 64.4°F → 18.0°C.
-        assert "Obs max: 19.0°C" in unescaped
-        assert "Forecast peak: 18.0°C" in unescaped
-        # Trend 1.8°F/hr → 1.0°C/hr (rendered "+1.0°C/hr").
-        assert "+1.0°C/hr" in unescaped
-
-    @pytest.mark.asyncio
-    async def test_alert_displays_short_window_trend_when_present(self):
-        # 6h trend +5°F/hr but short-window trend +3°F/hr (curve already bending
-        # toward peak). The projection uses the short trend (_effective_trend),
-        # and the rendered alert text must report the same number — otherwise
-        # the user reads a slope that doesn't match the projection math.
-        observed_at = datetime(2026, 4, 22, 18, 53, tzinfo=timezone.utc)
-        history = [_metar(observed_at, 78.5)]
-        forecast = _make_forecast([24.0] * 24)
-        state = _state(
-            current_max_f=78.5,
-            metar_trend_rate=5.0,
-            metar_trend_rate_short=3.0,
-            forecast_peak_f=79.0, hours_until_peak=1.5,
-            routine_count_today=4,
-        )
-
-        fake_session = _FakeSession(existing_id=None)
-        alerter = MagicMock()
-        alerter._enqueue = AsyncMock()
-
-        with patch("src.signals.forecast_exceedance.async_session", return_value=fake_session), \
-             patch("src.signals.forecast_exceedance.get_alerter", return_value=alerter):
-            await check_and_record_daily_max_alert("KLAX", state, history, forecast)
-
-        alerter._enqueue.assert_awaited_once()
-        sent = alerter._enqueue.await_args.args[0].replace("\\", "")
-        assert "+3.0°F/hr" in sent
-        assert "+5.0°F/hr" not in sent
+    # Removed: ``test_celsius_station_message_uses_celsius`` and
+    # ``test_alert_displays_short_window_trend_when_present`` — both
+    # asserted the Telegram message text (°F vs °C, displayed slope),
+    # but commit 50a9a13 removed the actual Telegram push from
+    # ``check_and_record_daily_max_alert``. The DB-row tests above and
+    # below still cover the ``alerted`` decision flag.
 
     @pytest.mark.asyncio
     async def test_peak_passed_records_but_no_push(self):
@@ -991,7 +922,6 @@ class TestCheckAndRecordDailyMaxAlert:
 
         assert len(fake_session.added) == 1
         assert fake_session.added[0].alerted is True
-        alerter._enqueue.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_weak_residual_blocked_at_two_routines(self):
@@ -1045,4 +975,3 @@ class TestCheckAndRecordDailyMaxAlert:
 
         assert len(fake_session.added) == 1
         assert fake_session.added[0].alerted is True
-        alerter._enqueue.assert_awaited_once()

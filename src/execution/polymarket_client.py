@@ -458,6 +458,15 @@ async def place_order(
                 trade.market_id, trade.direction.value,
                 limit_price, trade.stake_usd,
                 trade.order_id, trade.exchange_status,
+                extra={
+                    "event": "order_posted",
+                    "market_id": trade.market_id,
+                    "side": trade.direction.value,
+                    "limit_price": limit_price,
+                    "stake_usd": trade.stake_usd,
+                    "order_id": trade.order_id,
+                    "exchange_status": trade.exchange_status,
+                },
             )
             if trade.order_id:
                 # Fill-details lookup is best-effort: the order is already
@@ -481,16 +490,42 @@ async def place_order(
                         trade.fill_price or 0.0,
                         trade.stake_usd,
                         limit_price,
+                        extra={
+                            "event": "order_filled",
+                            "market_id": trade.market_id,
+                            "side": trade.direction.value,
+                            "order_id": trade.order_id,
+                            "filled_size": trade.filled_size,
+                            "fill_price": trade.fill_price,
+                            "stake_usd": trade.stake_usd,
+                            "limit_price": limit_price,
+                        },
                     )
                 else:
                     logger.info(
                         "FAK order posted but no fill at limit %.3f (book empty at/below limit, or still queued)",
                         limit_price,
+                        extra={
+                            "event": "order_no_fill",
+                            "market_id": trade.market_id,
+                            "side": trade.direction.value,
+                            "order_id": trade.order_id,
+                            "limit_price": limit_price,
+                        },
                     )
             return True
 
         error_msg = resp.get("errorMsg", "unknown error")
-        logger.error("Order failed: market=%s error=%s", trade.market_id, error_msg)
+        logger.error(
+            "Order failed: market=%s error=%s",
+            trade.market_id, error_msg,
+            extra={
+                "event": "order_failed",
+                "market_id": trade.market_id,
+                "side": trade.direction.value,
+                "error_msg": error_msg,
+            },
+        )
         trade.exchange_status = f"failed: {error_msg}"
         await _maybe_alert_version_mismatch(error_msg, trade.market_id)
         return False
