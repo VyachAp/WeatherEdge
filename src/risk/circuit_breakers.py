@@ -13,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.exc import ProgrammingError
 
 from src.config import settings
 from src.db.models import BotState, Trade, TradeStatus
@@ -35,7 +36,19 @@ _hydrated_from_db: bool = False
 
 
 async def _load_paused_until(session: AsyncSession) -> datetime | None:
-    row = await session.get(BotState, _PAUSED_UNTIL_KEY)
+    # Fail-open if the bot_state migration hasn't been applied yet: missing
+    # table means there's no persisted pause to honor, so trading proceeds
+    # under the in-process default. The alternative — bubbling the
+    # ProgrammingError up — silently kills every pipeline tick.
+    try:
+        row = await session.get(BotState, _PAUSED_UNTIL_KEY)
+    except ProgrammingError:
+        await session.rollback()
+        logger.warning(
+            "bot_state table missing — circuit-breaker pause not persisted. "
+            "Run `alembic upgrade head` to enable cross-restart pauses."
+        )
+        return None
     if row is None or row.value is None:
         return None
     iso = row.value.get("until_iso") if isinstance(row.value, dict) else None
@@ -49,28 +62,31 @@ async def _load_paused_until(session: AsyncSession) -> datetime | None:
 
 
 async def _persist_paused_until(session: AsyncSession, until: datetime | None) -> None:
-    if until is None:
-        # Clear the row entirely — easier to reason about than NULL value.
-        existing = await session.get(BotState, _PAUSED_UNTIL_KEY)
-        if existing is not None:
-            await session.delete(existing)
-        return
-    stmt = (
-        pg_insert(BotState)
-        .values(
-            key=_PAUSED_UNTIL_KEY,
-            value={"until_iso": until.isoformat()},
-            updated_at=datetime.now(timezone.utc),
+    try:
+        if until is None:
+            existing = await session.get(BotState, _PAUSED_UNTIL_KEY)
+            if existing is not None:
+                await session.delete(existing)
+            return
+        stmt = (
+            pg_insert(BotState)
+            .values(
+                key=_PAUSED_UNTIL_KEY,
+                value={"until_iso": until.isoformat()},
+                updated_at=datetime.now(timezone.utc),
+            )
+            .on_conflict_do_update(
+                index_elements=["key"],
+                set_={
+                    "value": {"until_iso": until.isoformat()},
+                    "updated_at": datetime.now(timezone.utc),
+                },
+            )
         )
-        .on_conflict_do_update(
-            index_elements=["key"],
-            set_={
-                "value": {"until_iso": until.isoformat()},
-                "updated_at": datetime.now(timezone.utc),
-            },
-        )
-    )
-    await session.execute(stmt)
+        await session.execute(stmt)
+    except ProgrammingError:
+        await session.rollback()
+        logger.warning("bot_state table missing — pause not persisted across restarts.")
 
 
 @dataclass

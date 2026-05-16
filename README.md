@@ -121,6 +121,9 @@ python -m src.cli bet place <market-id> --side YES --usd 10
 python -m src.cli bet portfolio
 python -m src.cli bet redeem --all        # CTF redemption after resolution
 
+# Maintenance
+python -m src.cli admin reset-drawdown-peak  # Reset DrawdownMonitor's stuck peak; restart scheduler after
+
 # Standalone backtest of the lock-rule trader
 python scripts/backtest_lock_rule.py --days 30
 ```

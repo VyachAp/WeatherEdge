@@ -3025,5 +3025,80 @@ def bet_redeem(
     asyncio.run(_redeem())
 
 
+@main.group()
+def admin() -> None:
+    """One-shot maintenance commands."""
+
+
+@admin.command("reset-drawdown-peak")
+@click.option("--yes", "-y", "skip_confirm", is_flag=True, help="Skip confirmation prompt.")
+@click.option("--dry-run", is_flag=True, help="Show what would change without writing.")
+def reset_drawdown_peak(skip_confirm: bool, dry_run: bool) -> None:
+    """Reset DrawdownMonitor's peak to current equity.
+
+    Inserts a fresh BankrollLog row with peak = balance = get_current_bankroll().
+    DrawdownMonitor.load_state reads this row at next scheduler startup, so
+    the running process MUST be restarted for the change to take effect.
+
+    Use this after a bankroll-equation correction that left an inflated
+    `peak` in the latest BankrollLog row, which pins drawdown_pct >
+    PAUSE_THRESHOLD and silently zeros every Kelly stake.
+    """
+
+    async def _reset() -> None:
+        from datetime import datetime, timezone
+
+        from sqlalchemy import select
+
+        from src.db.engine import async_session
+        from src.db.models import BankrollLog
+        from src.resolution import get_current_bankroll
+
+        async with async_session() as session:
+            prior = (
+                await session.execute(
+                    select(BankrollLog)
+                    .order_by(BankrollLog.timestamp.desc())
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            current = await get_current_bankroll(session)
+
+            click.echo("Current state:")
+            if prior is not None:
+                click.echo(f"  Prior row #{prior.id} @ {prior.timestamp.isoformat()}")
+                click.echo(f"    balance={prior.balance:.2f}  peak={prior.peak:.2f}  dd_pct={prior.drawdown_pct:.4f}")
+            else:
+                click.echo("  No prior BankrollLog row (table empty).")
+            click.echo(f"  Computed current bankroll: ${current:.2f}")
+            click.echo()
+            click.echo("Will insert:")
+            click.echo(f"  BankrollLog(balance={current:.2f}, peak={current:.2f}, drawdown_pct=0.0)")
+            click.echo()
+
+            if dry_run:
+                click.echo("--dry-run: no row written.")
+                return
+
+            if not skip_confirm:
+                click.confirm("Proceed?", abort=True)
+
+            row = BankrollLog(
+                balance=current,
+                peak=current,
+                drawdown_pct=0.0,
+                timestamp=datetime.now(timezone.utc),
+            )
+            session.add(row)
+            await session.commit()
+            click.echo(f"Inserted BankrollLog row #{row.id}.")
+            click.echo()
+            click.echo("⚠  RESTART the scheduler for the change to take effect.")
+            click.echo("   DrawdownMonitor._peak is loaded once at startup; the running")
+            click.echo("   process is still holding the inflated peak in memory.")
+
+    asyncio.run(_reset())
+
+
 if __name__ == "__main__":
     main()

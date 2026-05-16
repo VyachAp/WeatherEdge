@@ -50,6 +50,41 @@ _WEATHER_KW_RE = _re.compile(
 
 WEATHER_TAGS: list[str] = ["weather"]
 
+# Polymarket city-slug overrides: cases where the city's name in
+# ``src/signals/mapper.py::CITY_ICAO`` doesn't slugify to the slug Polymarket
+# actually uses in event URLs (e.g. New York → "nyc", not "new-york").
+# Empirically derived from the 2026-05-14 snapshot of active weather events.
+# Append a row when a new city's first scan returns 0 events at the expected
+# slug — likely a naming mismatch to fix here.
+POLYMARKET_CITY_SLUG_OVERRIDES: dict[str, str] = {
+    "new york": "nyc",
+    "new york city": "nyc",
+    "washington dc": "washington",
+}
+
+# Maximum days ahead to enumerate when discovering daily-temperature events.
+# Polymarket typically posts 5 trading days at a time; 6 covers same-day +
+# weekend gap. Each (city × day) is one Gamma API call.
+_EVENT_SLUG_LOOKAHEAD_DAYS = 6
+
+
+def _city_to_polymarket_slug(city: str) -> str:
+    """Convert a CITY_ICAO key (e.g. "san francisco") to the Polymarket
+    event-URL slug ("san-francisco" / "nyc")."""
+    city_lc = city.strip().lower()
+    if city_lc in POLYMARKET_CITY_SLUG_OVERRIDES:
+        return POLYMARKET_CITY_SLUG_OVERRIDES[city_lc]
+    return re.sub(r"\s+", "-", city_lc)
+
+
+def _event_slug_for(city: str, target_date: datetime) -> str:
+    """Build the Polymarket event slug used for a city's daily-max market
+    on a target date. Format: ``highest-temperature-in-<city>-on-<month>-<day>-<year>``.
+    Month name is lowercased English (e.g. ``may``)."""
+    city_slug = _city_to_polymarket_slug(city)
+    month_name = target_date.strftime("%B").lower()
+    return f"highest-temperature-in-{city_slug}-on-{month_name}-{target_date.day}-{target_date.year}"
+
 # Rate-limit: ≤10 requests / second
 _rate_semaphore = asyncio.Semaphore(10)
 _rate_interval = 1.0  # seconds
@@ -450,13 +485,90 @@ async def _get_json(client: httpx.AsyncClient, url: str,
 # ---------------------------------------------------------------------------
 
 
+async def _fetch_event_markets_by_slug(
+    client: httpx.AsyncClient, slug: str
+) -> list[dict[str, Any]]:
+    """Fetch one event from Gamma by exact slug, return embedded markets.
+
+    The ``/events?slug=<event-slug>`` endpoint is the only Gamma path that
+    currently surfaces weather markets — the ``/markets`` listing silently
+    ignores ``tag=weather`` / ``feeType=weather_fees`` and returns generic
+    trending markets (empirically verified 2026-05-16). Each successful
+    response is a single-element list with the daily event and its
+    bucket-markets embedded under ``markets``.
+    """
+    try:
+        data = await _get_json(
+            client, f"{GAMMA_BASE}/events", params={"slug": slug}
+        )
+    except Exception:
+        logger.debug("event slug fetch failed: %s", slug, exc_info=True)
+        return []
+    if not data or not isinstance(data, list):
+        return []
+    event = data[0]
+    return [m for m in (event.get("markets") or []) if isinstance(m, dict)]
+
+
+async def _discover_by_event_slugs(
+    client: httpx.AsyncClient, seen: dict[str, dict[str, Any]]
+) -> int:
+    """Enumerate (city × upcoming-day) event slugs, fetch concurrently, merge
+    every embedded market into ``seen``. Returns number of new markets added.
+    """
+    from src.signals.mapper import CITY_ICAO
+
+    # Deduplicate city slugs (CITY_ICAO has aliases like "new york" /
+    # "new york city" mapping to KJFK; both produce slug "nyc").
+    city_slugs = sorted({_city_to_polymarket_slug(c) for c in CITY_ICAO})
+
+    now = datetime.utcnow()
+    slugs: list[str] = []
+    for city_slug in city_slugs:
+        for day_offset in range(_EVENT_SLUG_LOOKAHEAD_DAYS):
+            target = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            target_date = target.fromordinal(target.toordinal() + day_offset)
+            month_name = target_date.strftime("%B").lower()
+            slugs.append(
+                f"highest-temperature-in-{city_slug}-on-{month_name}-{target_date.day}-{target_date.year}"
+            )
+
+    sem = asyncio.Semaphore(8)
+
+    async def _one(slug: str) -> list[dict[str, Any]]:
+        async with sem:
+            return await _fetch_event_markets_by_slug(client, slug)
+
+    results = await asyncio.gather(*[_one(s) for s in slugs])
+    added = 0
+    for markets in results:
+        for m in markets:
+            mid = m.get("id") or m.get("conditionId")
+            if mid and mid not in seen:
+                seen[mid] = m
+                added += 1
+    logger.info(
+        "Event-slug enumeration: %d slugs probed, %d markets discovered",
+        len(slugs), added,
+    )
+    return added
+
+
 async def fetch_weather_markets(client: httpx.AsyncClient | None = None) -> list[dict[str, Any]]:
     """Fetch active weather markets from the Gamma API.
 
-    Strategy:
-      1. Paginate through all active markets, keyword-filter locally.
-      2. Also query tag-filtered endpoints for "weather" and "climate".
-      3. Deduplicate by market id.
+    Strategy (primary first, fallbacks defensive):
+      1. **Event-slug enumeration** — for every configured city × upcoming
+         day, hit ``/events?slug=highest-temperature-in-<city>-on-<month>-<day>-<year>``
+         and flatten the embedded ``markets`` list. This is the only path
+         that currently works (2026-05-16); see ``_fetch_event_markets_by_slug``.
+      2. **Keyword scan** — paginate ``/markets?active=true&closed=false``
+         and locally filter via ``is_weather_market``. Kept as a fallback
+         in case Polymarket restores the listing behavior; returns 0 today.
+      3. **Tag scan** — ``/markets?tag=weather``. Silently ignored by Gamma
+         today (returns generic markets), so we ``is_weather_market``-filter
+         the response defensively.
+      4. Deduplicate by market id.
     """
     own_client = client is None
     if own_client:
@@ -465,10 +577,18 @@ async def fetch_weather_markets(client: httpx.AsyncClient | None = None) -> list
     seen: dict[str, dict[str, Any]] = {}
 
     try:
-        # --- keyword scan: paginate through active markets ---
+        # --- primary: event-slug enumeration ---
+        await _discover_by_event_slugs(client, seen)
+
+        # --- fallback 1: paginated keyword scan ---
+        # Gamma's ``/markets`` returns 422 around offset=10000, so bound the
+        # paginator below that. Real discovery now comes from the event-slug
+        # enumeration above; this only exists in case Polymarket restores
+        # weather markets to the regular listing.
         offset = 0
         limit = 100
-        while True:
+        MAX_OFFSET = 10000
+        while offset < MAX_OFFSET:
             params: dict[str, Any] = {
                 "active": "true",
                 "closed": "false",
@@ -478,7 +598,7 @@ async def fetch_weather_markets(client: httpx.AsyncClient | None = None) -> list
             try:
                 batch = await _get_json(client, MARKETS_URL, params=params)
             except Exception:
-                logger.exception("Failed to fetch markets at offset %d", offset)
+                logger.debug("keyword-scan fallback stopped at offset %d", offset, exc_info=True)
                 break
 
             if not batch:
@@ -494,7 +614,8 @@ async def fetch_weather_markets(client: httpx.AsyncClient | None = None) -> list
             offset += limit
             logger.debug("Fetched %d markets so far, %d weather", offset, len(seen))
 
-        # --- tag-based queries ---
+        # --- fallback 2: tag-based queries (filter response defensively;
+        # Gamma silently ignores ``tag=`` today and returns generic markets) ---
         for tag in WEATHER_TAGS:
             try:
                 batch = await _get_json(client, MARKETS_URL, params={
@@ -506,7 +627,7 @@ async def fetch_weather_markets(client: httpx.AsyncClient | None = None) -> list
                 continue
             for m in (batch or []):
                 mid = m.get("id") or m.get("conditionId")
-                if mid and mid not in seen:
+                if mid and mid not in seen and is_weather_market(m):
                     seen[mid] = m
 
     finally:
