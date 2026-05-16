@@ -66,8 +66,10 @@ _NO_LOCK = LockDecision(side=None)
 # on `exactly` markets that the bot enters at LOCK_RULE_MAX_PRICE near 0.95,
 # so each win pays ~$0.05/$1 staked while each loss costs ~$1/$1 staked —
 # breakeven needs ≥95% accuracy. Tighter gates than threshold markets.
-RANGE_LOCK_MIN_ROUTINES = 4
-RANGE_LOCK_MARGIN_MULTIPLIER = 2.0
+# Bound from `settings` so the operator can override via .env (see
+# `src.config.Settings`); restart required for changes to take effect.
+RANGE_LOCK_MIN_ROUTINES: int = settings.RANGE_LOCK_MIN_ROUTINES
+RANGE_LOCK_MARGIN_MULTIPLIER: float = settings.RANGE_LOCK_MARGIN_MULTIPLIER
 
 
 def _market_daily_max(

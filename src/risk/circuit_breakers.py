@@ -12,9 +12,10 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import func, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from src.config import settings
-from src.db.models import Trade, TradeStatus
+from src.db.models import BotState, Trade, TradeStatus
 
 from typing import TYPE_CHECKING
 
@@ -23,9 +24,53 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Persistent pause state (resets on process restart, which is acceptable
-# since consecutive losses are re-queried from DB each check).
+# Persisted in ``bot_state`` so the protective window survives a process
+# restart. In-process variable acts as a cache: ``None`` means "not yet
+# hydrated from DB this process" — the first call to
+# ``check_circuit_breakers`` after boot reads from DB once, then in-memory
+# until set/clear writes back through.
+_PAUSED_UNTIL_KEY = "circuit_breakers.paused_until"
 _paused_until: datetime | None = None
+_hydrated_from_db: bool = False
+
+
+async def _load_paused_until(session: AsyncSession) -> datetime | None:
+    row = await session.get(BotState, _PAUSED_UNTIL_KEY)
+    if row is None or row.value is None:
+        return None
+    iso = row.value.get("until_iso") if isinstance(row.value, dict) else None
+    if not iso:
+        return None
+    try:
+        return datetime.fromisoformat(iso)
+    except ValueError:
+        logger.warning("Invalid paused_until value in bot_state: %r", row.value)
+        return None
+
+
+async def _persist_paused_until(session: AsyncSession, until: datetime | None) -> None:
+    if until is None:
+        # Clear the row entirely — easier to reason about than NULL value.
+        existing = await session.get(BotState, _PAUSED_UNTIL_KEY)
+        if existing is not None:
+            await session.delete(existing)
+        return
+    stmt = (
+        pg_insert(BotState)
+        .values(
+            key=_PAUSED_UNTIL_KEY,
+            value={"until_iso": until.isoformat()},
+            updated_at=datetime.now(timezone.utc),
+        )
+        .on_conflict_do_update(
+            index_elements=["key"],
+            set_={
+                "value": {"until_iso": until.isoformat()},
+                "updated_at": datetime.now(timezone.utc),
+            },
+        )
+    )
+    await session.execute(stmt)
 
 
 @dataclass
@@ -42,7 +87,13 @@ async def check_circuit_breakers(session: AsyncSession) -> CircuitBreakerState:
 
     Returns a state indicating whether trading is allowed.
     """
-    global _paused_until
+    global _paused_until, _hydrated_from_db
+
+    # First call after process boot: hydrate from bot_state so a restart
+    # mid-pause doesn't silently drop the protective window.
+    if not _hydrated_from_db:
+        _paused_until = await _load_paused_until(session)
+        _hydrated_from_db = True
 
     # Check if we're still in a consecutive-loss pause
     now = datetime.now(timezone.utc)
@@ -53,7 +104,11 @@ async def check_circuit_breakers(session: AsyncSession) -> CircuitBreakerState:
             paused_until=_paused_until,
             reason=f"consecutive loss pause ({remaining:.0f}m remaining)",
         )
-    _paused_until = None
+    if _paused_until is not None:
+        # Pause expired — clear both in-process and DB so a future restart
+        # doesn't see a stale "active pause" row.
+        _paused_until = None
+        await _persist_paused_until(session, None)
 
     # 1. Daily loss stop
     daily_pnl = await _get_daily_pnl(session)
@@ -68,6 +123,7 @@ async def check_circuit_breakers(session: AsyncSession) -> CircuitBreakerState:
     consecutive = await _get_consecutive_losses(session)
     if consecutive >= settings.CONSECUTIVE_LOSS_PAUSE_COUNT:
         _paused_until = now + timedelta(hours=settings.CONSECUTIVE_LOSS_PAUSE_HOURS)
+        await _persist_paused_until(session, _paused_until)
         return CircuitBreakerState(
             can_trade=False,
             paused_until=_paused_until,

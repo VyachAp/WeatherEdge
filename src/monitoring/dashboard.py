@@ -178,7 +178,7 @@ def fetch_all_signals(
 ) -> pd.DataFrame:
     query = (
         "SELECT s.id, s.market_id, s.edge, s.confidence, s.model_prob, "
-        "       s.market_prob, s.aviation_prob, s.direction, "
+        "       s.market_prob, s.direction, "
         "       s.created_at, m.question, m.parsed_variable, m.parsed_location, "
         "       m.current_yes_price, m.end_date, "
         "       CASE "
@@ -219,7 +219,7 @@ def fetch_market_price_history(market_id: str) -> pd.DataFrame:
 def fetch_calibration_data() -> pd.DataFrame:
     return pd.read_sql(
         text(
-            "SELECT s.model_prob, s.aviation_prob, s.direction, "
+            "SELECT s.model_prob, s.direction, "
             "       s.created_at, m.parsed_variable, "
             "       EXTRACT(DAY FROM m.end_date - s.created_at) AS forecast_horizon, "
             "       t.status AS trade_status "
@@ -443,8 +443,8 @@ def page_signal_explorer():
         label = f"[{row['outcome'].upper()}] {row['question'][:80]}"
         with st.expander(label):
             mc1, mc2 = st.columns(2)
-            mc1.metric("Aviation Prob", f"{row['aviation_prob']:.1%}" if pd.notna(row["aviation_prob"]) else "N/A")
-            mc2.metric("Consensus", f"{row['model_prob']:.1%}")
+            mc1.metric("Model", f"{row['model_prob']:.1%}")
+            mc2.metric("Market", f"{row['market_prob']:.1%}" if pd.notna(row["market_prob"]) else "N/A")
 
             history = fetch_market_price_history(row["market_id"])
             if not history.empty:
@@ -508,10 +508,9 @@ def page_model_calibration():
     )
 
     prob_columns = [
-        ("Consensus", "model_prob"),
-        ("Aviation", "aviation_prob"),
+        ("Model", "model_prob"),
     ]
-    colors = {"Consensus": "#1f77b4", "Aviation": "#ff7f0e"}
+    colors = {"Model": "#1f77b4"}
 
     for name, col in prob_columns:
         sub = filtered.dropna(subset=[col])
@@ -545,7 +544,7 @@ def page_model_calibration():
     filtered["week"] = pd.to_datetime(filtered["created_at"]).dt.to_period("W").dt.start_time
 
     brier_rows = []
-    for name, col in [("Consensus", "model_prob"), ("Aviation", "aviation_prob")]:
+    for name, col in [("Model", "model_prob")]:
         sub = filtered.dropna(subset=[col])
         if sub.empty:
             continue

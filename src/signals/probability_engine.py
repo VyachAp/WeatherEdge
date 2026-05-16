@@ -16,14 +16,13 @@ from src.signals.state_aggregator import WeatherState
 # Post-peak trend shift — when `hours_until_peak <= 0` but the METAR trend is
 # still rising, Open-Meteo's nominal peak was too early (systematic in hot arid
 # cities). Shift the Gaussian center upward by a bounded, solar/cloud-damped
-# amount so the distribution has mass above the current observed max.
-POST_PEAK_EXTRAPOLATION_HOURS_CAP = 1.5
-POST_PEAK_MAX_SHIFT_F = 3.0
-POST_PEAK_MIN_TREND_F_PER_HR = 0.5
-# Fraction of (rate * hours) carried into the center shift. Matches the
-# forecast_exceedance post-peak carry so the alert and the trading Gaussian move
-# in lockstep when Open-Meteo's nominal peak was too early.
-POST_PEAK_TREND_CARRY_K = 0.75
+# amount so the distribution has mass above the current observed max. All four
+# constants bind to `Settings` so they stay in lockstep with the matching
+# `forecast_exceedance` constants. Override via .env; restart required.
+POST_PEAK_EXTRAPOLATION_HOURS_CAP: float = settings.POST_PEAK_HOURS_CAP
+POST_PEAK_MAX_SHIFT_F: float = settings.POST_PEAK_MAX_SHIFT_F
+POST_PEAK_MIN_TREND_F_PER_HR: float = settings.POST_PEAK_MIN_TREND_F_PER_HR
+POST_PEAK_TREND_CARRY_K: float = settings.POST_PEAK_TREND_CARRY_K
 
 
 @dataclass

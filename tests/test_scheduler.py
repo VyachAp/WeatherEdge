@@ -475,20 +475,59 @@ class TestHasActiveTrade:
 
 
 class TestUpsertSignal:
-    """`_upsert_signal` is INSERT-or-REFRESH. The schema-level
-    `uq_signals_market_direction` constraint means a plain insert on every
-    tick would crash; this helper keeps callers ORM-friendly."""
+    """`_upsert_signal` issues a single ``INSERT ... ON CONFLICT DO
+    UPDATE ... RETURNING`` against ``uq_signals_market_direction``. The
+    insert-vs-update branching is enforced by Postgres, so these tests
+    cover the *statement shape* (values + set_ + returning), and the
+    pass-through of the RETURNING clause into the ORM object. Integration
+    tests against a real DB cover the conflict semantics themselves."""
+
+    @staticmethod
+    def _capture_session(returned_signal):
+        """Build an AsyncMock session whose ``scalars(stmt)`` records the
+        statement and returns a result that yields ``returned_signal``."""
+        captured: dict = {}
+        session = AsyncMock()
+
+        async def fake_scalars(stmt, execution_options=None):
+            captured["stmt"] = stmt
+            captured["execution_options"] = execution_options
+            result = AsyncMock()
+            result.one = lambda: returned_signal
+            return result
+
+        session.scalars = fake_scalars
+        return session, captured
+
+    @staticmethod
+    def _on_conflict_clauses(stmt) -> tuple[dict, dict]:
+        """Extract ``(values_dict, on_conflict_set_dict)`` from a pg insert."""
+        # pg_insert(...).values(...) stores values on the compile-state;
+        # the simplest robust read is via the parameters dict on the
+        # compiled statement.
+        compiled = stmt.compile()
+        params = dict(compiled.params)
+        # ON CONFLICT DO UPDATE set_ payload lives under `_post_values_clause`
+        # in 2.0 — but we can inspect more reliably by looking at the dialect
+        # element directly.
+        on_conflict = stmt._post_values_clause  # type: ignore[attr-defined]
+        # update_values_to_set yields (col_name_str, bound_value) tuples.
+        set_dict = {name: val for name, val in on_conflict.update_values_to_set}
+        return params, set_dict
 
     @pytest.mark.asyncio
-    async def test_inserts_when_no_existing_row(self):
-        from src.db.models import TradeDirection
+    async def test_statement_carries_all_values_and_returning_signal(self):
+        from src.db.models import Signal, TradeDirection
 
-        session = AsyncMock()
-        result = AsyncMock()
-        result.scalar_one_or_none = lambda: None
-        session.execute.return_value = result
-        # session.add is sync on the real Session — match shape.
-        session.add = lambda obj: None
+        returned = Signal(
+            market_id="mkt_z",
+            direction=TradeDirection.BUY_YES,
+            model_prob=0.7,
+            market_prob=0.4,
+            edge=0.3,
+            confidence=0.7,
+        )
+        session, captured = self._capture_session(returned)
 
         sig = await _upsert_signal(
             session,
@@ -500,39 +539,39 @@ class TestUpsertSignal:
             confidence=0.7,
         )
 
-        # Returned a fresh Signal carrying the requested fields.
-        assert sig.market_id == "mkt_z"
-        assert sig.direction == TradeDirection.BUY_YES
-        assert sig.model_prob == 0.7
-        assert sig.market_prob == 0.4
-        assert sig.edge == 0.3
-        # Flushed exactly once after add.
-        session.flush.assert_awaited_once()
+        # Helper passes the RETURNING row straight through.
+        assert sig is returned
+        # populate_existing forces the ORM to refresh from RETURNING even when
+        # a stale identity-mapped row exists (matters for repeated ticks).
+        assert captured["execution_options"] == {"populate_existing": True}
+
+        values, _ = self._on_conflict_clauses(captured["stmt"])
+        assert values["market_id"] == "mkt_z"
+        assert values["model_prob"] == 0.7
+        assert values["market_prob"] == 0.4
+        assert values["edge"] == 0.3
+        assert values["confidence"] == 0.7
+        # Probability is the default path when kind is unspecified.
+        assert values["signal_kind"] == "probability"
+        # created_at is set by the helper, not the DB default — so refresh
+        # semantics work on the UPDATE branch too.
+        assert isinstance(values["created_at"], datetime)
 
     @pytest.mark.asyncio
-    async def test_refreshes_existing_row_in_place(self):
+    async def test_on_conflict_set_refreshes_all_mutable_fields(self):
         from src.db.models import Signal, TradeDirection
 
-        existing = Signal(
+        returned = Signal(
             market_id="mkt_z",
             direction=TradeDirection.BUY_YES,
-            model_prob=0.5,
-            market_prob=0.6,
-            edge=0.1,
-            confidence=0.5,
+            model_prob=0.8,
+            market_prob=0.45,
+            edge=0.35,
+            confidence=0.8,
         )
-        # Snapshot the original timestamp so we can prove it advances.
-        existing.created_at = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        session, captured = self._capture_session(returned)
 
-        session = AsyncMock()
-        result = AsyncMock()
-        result.scalar_one_or_none = lambda: existing
-        session.execute.return_value = result
-        # If the helper accidentally adds a new row we want to know.
-        added = []
-        session.add = lambda obj: added.append(obj)
-
-        sig = await _upsert_signal(
+        await _upsert_signal(
             session,
             market_id="mkt_z",
             direction=TradeDirection.BUY_YES,
@@ -542,25 +581,35 @@ class TestUpsertSignal:
             confidence=0.8,
         )
 
-        # Same row, refreshed values, no insert.
-        assert sig is existing
-        assert added == []
-        assert sig.model_prob == 0.8
-        assert sig.market_prob == 0.45
-        assert sig.edge == 0.35
-        assert sig.confidence == 0.8
-        # created_at advanced past the original snapshot.
-        assert sig.created_at > datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        _, set_dict = self._on_conflict_clauses(captured["stmt"])
+        # Every mutable field is refreshed on conflict so a repeat tick
+        # overwrites the previous evaluation rather than silently retaining
+        # stale values.
+        for field in (
+            "model_prob", "raw_model_prob", "calibrated",
+            "market_prob", "edge", "confidence",
+            "signal_kind", "lock_branch", "lock_routine_count",
+            "lock_observed_max_f", "created_at",
+        ):
+            assert field in set_dict, f"{field} missing from ON CONFLICT set_"
 
     @pytest.mark.asyncio
-    async def test_lock_kind_and_branch_persist_on_insert(self):
-        from src.db.models import TradeDirection
+    async def test_lock_fields_land_in_values_and_set(self):
+        from src.db.models import Signal, TradeDirection
 
-        session = AsyncMock()
-        result = AsyncMock()
-        result.scalar_one_or_none = lambda: None
-        session.execute.return_value = result
-        session.add = lambda obj: None
+        returned = Signal(
+            market_id="mkt_lock",
+            direction=TradeDirection.BUY_NO,
+            model_prob=1.0,
+            market_prob=0.92,
+            edge=0.08,
+            confidence=4.5,
+            signal_kind="lock",
+            lock_branch="easy_super",
+            lock_routine_count=2,
+            lock_observed_max_f=85.0,
+        )
+        session, captured = self._capture_session(returned)
 
         sig = await _upsert_signal(
             session,
@@ -576,10 +625,20 @@ class TestUpsertSignal:
             lock_observed_max_f=85.0,
         )
 
+        # Returned row carries the lock context — same object semantics as
+        # the probability path.
         assert sig.signal_kind == "lock"
         assert sig.lock_branch == "easy_super"
         assert sig.lock_routine_count == 2
         assert sig.lock_observed_max_f == 85.0
+        # And the lock fields appear in BOTH the values AND the set_ so the
+        # UPDATE branch also persists them (a market that flips
+        # probability→lock between ticks must overwrite, not keep stale).
+        values, set_dict = self._on_conflict_clauses(captured["stmt"])
+        assert values["signal_kind"] == "lock"
+        assert values["lock_branch"] == "easy_super"
+        assert set_dict["lock_branch"] is not None
+        assert set_dict["signal_kind"] is not None
 
 
 class TestLogEvaluation:

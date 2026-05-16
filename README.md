@@ -239,7 +239,7 @@ src/
     forecast_exceedance.py     "Daily max set to beat forecast" alerts
     projected_market_lookup.py Market lookup by projected daily max
     mapper.py                  Geocoding, ICAO map, timezone helpers
-    consensus.py               Weekly calibration coefficients (vestigial; not applied live)
+    calibration.py             Linear (slope, intercept) recalibration from resolved signals
     reverse_lookup.py          Find markets by city/station/observation
   risk/
     kelly.py                   Fractional Kelly + lock-rule fixed sizing

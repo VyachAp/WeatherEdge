@@ -48,46 +48,45 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-EXCEEDANCE_THRESHOLD_F = 0.5  # same-hour delta still gates DB recording
-DELTA_THRESHOLD_F = 1.0       # projected_max − forecast_peak to trigger push
-MIN_ROUTINE_COUNT_FOR_PUSH = 3
+# Module-level aliases bound from `settings` — overridable via .env, see
+# `src.config.Settings` for defaults. Process restart required for .env
+# edits to take effect (Pydantic loads once at boot).
+EXCEEDANCE_THRESHOLD_F: float = settings.EXCEEDANCE_THRESHOLD_F
+DELTA_THRESHOLD_F: float = settings.EXCEEDANCE_DELTA_THRESHOLD_F
+MIN_ROUTINE_COUNT_FOR_PUSH: int = settings.EXCEEDANCE_MIN_ROUTINE_COUNT
 # Strong-residual fast path: when the latest obs is already running ≥1°F
 # (=2× EXCEEDANCE_THRESHOLD_F) over its same-hour forecast, the underlying
 # signal is unambiguous. Allow the push at routine #2 to shave 30–60 min
 # off the morning lag instead of waiting for routine #3.
-STRONG_RESIDUAL_DELTA_F = 2.0 * EXCEEDANCE_THRESHOLD_F
-STRONG_RESIDUAL_MIN_ROUTINES = 2
-EXTRAPOLATION_HOURS_CAP = 3.0
-PEAK_TOLERANCE_F = 0.5        # current_max within this of forecast_peak = "reached"
-EXTRAPOLATION_HALFLIFE_H = 2.0  # α = exp(-h/halflife); trust extrapolation near peak
-MAX_OVERSHOOT_F = 5.0           # ≈ 2.8°C plausibility ceiling vs forecast_peak
-DEWPOINT_NUDGE_F = 0.5
-ALERT_COOLDOWN = timedelta(minutes=30)  # one Telegram push per station per 30 min
+STRONG_RESIDUAL_DELTA_F: float = settings.EXCEEDANCE_STRONG_RESIDUAL_DELTA_F
+STRONG_RESIDUAL_MIN_ROUTINES: int = settings.EXCEEDANCE_STRONG_RESIDUAL_MIN_ROUTINES
+EXTRAPOLATION_HOURS_CAP: float = settings.EXCEEDANCE_EXTRAPOLATION_HOURS_CAP
+PEAK_TOLERANCE_F: float = settings.EXCEEDANCE_PEAK_TOLERANCE_F
+EXTRAPOLATION_HALFLIFE_H: float = settings.EXCEEDANCE_EXTRAPOLATION_HALFLIFE_H
+MAX_OVERSHOOT_F: float = settings.EXCEEDANCE_MAX_OVERSHOOT_F
+DEWPOINT_NUDGE_F: float = settings.EXCEEDANCE_DEWPOINT_NUDGE_F
+ALERT_COOLDOWN: timedelta = timedelta(minutes=settings.EXCEEDANCE_ALERT_COOLDOWN_MINUTES)
 # Residual-carry tunables — how much of the observed-vs-forecast gap to carry
 # forward to the forecast peak. Halflife controls how quickly the level
 # residual fades toward zero with distance to peak; K is the fraction of a
 # positive trend residual carried linearly up to EXTRAPOLATION_HOURS_CAP.
-RESIDUAL_DECAY_HALFLIFE_H = 2.0
-RESIDUAL_TREND_CARRY_K = 0.5
+RESIDUAL_DECAY_HALFLIFE_H: float = settings.EXCEEDANCE_RESIDUAL_DECAY_HALFLIFE_H
+RESIDUAL_TREND_CARRY_K: float = settings.EXCEEDANCE_RESIDUAL_TREND_CARRY_K
 # Post-peak trend carry — when `hours_until_peak <= 0` but obs is still rising,
 # Open-Meteo's nominal peak was simply too early (common in hot arid cities like
 # OPKC/Phoenix/Delhi). Extrapolate a bounded, solar/cloud-damped amount beyond
 # the observed max. Hours cap is shorter than pre-peak because diurnal concavity
-# is sharper after nominal peak.
-POST_PEAK_HOURS_CAP = 1.5
-# K=0.75 post-peak is more aggressive than the pre-peak residual carry (K=0.5)
-# because post-peak the raw trend is used directly instead of the observed-minus-
-# forecast residual — and a positive post-peak trend is itself evidence that
-# Open-Meteo's nominal peak hour was wrong, so the signal deserves higher weight.
-POST_PEAK_TREND_CARRY_K = 0.75
-POST_PEAK_MIN_TREND_F_PER_HR = 0.5
+# is sharper after nominal peak. Shared with probability_engine via Settings.
+POST_PEAK_HOURS_CAP: float = settings.POST_PEAK_HOURS_CAP
+POST_PEAK_TREND_CARRY_K: float = settings.POST_PEAK_TREND_CARRY_K
+POST_PEAK_MIN_TREND_F_PER_HR: float = settings.POST_PEAK_MIN_TREND_F_PER_HR
 # Residual-slope projection (lever A). When ≥ RESIDUAL_SLOPE_MIN_POINTS
 # routines are available, project the residual forward at its observed
 # slope to peak hour. Cap absolute slope contribution to prevent a single
 # fast-rising morning from extrapolating into the stratosphere.
-RESIDUAL_SLOPE_MIN_POINTS = 3
-RESIDUAL_SLOPE_HOURS_CAP = 3.0
-RESIDUAL_SLOPE_MAX_F_PER_HR = 1.5
+RESIDUAL_SLOPE_MIN_POINTS: int = settings.EXCEEDANCE_RESIDUAL_SLOPE_MIN_POINTS
+RESIDUAL_SLOPE_HOURS_CAP: float = settings.EXCEEDANCE_RESIDUAL_SLOPE_HOURS_CAP
+RESIDUAL_SLOPE_MAX_F_PER_HR: float = settings.EXCEEDANCE_RESIDUAL_SLOPE_MAX_F_PER_HR
 
 
 def _c_to_f(c: float) -> float:

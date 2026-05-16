@@ -479,15 +479,45 @@ async def aggregate_state(
     from src.ingestion.station_normals import get_normal
     from src.signals.mapper import icao_timezone, today_local
 
+    # ``return_exceptions=True`` keeps METAR / deterministic / ensemble
+    # failures independent — a 500 from Open-Meteo's ensemble endpoint no
+    # longer voids the METAR-derived state (which is what lock-rule EASY
+    # needs even with no forecast). _blend_forecasts already handles
+    # "either alone is acceptable".
     metar_task = _safe_fetch_metar(icao)
     deterministic_task = fetch_deterministic_forecast(lat, lon)
     ensemble_task = fetch_ensemble_forecast(lat, lon)
     history, deterministic, ensemble = await asyncio.gather(
         metar_task, deterministic_task, ensemble_task,
+        return_exceptions=True,
     )
 
+    if isinstance(history, BaseException):
+        # _safe_fetch_metar already catches and returns None; an exception
+        # leaking through here means something more catastrophic (e.g. an
+        # asyncio.CancelledError). Treat the city as un-aggregateable.
+        logger.warning(
+            "METAR fetch raised for %s, skipping city", icao,
+            exc_info=(type(history), history, history.__traceback__),
+        )
+        return None
     if history is None:
         return None
+
+    if isinstance(deterministic, BaseException):
+        logger.warning(
+            "deterministic forecast fetch failed for %s, falling back to ensemble alone",
+            icao,
+            exc_info=(type(deterministic), deterministic, deterministic.__traceback__),
+        )
+        deterministic = None
+    if isinstance(ensemble, BaseException):
+        logger.warning(
+            "ensemble forecast fetch failed for %s, falling back to deterministic alone",
+            icao,
+            exc_info=(type(ensemble), ensemble, ensemble.__traceback__),
+        )
+        ensemble = None
 
     forecast = _blend_forecasts(deterministic, ensemble)
 

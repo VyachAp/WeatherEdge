@@ -116,13 +116,13 @@ class Settings(BaseSettings):
     STATION_BIAS_WINDOW_DAYS: int = 30
     STATION_BIAS_MAX_C: float = 3.0
 
-    # Consensus calibration. When True, the unified pipeline refreshes a
+    # Linear calibration. When True, the unified pipeline refreshes a
     # linear (slope, intercept) fit from resolved signals every tick and
     # applies it to the chosen side's probability before edge filtering.
     # Flipped True by default 2026-05-08 after live data showed +10-21pp
     # overconfidence on bracket/exactly markets. The fit needs at least
     # `MIN_CALIBRATION_SAMPLES=50` resolved trades; below that, callers
-    # see the raw probability unchanged. See `src/signals/consensus.py`.
+    # see the raw probability unchanged. See `src/signals/calibration.py`.
     APPLY_CALIBRATION: bool = True
 
     # Circuit breakers
@@ -211,6 +211,49 @@ class Settings(BaseSettings):
     # further behind every hour" 1-2 hours earlier than the legacy path.
     # Falls back to the halflife decay when fewer than 3 points are available.
     PROJECTION_RESIDUAL_SLOPE_ENABLED: bool = True
+
+    # ------------------------------------------------------------------
+    # Forecast-exceedance alert tunables
+    # ------------------------------------------------------------------
+    # Used by ``src/signals/forecast_exceedance.py``. Previously module-level
+    # constants; moved here so the operator can override via .env without code
+    # edits (process restart still required — Pydantic loads once at boot).
+    EXCEEDANCE_THRESHOLD_F: float = 0.5
+    EXCEEDANCE_DELTA_THRESHOLD_F: float = 1.0
+    EXCEEDANCE_MIN_ROUTINE_COUNT: int = 3
+    EXCEEDANCE_STRONG_RESIDUAL_DELTA_F: float = 1.0  # 2 × EXCEEDANCE_THRESHOLD_F
+    EXCEEDANCE_STRONG_RESIDUAL_MIN_ROUTINES: int = 2
+    EXCEEDANCE_EXTRAPOLATION_HOURS_CAP: float = 3.0
+    EXCEEDANCE_PEAK_TOLERANCE_F: float = 0.5
+    EXCEEDANCE_EXTRAPOLATION_HALFLIFE_H: float = 2.0
+    EXCEEDANCE_MAX_OVERSHOOT_F: float = 5.0
+    EXCEEDANCE_DEWPOINT_NUDGE_F: float = 0.5
+    EXCEEDANCE_ALERT_COOLDOWN_MINUTES: int = 30
+    EXCEEDANCE_RESIDUAL_DECAY_HALFLIFE_H: float = 2.0
+    EXCEEDANCE_RESIDUAL_TREND_CARRY_K: float = 0.5
+    EXCEEDANCE_RESIDUAL_SLOPE_MIN_POINTS: int = 3
+    EXCEEDANCE_RESIDUAL_SLOPE_HOURS_CAP: float = 3.0
+    EXCEEDANCE_RESIDUAL_SLOPE_MAX_F_PER_HR: float = 1.5
+
+    # ------------------------------------------------------------------
+    # Post-peak trend-carry tunables (shared by forecast_exceedance and
+    # probability_engine — single source of truth so alert and trading
+    # Gaussian move in lockstep when Open-Meteo's nominal peak was too
+    # early).
+    # ------------------------------------------------------------------
+    POST_PEAK_HOURS_CAP: float = 1.5
+    POST_PEAK_TREND_CARRY_K: float = 0.75
+    POST_PEAK_MIN_TREND_F_PER_HR: float = 0.5
+    POST_PEAK_MAX_SHIFT_F: float = 3.0  # probability_engine center-shift cap
+
+    # ------------------------------------------------------------------
+    # Range/`exactly` lock-rule gates (lock_rules.py). Tighter than
+    # threshold markets because range overshoot/undershoot enters at
+    # ~0.95 — each loss costs ~$1/$1 staked, so breakeven needs ≥95%
+    # accuracy.
+    # ------------------------------------------------------------------
+    RANGE_LOCK_MIN_ROUTINES: int = 4
+    RANGE_LOCK_MARGIN_MULTIPLIER: float = 2.0
 
 
 settings = Settings()

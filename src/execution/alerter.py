@@ -547,8 +547,7 @@ class Alerter:
         if signal_row is None or market_row is None:
             return f"\U0001f4ca *Detail*\n\nNo signal data found for {e(market_id)}"
 
-        aviation = f"{signal_row.aviation_prob * 100:.1f}%" if signal_row.aviation_prob is not None else "n/a"
-        consensus = f"{signal_row.model_prob * 100:.1f}%"
+        model_p = f"{signal_row.model_prob * 100:.1f}%"
         market_p = f"{signal_row.market_prob * 100:.1f}%"
 
         return (
@@ -556,8 +555,7 @@ class Alerter:
             f"\n"
             f"\"{e(market_row.question)}\"\n"
             f"\n"
-            f"Aviation: {e(aviation)}\n"
-            f"Consensus: {e(consensus)}\n"
+            f"Model: {e(model_p)}\n"
             f"Market: {e(market_p)}\n"
             f"Edge: {e(f'{signal_row.edge * 100:+.1f}%')}\n"
             f"Direction: {e(signal_row.direction.value)}\n"

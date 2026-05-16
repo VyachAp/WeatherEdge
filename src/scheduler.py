@@ -14,6 +14,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from src.config import settings
 from src.db.engine import async_session, engine
@@ -27,7 +28,7 @@ from src.resolution import (
 )
 from src.risk.drawdown import DrawdownLevel, DrawdownMonitor
 from src.risk.kelly import size_locked_position, size_position
-from src.signals.consensus import get_calibration_coefficients
+from src.signals.calibration import get_calibration_coefficients
 from src.signals.lock_rules import evaluate_lock
 from src.execution.polymarket_client import is_live, place_order
 
@@ -363,13 +364,13 @@ async def job_unified_pipeline() -> None:
             exposure = await get_current_exposure(session)
             total_trades = 0
 
-            # Refresh consensus calibration once per tick when enabled.
+            # Refresh calibration once per tick when enabled.
             # The fit is cached for `_CACHE_TTL_SEC` (30 min) so back-to-back
             # ticks don't re-query; `apply_calibration` reads sync from the
             # cache inside `_binary_market_edge`.
             if settings.APPLY_CALIBRATION:
                 try:
-                    from src.signals.consensus import refresh_calibration
+                    from src.signals.calibration import refresh_calibration
                     await refresh_calibration(session)
                 except Exception:
                     logger.warning(
@@ -651,8 +652,8 @@ async def job_unified_pipeline() -> None:
                                 continue
 
                         # Side-effective probability lands in Signal.model_prob
-                        # so consensus calibration treats YES and NO uniformly.
-                        # See src/signals/consensus.py. The (market, direction)
+                        # so calibration treats YES and NO uniformly.
+                        # See src/signals/calibration.py. The (market, direction)
                         # uniqueness constraint means this is INSERT-or-REFRESH:
                         # repeat evaluations of the same market+side update the
                         # existing row instead of inserting duplicates.
@@ -980,12 +981,12 @@ def _binary_market_edge(
         side_edge = yes_edge
         side_depth = depth_yes
 
-    # Apply consensus calibration when enabled — corrects the
-    # side-effective probability based on resolved-signal history. No-op
-    # when `APPLY_CALIBRATION=False`, when fewer than
-    # `MIN_CALIBRATION_SAMPLES` resolved signals exist, or when the cache
-    # is stale (refresh happens at the top of each tick).
-    from src.signals.consensus import apply_calibration
+    # Apply calibration when enabled — corrects the side-effective
+    # probability based on resolved-signal history. No-op when
+    # `APPLY_CALIBRATION=False`, when fewer than `MIN_CALIBRATION_SAMPLES`
+    # resolved signals exist, or when the cache is stale (refresh happens
+    # at the top of each tick).
+    from src.signals.calibration import apply_calibration
     side_prob_raw = side_prob
     side_prob, calibrated = apply_calibration(side_prob_raw)
     if calibrated:
@@ -1160,10 +1161,11 @@ async def _upsert_signal(
 
     Schema-level ``uq_signals_market_direction`` (migration
     ``i9j0k1l2m3n4``) means we'd otherwise collide on every re-evaluation
-    tick. SELECT-then-INSERT-or-UPDATE keeps the ORM identity intact so
-    callers can still take ``sig_row.id`` for the Trade FK. Refreshes
-    ``created_at`` so callers can see "this signal was last evaluated at
-    X" in the DB.
+    tick. Implemented as a single atomic ``INSERT ... ON CONFLICT DO
+    UPDATE ... RETURNING`` so the path is race-safe without relying on
+    APScheduler's ``max_instances=1`` to serialize the SELECT/INSERT
+    window. Refreshes ``created_at`` so callers can see "this signal was
+    last evaluated at X" in the DB.
 
     ``signal_kind`` and the ``lock_*`` fields land on the row regardless
     of whether it's INSERT or UPDATE; a market that flips between the
@@ -1172,15 +1174,10 @@ async def _upsert_signal(
     the kind/branch on the next tick. That's the intended semantic:
     Signal reflects the current trading rationale, not history.
     """
-    existing = await session.execute(
-        select(Signal).where(
-            Signal.market_id == market_id,
-            Signal.direction == direction,
-        )
-    )
-    sig_row = existing.scalar_one_or_none()
-    if sig_row is None:
-        sig_row = Signal(
+    now = datetime.now(timezone.utc)
+    stmt = (
+        pg_insert(Signal)
+        .values(
             market_id=market_id,
             direction=direction,
             model_prob=model_prob,
@@ -1193,22 +1190,30 @@ async def _upsert_signal(
             lock_branch=lock_branch,
             lock_routine_count=lock_routine_count,
             lock_observed_max_f=lock_observed_max_f,
+            created_at=now,
         )
-        session.add(sig_row)
-    else:
-        sig_row.model_prob = model_prob
-        sig_row.raw_model_prob = raw_model_prob
-        sig_row.calibrated = calibrated
-        sig_row.market_prob = market_prob
-        sig_row.edge = edge
-        sig_row.confidence = confidence
-        sig_row.signal_kind = signal_kind
-        sig_row.lock_branch = lock_branch
-        sig_row.lock_routine_count = lock_routine_count
-        sig_row.lock_observed_max_f = lock_observed_max_f
-        sig_row.created_at = datetime.now(timezone.utc)
-    await session.flush()
-    return sig_row
+        .on_conflict_do_update(
+            constraint="uq_signals_market_direction",
+            set_={
+                "model_prob": model_prob,
+                "raw_model_prob": raw_model_prob,
+                "calibrated": calibrated,
+                "market_prob": market_prob,
+                "edge": edge,
+                "confidence": confidence,
+                "signal_kind": signal_kind,
+                "lock_branch": lock_branch,
+                "lock_routine_count": lock_routine_count,
+                "lock_observed_max_f": lock_observed_max_f,
+                "created_at": now,
+            },
+        )
+        .returning(Signal)
+    )
+    result = await session.scalars(
+        stmt, execution_options={"populate_existing": True}
+    )
+    return result.one()
 
 
 async def _try_lock_rule_trade(

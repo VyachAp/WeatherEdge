@@ -95,7 +95,7 @@ class Signal(Base):
     # Engine probability *before* `apply_calibration` was applied. The
     # calibration regression must fit from this, not from `model_prob`,
     # otherwise it learns a correction on top of its own correction.
-    # NULL on pre-migration rows; `consensus.py` falls back to `model_prob`.
+    # NULL on pre-migration rows; `calibration.py` falls back to `model_prob`.
     raw_model_prob = Column(Float)
     calibrated = Column(Boolean)
     market_prob = Column(Float, nullable=False)
@@ -109,8 +109,11 @@ class Signal(Base):
     lock_branch = Column(String)  # 'easy_super' | 'easy_standard' | 'hard' | 'range_overshoot' | 'range_undershoot' | 'range_in_window'
     lock_routine_count = Column(Integer)
     lock_observed_max_f = Column(Float)
-    gfs_prob = Column(Float)  # Legacy — always NULL, drop via migration later
-    ecmwf_prob = Column(Float)  # Legacy — always NULL, drop via migration later
+    # Legacy per-model probability columns — always NULL in the unified
+    # pipeline. Kept for schema compatibility (no live readers); drop via
+    # migration once we're comfortable with the column-removal path.
+    gfs_prob = Column(Float)
+    ecmwf_prob = Column(Float)
     aviation_prob = Column(Float)
     wx_prob = Column(Float)
     created_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
@@ -447,6 +450,29 @@ class ForecastArchive(Base):
     hourly_wind_speed = Column(JSONB, nullable=False)
     hourly_temps_std_c = Column(JSONB, nullable=True)
     created_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+
+class BotState(Base):
+    """Key/value durable state for runtime values that must survive a
+    process restart (e.g. the consecutive-loss circuit-breaker pause).
+
+    Intentionally generic. Keys are dotted strings like
+    ``circuit_breakers.paused_until`` so consumers can namespace their
+    own values without a migration per new key. Value is JSONB so we can
+    store timestamps, counters, or small dicts without schema churn.
+    Treat this table as a tiny config-with-history surface, not as a
+    high-throughput store — every read is a primary-key lookup but it
+    still hits Postgres, so cache in-process when sensible.
+    """
+    __tablename__ = "bot_state"
+
+    key = Column(String, primary_key=True)
+    value = Column(JSONB)
+    updated_at = Column(
         DateTime(timezone=True),
         nullable=False,
         default=lambda: datetime.now(timezone.utc),
