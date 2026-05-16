@@ -136,13 +136,50 @@ def _hours_based_sigma(hours_until_peak: float) -> float:
     return 3.5
 
 
+# Bounds on the per-station σ floor — keeps a station with very low or
+# very high observed RMSE from collapsing or blowing out the
+# distribution. Below RMSE_FLOOR_MIN we treat the station as
+# "calibration noise dominated"; above RMSE_FLOOR_MAX the forecast is
+# so error-prone that wider σ stops helping (the trade has no edge).
+_PER_STATION_SIGMA_FLOOR_MIN_F = 1.5
+_PER_STATION_SIGMA_FLOOR_MAX_F = 5.0
+# Need at least this many days of observed bias to trust the per-station
+# RMSE; below this, fall back to the global ENSEMBLE_MIN_SIGMA_F.
+_PER_STATION_SIGMA_MIN_DAYS = 14
+
+
+def _effective_sigma_floor(state: WeatherState) -> tuple[float, str]:
+    """Pick the σ floor for the Gaussian.
+
+    Per-station floor (rolling forecast-error RMSE) replaces the global
+    ``ENSEMBLE_MIN_SIGMA_F`` when the station has ≥
+    ``_PER_STATION_SIGMA_MIN_DAYS`` days of observed bias rows. Returns
+    ``(floor_f, source_label)`` so ``_compute_sigma`` can include
+    provenance in the reasoning trail (helpful when debugging why a
+    station's σ shifted).
+    """
+    if (
+        state.station_rmse_f is not None
+        and state.station_rmse_sample_days >= _PER_STATION_SIGMA_MIN_DAYS
+    ):
+        floor = min(
+            _PER_STATION_SIGMA_FLOOR_MAX_F,
+            max(_PER_STATION_SIGMA_FLOOR_MIN_F, state.station_rmse_f),
+        )
+        return floor, f"per-station RMSE {state.station_rmse_f:.2f}°F ({state.station_rmse_sample_days}d)"
+    return settings.ENSEMBLE_MIN_SIGMA_F, f"global {settings.ENSEMBLE_MIN_SIGMA_F:.2f}°F"
+
+
 def _compute_sigma(state: WeatherState, reasoning: list[str]) -> float:
     """Base σ for the Gaussian: ensemble spread with floors, else hours-based.
 
     When `state.forecast_sigma_f` is populated (multi-model fetch succeeded),
     it is inflated by `ENSEMBLE_SPREAD_MULTIPLIER` to correct for documented
-    NWP under-dispersion, then clipped to [ENSEMBLE_MIN_SIGMA_F,
-    ENSEMBLE_MAX_SIGMA_F]. A soft floor at half the hours-based σ prevents
+    NWP under-dispersion, then clipped to [floor, ENSEMBLE_MAX_SIGMA_F]
+    where ``floor`` is the per-station rolling-RMSE floor when available
+    (replaces the global ENSEMBLE_MIN_SIGMA_F — the global value over-pads
+    low-variance stations like RJTT and under-pads high-variance stations
+    like KAUS/KLAX). A soft floor at half the hours-based σ prevents
     runaway overconfidence on stable days.
     """
     hours_floor = _hours_based_sigma(state.hours_until_peak)
@@ -154,16 +191,14 @@ def _compute_sigma(state: WeatherState, reasoning: list[str]) -> float:
         )
         return hours_floor
 
+    floor, floor_source = _effective_sigma_floor(state)
     raw = state.forecast_sigma_f * settings.ENSEMBLE_SPREAD_MULTIPLIER
-    clipped = max(
-        settings.ENSEMBLE_MIN_SIGMA_F,
-        min(settings.ENSEMBLE_MAX_SIGMA_F, raw),
-    )
+    clipped = max(floor, min(settings.ENSEMBLE_MAX_SIGMA_F, raw))
     sigma = max(clipped, hours_floor * 0.5)
     reasoning.append(
         f"sigma={sigma:.2f}°F (ensemble spread {state.forecast_sigma_f:.2f}°F "
         f"× {settings.ENSEMBLE_SPREAD_MULTIPLIER} from {state.ensemble_model_count} models, "
-        f"hours_floor={hours_floor:.2f}°F)"
+        f"floor={floor:.2f}°F [{floor_source}], hours_floor={hours_floor:.2f}°F)"
     )
     return sigma
 

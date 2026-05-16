@@ -72,6 +72,15 @@ class WeatherState:
     # engine then degrades to its pre-prior baseline.
     climate_prior_mean_f: float | None = None
     climate_prior_std_f: float | None = None
+    # Per-station forecast-error RMSE in °F over the last
+    # STATION_BIAS_WINDOW_DAYS (computed from station_biases.bias_c).
+    # Used by probability_engine._compute_sigma to set a per-station σ
+    # floor instead of the global ENSEMBLE_MIN_SIGMA_F=2.0 (which
+    # over-pads RJTT-style low-variance stations and under-pads
+    # KAUS/KLAX-style high-variance stations). None / 0 sample days →
+    # _compute_sigma falls back to the global floor.
+    station_rmse_f: float | None = None
+    station_rmse_sample_days: int = 0
 
 
 @dataclass(frozen=True)
@@ -92,6 +101,8 @@ class CachedAggregationInputs:
     bias_c: float
     climate_prior_mean_f: float | None
     climate_prior_std_f: float | None
+    station_rmse_f: float | None = None
+    station_rmse_sample_days: int = 0
 
 
 _state_cache: dict[str, CachedAggregationInputs] = {}
@@ -296,6 +307,8 @@ def build_state_from_metars(
     now_utc: datetime,
     climate_prior_mean_f: float | None = None,
     climate_prior_std_f: float | None = None,
+    station_rmse_f: float | None = None,
+    station_rmse_sample_days: int = 0,
 ) -> WeatherState | None:
     """Assemble a WeatherState from already-fetched METAR history + forecast.
 
@@ -444,6 +457,8 @@ def build_state_from_metars(
         ensemble_model_count=ensemble_model_count,
         climate_prior_mean_f=climate_prior_mean_f,
         climate_prior_std_f=climate_prior_std_f,
+        station_rmse_f=station_rmse_f,
+        station_rmse_sample_days=station_rmse_sample_days,
     )
 
 
@@ -475,7 +490,7 @@ async def aggregate_state(
         fetch_deterministic_forecast,
         fetch_ensemble_forecast,
     )
-    from src.ingestion.station_bias import get_bias
+    from src.ingestion.station_bias import get_bias, get_station_rmse
     from src.ingestion.station_normals import get_normal
     from src.signals.mapper import icao_timezone, today_local
 
@@ -541,6 +556,23 @@ async def aggregate_state(
     else:
         bias_c = 0.0  # Not used when forecast is None
 
+    # Per-station forecast-error RMSE — same windowed source as bias_c
+    # (station_biases.bias_c), feeds the probability engine's per-station
+    # σ floor in place of the global ENSEMBLE_MIN_SIGMA_F. Fail-soft: if
+    # the lookup errors, the engine falls back to the global floor via
+    # the (None, 0) sentinel.
+    station_rmse_f: float | None = None
+    station_rmse_sample_days = 0
+    try:
+        station_rmse_f, station_rmse_sample_days = await get_station_rmse(
+            session, icao,
+        )
+    except Exception:
+        logger.warning(
+            "Station RMSE fetch failed for %s, using global σ floor",
+            icao, exc_info=True,
+        )
+
     # Climate-normal prior — read once per station per tick. Uses today's
     # station-local DOY (off-by-one DOY between adjacent days changes the
     # normal by <0.1°F, negligible vs the per-market target-day distinction).
@@ -575,6 +607,8 @@ async def aggregate_state(
         icao, history, forecast, bias_c, now_utc,
         climate_prior_mean_f=climate_prior_mean_f,
         climate_prior_std_f=climate_prior_std_f,
+        station_rmse_f=station_rmse_f,
+        station_rmse_sample_days=station_rmse_sample_days,
     )
     if state is None:
         logger.debug("No routine METARs yet for %s, skipping", icao)
@@ -589,6 +623,8 @@ async def aggregate_state(
         bias_c=bias_c,
         climate_prior_mean_f=climate_prior_mean_f,
         climate_prior_std_f=climate_prior_std_f,
+        station_rmse_f=station_rmse_f,
+        station_rmse_sample_days=station_rmse_sample_days,
     )
 
     sigma_desc = (

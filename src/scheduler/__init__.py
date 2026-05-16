@@ -1061,6 +1061,8 @@ async def _fast_poll_projection_check(
         datetime.now(timezone.utc),
         climate_prior_mean_f=cached.climate_prior_mean_f,
         climate_prior_std_f=cached.climate_prior_std_f,
+        station_rmse_f=cached.station_rmse_f,
+        station_rmse_sample_days=cached.station_rmse_sample_days,
     )
     if new_state is None:
         return
