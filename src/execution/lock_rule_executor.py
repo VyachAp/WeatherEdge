@@ -274,7 +274,15 @@ async def try_lock_rule_trade(
             actual_stake_usd=stake,
             dd_multiplier=dd_state.size_multiplier,
             dd_level=dd_state.level.value,
-            metadata={"branch": decision.branch, "margin_f": decision.margin_f},
+            metadata={
+                "branch": decision.branch,
+                "margin_f": decision.margin_f,
+                # Which cap actually zeroed the stake — see the parallel
+                # comment in scheduler.__init__ for the probability path.
+                "size_reason": pos.reason,
+                "depth_usd": buy_depth,
+                "effective_price": effective_price,
+            },
         )
         return 0.0
 

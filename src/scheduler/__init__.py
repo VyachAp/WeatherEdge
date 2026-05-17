@@ -554,6 +554,14 @@ async def job_unified_pipeline() -> None:
                                     "bucket": edge.bucket_value,
                                     "edge": edge.edge,
                                     "side": side_label,
+                                    # Which cap actually zeroed the stake —
+                                    # per-trade / exposure / USD / depth /
+                                    # MIN_TRADE_USD floor. Without this the
+                                    # decision_log only tells us the trade
+                                    # was killed, not by which constraint.
+                                    "size_reason": pos.reason,
+                                    "kelly_pct": pos.kelly_pct,
+                                    "depth_usd": side_depth,
                                 },
                             )
                             continue
@@ -1348,6 +1356,13 @@ async def job_reconcile_orders() -> None:
                     Trade.order_id.is_not(None),
                     Trade.fill_price.is_(None),
                     Trade.exchange_status.in_(["delayed", "matched", "matching"]),
+                    # Terminal trades (WON/LOST) have already been settled
+                    # by ``resolve_trades`` against ``entry_price`` — the
+                    # ``fill_price IS NULL`` is permanent and polling them
+                    # only produces "Could not check order" noise. Filter
+                    # them out (added 2026-05-17 after the E3 widening
+                    # exposed ~90 stale terminals being polled every tick).
+                    Trade.status.in_([TradeStatus.PENDING, TradeStatus.OPEN]),
                     (
                         (Trade.opened_at >= recent_cutoff)
                         | (Market.end_date >= longtail_cutoff)
