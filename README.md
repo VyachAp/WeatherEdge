@@ -122,7 +122,8 @@ python -m src.cli bet portfolio
 python -m src.cli bet redeem --all        # CTF redemption after resolution
 
 # Maintenance
-python -m src.cli admin reset-drawdown-peak  # Reset DrawdownMonitor's stuck peak; restart scheduler after
+python -m src.cli admin reset-drawdown-peak    # Reset DrawdownMonitor's stuck peak; restart scheduler after
+python -m src.cli admin reconcile-stuck        # Resolve OPEN+delayed+null-fill trades against on-chain payout; releases stuck exposure
 
 # Standalone backtest of the lock-rule trader
 python scripts/backtest_lock_rule.py --days 30

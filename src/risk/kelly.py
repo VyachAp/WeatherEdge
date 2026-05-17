@@ -13,6 +13,20 @@ from src.config import settings
 MIN_TRADE_USD: float = 5.0
 MAX_EXPOSURE_PCT: float = 0.25
 
+
+def _effective_exposure_cap(bankroll: float) -> float:
+    """Return the absolute USD exposure cap for the current bankroll.
+
+    ``max(MAX_EXPOSURE_PCT × bankroll, settings.MAX_EXPOSURE_USD_FLOOR)``
+    so small-bankroll mode keeps the bot trading instead of pinning at
+    ~$100 cap. The floor only binds when ``bankroll < floor /
+    MAX_EXPOSURE_PCT`` (≈ $1200 at defaults). Per-trade caps still apply.
+    """
+    return max(
+        bankroll * MAX_EXPOSURE_PCT,
+        settings.MAX_EXPOSURE_USD_FLOOR,
+    )
+
 # ---------------------------------------------------------------------------
 # Dataclass
 # ---------------------------------------------------------------------------
@@ -94,8 +108,8 @@ def size_position(
         capped = True
         reasons.append(f"per-trade cap ({settings.MAX_POSITION_PCT:.0%})")
 
-    # --- Total exposure cap (25% of bankroll) ---
-    max_remaining = bankroll * MAX_EXPOSURE_PCT - current_exposure
+    # --- Total exposure cap (max of pct-of-bankroll and USD floor) ---
+    max_remaining = _effective_exposure_cap(bankroll) - current_exposure
     if max_remaining <= 0:
         return PositionSize(
             stake_usd=0,
@@ -162,7 +176,7 @@ def size_locked_position(
     capped = False
     reasons: list[str] = [f"fixed {settings.LOCK_POSITION_PCT:.0%} bankroll"]
 
-    max_remaining = bankroll * MAX_EXPOSURE_PCT - current_exposure
+    max_remaining = _effective_exposure_cap(bankroll) - current_exposure
     if max_remaining <= 0:
         return PositionSize(
             stake_usd=0, kelly_pct=0.0, capped=True,

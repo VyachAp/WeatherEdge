@@ -48,28 +48,67 @@ class TestSizePosition:
         assert "per-trade cap" in pos.reason
 
     def test_exposure_cap_limits_stake(self):
-        """Current exposure leaves only a sliver of the 25% limit."""
+        """Current exposure leaves only a sliver of the 25% limit.
+
+        Uses bankroll=2000 so the pct cap (500) is above the
+        ``MAX_EXPOSURE_USD_FLOOR=300`` and stays the binding constraint.
+        """
         pos = size_position(
-            1000,
+            2000,
             model_prob=0.99,
             market_prob=0.10,
-            current_exposure=240,
+            current_exposure=490,
         )
-        # max_remaining = 1000*0.25 - 240 = 10
+        # effective_cap = max(2000*0.25=500, 300) = 500
+        # max_remaining = 500 - 490 = 10
         assert pos.stake_usd == pytest.approx(10.0)
         assert pos.capped is True
 
     def test_exposure_limit_reached(self):
-        """Exposure already at 25% → stake = 0."""
+        """Exposure already at 25% → stake = 0 (bankroll above floor zone)."""
         pos = size_position(
-            1000,
+            2000,
             model_prob=0.99,
             market_prob=0.10,
-            current_exposure=250,
+            current_exposure=500,
         )
         assert pos.stake_usd == 0
         assert pos.capped is True
         assert "exposure limit" in pos.reason
+
+    def test_usd_floor_binds_at_small_bankroll(self):
+        """At small bankroll, the absolute USD floor binds instead of the
+        percent cap so the bot keeps trading. With bankroll=$441 the
+        pct cap is $110 but the floor lifts effective cap to $300 —
+        $134.77 of stuck exposure no longer pins the cap immediately.
+        Regression for the 2026-05-17 silencing incident."""
+        # Bankroll * 0.25 = 110.25; floor = 300; effective = 300.
+        # With $134 exposure (where the pre-floor cap would have already
+        # been blown by 22%), we still have $166 budget.
+        pos = size_position(
+            441,
+            model_prob=0.99,
+            market_prob=0.50,
+            current_exposure=134,
+        )
+        assert pos.stake_usd > 0, "Floor should leave headroom for a new trade"
+        # Per-trade cap = 441 * 0.05 = $22.05, so the sized stake should be
+        # capped there (not at exposure-cap remaining of ~$166).
+        assert pos.stake_usd == pytest.approx(22.05, abs=0.10)
+
+    def test_usd_floor_inactive_at_large_bankroll(self):
+        """Above the crossover (~$1200 at defaults), the pct cap binds
+        and the floor has no effect."""
+        pos = size_position(
+            5000,
+            model_prob=0.99,
+            market_prob=0.10,
+            current_exposure=1240,
+        )
+        # effective_cap = max(5000*0.25=1250, 300) = 1250
+        # max_remaining = 1250 - 1240 = 10
+        assert pos.stake_usd == pytest.approx(10.0)
+        assert pos.capped is True
 
     def test_below_minimum_returns_zero(self):
         """Tiny bankroll yields stake < $5 → skip."""

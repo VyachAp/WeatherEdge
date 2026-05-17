@@ -326,7 +326,71 @@ _CTF_BALANCE_ABI = [
         "stateMutability": "nonpayable",
         "type": "function",
     },
+    # Read-only resolution oracle. ``payoutDenominator > 0`` iff the
+    # condition has been reported by the UMA oracle. ``payoutNumerators(
+    # conditionId, outcomeIndex)`` returns the share of the pot that each
+    # outcome receives — for Polymarket binary markets it's [1,0] (YES) or
+    # [0,1] (NO) after resolution. Used by ``get_payout_outcome`` to settle
+    # trades whose markets dropped out of the CLOB before the bot could
+    # observe a resolution price.
+    {
+        "inputs": [{"name": "conditionId", "type": "bytes32"}],
+        "name": "payoutDenominator",
+        "outputs": [{"name": "", "type": "uint256"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
+    {
+        "inputs": [
+            {"name": "conditionId", "type": "bytes32"},
+            {"name": "index", "type": "uint256"},
+        ],
+        "name": "payoutNumerators",
+        "outputs": [{"name": "", "type": "uint256"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
 ]
+
+
+def get_payout_outcome(ctf, condition_id: str) -> bool | None:
+    """Query on-chain payout numerators for a binary market.
+
+    Returns:
+        True  — YES side won (payoutNumerators[0] > payoutNumerators[1]).
+        False — NO side won.
+        None  — condition not yet reported (payoutDenominator == 0) or
+                the call raised (caller should fall back to CLOB / leave
+                trade OPEN).
+
+    Use to settle trades whose market resolved on-chain but whose CLOB
+    listing was dropped before ``_refresh_market_price`` could observe
+    a 0.05/0.95 price. The chain is the authoritative resolution source.
+    """
+    from web3 import Web3
+
+    if not condition_id:
+        return None
+    try:
+        cid = (
+            condition_id
+            if condition_id.startswith("0x")
+            else "0x" + condition_id
+        )
+        cid_bytes = Web3.to_bytes(hexstr=cid)
+        denom = ctf.functions.payoutDenominator(cid_bytes).call()
+        if denom == 0:
+            return None
+        yes_num = ctf.functions.payoutNumerators(cid_bytes, 0).call()
+        no_num = ctf.functions.payoutNumerators(cid_bytes, 1).call()
+    except Exception:
+        return None
+
+    if yes_num == no_num:
+        # 50/50 split is theoretically possible but never used by Polymarket
+        # for binary markets; treat as unresolved to be safe.
+        return None
+    return yes_num > no_num
 
 
 def get_ctf_readonly(skip_url: str | None = None):

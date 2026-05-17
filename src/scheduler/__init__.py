@@ -913,6 +913,34 @@ async def job_daily_settlement() -> None:
                 else:
                     logger.info("Calibration: insufficient data (<50 resolved signals)")
 
+            # 6. Exposure-cap proximity alert. Catches the silent-silencer
+            # failure mode (incident 2026-05-17): stuck OPEN trades pin the
+            # ``MAX_EXPOSURE_PCT × bankroll`` cap, ``size_position`` returns
+            # $0 for every passing eval, the bot stops trading but logs
+            # nothing operationally urgent. The alert fires at 80% of the
+            # effective cap (matching the ``MAX_EXPOSURE_USD_FLOOR`` floor
+            # when bankroll is small) so the operator sees it BEFORE
+            # throughput dies, not after.
+            try:
+                exposure = await get_current_exposure(session)
+                bankroll = await get_current_bankroll(session)
+                effective_cap = max(
+                    settings.MAX_EXPOSURE_PCT * bankroll,
+                    settings.MAX_EXPOSURE_USD_FLOOR,
+                )
+                if effective_cap > 0 and exposure > 0.80 * effective_cap:
+                    await alerter._enqueue(
+                        f"⚠ *Exposure approaching cap*\n"
+                        f"Current: ${exposure:,.2f}  "
+                        f"Cap: ${effective_cap:,.2f}  "
+                        f"({100 * exposure / effective_cap:.0f}%)\n"
+                        f"New sizes will start collapsing to $0 once cap is hit. "
+                        f"Inspect OPEN trades and run `admin reconcile-stuck` "
+                        f"if any are stuck delayed."
+                    )
+            except Exception:
+                logger.warning("Exposure-cap alert check failed (non-fatal)", exc_info=True)
+
             await session.commit()
 
     except Exception as exc:
@@ -1302,17 +1330,28 @@ async def job_reconcile_orders() -> None:
 
     try:
         async with async_session() as session:
-            cutoff = (
-                datetime.now(timezone.utc)
-                - timedelta(hours=settings.ORDER_RECONCILE_LOOKBACK_HOURS)
+            now = datetime.now(timezone.utc)
+            recent_cutoff = (
+                now - timedelta(hours=settings.ORDER_RECONCILE_LOOKBACK_HOURS)
             )
+            # Long-tail cutoff: catch delayed orders whose fill never
+            # landed and whose market is still recent enough that
+            # resolution is plausible. Pre-2026-05-17 we only looked
+            # back 24h, so the May-13/14 batch of 16 delayed-no-fill
+            # trades drifted out of the window before resolution and
+            # ended up pinning the exposure cap (incident notes).
+            longtail_cutoff = now - timedelta(days=7)
             stmt = (
                 select(Trade)
+                .join(Market, Trade.market_id == Market.id)
                 .where(
                     Trade.order_id.is_not(None),
                     Trade.fill_price.is_(None),
                     Trade.exchange_status.in_(["delayed", "matched", "matching"]),
-                    Trade.opened_at >= cutoff,
+                    (
+                        (Trade.opened_at >= recent_cutoff)
+                        | (Market.end_date >= longtail_cutoff)
+                    ),
                 )
             )
             result = await session.execute(stmt)

@@ -1,7 +1,7 @@
 """Trade resolution, P&L calculation, and bankroll helpers."""
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -75,12 +75,48 @@ async def resolve_trades(session: AsyncSession) -> list[Trade]:
 
     resolved: list[Trade] = []
     refreshed_prices: dict[str, float | None] = {}
+    grace = timedelta(hours=settings.RESOLVE_NO_PRICE_GRACE_HOURS)
     for trade in trades:
         market = trade.market
         if market.id not in refreshed_prices:
             refreshed_prices[market.id] = await _refresh_market_price(market)
         price = refreshed_prices[market.id]
         if price is None:
+            # CLOB-dropped market catch-22: Polymarket drops resolved
+            # markets from its listings, so ``_refresh_market_price``
+            # returns None even though the market has been resolved on
+            # the on-chain oracle for hours. Pre-2026-05-17 these trades
+            # stayed OPEN forever, pinning the ``MAX_EXPOSURE_PCT`` cap.
+            # Fallback only fires after a grace period so transient CLOB
+            # blips during normal hours don't trigger spurious LOSTs.
+            if market.end_date is None or market.end_date > now - grace:
+                continue
+            if trade.fill_price is None:
+                # Order never landed on-chain (delayed → never filled).
+                # No real position; mark LOST to release exposure.
+                trade.status = TradeStatus.LOST
+                trade.pnl = -float(trade.stake_usd)
+                trade.exit_price = 0.0
+                trade.closed_at = now
+                resolved.append(trade)
+                logger.warning(
+                    "Resolved trade %s (null fill) on market %s → LOST "
+                    "(CLOB dropped market %.0fh past end_date; no on-chain position)",
+                    trade.id, trade.market_id,
+                    (now - market.end_date).total_seconds() / 3600.0,
+                )
+                continue
+            # fill_price IS populated → real on-chain position. Don't
+            # silently mark LOST; operator should run
+            # ``admin reconcile-stuck`` for on-chain payout settlement.
+            logger.warning(
+                "Trade %s on market %s has CLOB-dropped market %.0fh past "
+                "end_date with populated fill_price=%.3f. Run `admin "
+                "reconcile-stuck` to settle from on-chain payout.",
+                trade.id, trade.market_id,
+                (now - market.end_date).total_seconds() / 3600.0,
+                trade.fill_price,
+            )
             continue
 
         if price >= _YES_RESOLVED_THRESHOLD:

@@ -3100,5 +3100,340 @@ def reset_drawdown_peak(skip_confirm: bool, dry_run: bool) -> None:
     asyncio.run(_reset())
 
 
+@admin.command("reconcile-stuck")
+@click.option("--yes", "-y", "skip_confirm", is_flag=True, help="Skip confirmation prompt.")
+@click.option("--dry-run", is_flag=True, help="Show what would change without writing.")
+@click.option(
+    "--grace-hours",
+    default=4,
+    show_default=True,
+    type=int,
+    help="Only touch trades whose market ended at least this many hours ago.",
+)
+def reconcile_stuck(skip_confirm: bool, dry_run: bool, grace_hours: int) -> None:
+    """Resolve OPEN trades with no fill_price whose markets have ended.
+
+    Symptom: ``size_position`` returns $0 because ``get_current_exposure``
+    sums OPEN ``stake_usd`` and the bot is already over the
+    ``MAX_EXPOSURE_PCT`` cap. Root cause: delayed CLOB orders that never
+    matched but were promoted to ``status=OPEN`` despite ``fill_price IS
+    NULL``; ``job_resolve_trades`` then can't settle them because the
+    CLOB drops resolved markets from its listings and
+    ``_refresh_market_price`` returns None.
+
+    For each affected trade, query on-chain ``balanceOf`` for the
+    market's conditional token:
+      * balance == 0 → trade never landed; mark ``LOST`` with
+        ``pnl = -stake_usd``. Releases exposure budget.
+      * balance > 0  → trade DID land; backfill ``fill_price`` from
+        ``entry_price`` and ``filled_size`` from ``stake_usd/entry_price``
+        and leave OPEN so ``job_resolve_trades`` settles it next tick.
+
+    Requires ``POLYMARKET_PRIVATE_KEY`` set (read-only chain access; no
+    signed transactions).
+    """
+
+    async def _reconcile_stuck() -> None:
+        from datetime import datetime, timedelta, timezone
+
+        from sqlalchemy import select, update
+        from sqlalchemy.orm import joinedload
+
+        from src.config import settings
+        from src.db.engine import async_session
+        from src.db.models import Market, Trade, TradeDirection, TradeStatus
+        from src.bet_helpers import (
+            get_ctf_readonly,
+            get_payout_outcome,
+            rpc_call_with_retry,
+        )
+        from src.execution.polymarket_client import get_token_ids
+
+        if not settings.POLYMARKET_PRIVATE_KEY:
+            click.echo("Error: POLYMARKET_PRIVATE_KEY not set in .env")
+            raise SystemExit(1)
+
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=grace_hours)
+
+        async with async_session() as session:
+            rows = (
+                await session.execute(
+                    select(Trade)
+                    .options(joinedload(Trade.market))
+                    .join(Market, Trade.market_id == Market.id)
+                    .where(
+                        Trade.status == TradeStatus.OPEN,
+                        Trade.fill_price.is_(None),
+                        Trade.exchange_status == "delayed",
+                        Market.end_date < cutoff,
+                    )
+                    .order_by(Trade.opened_at)
+                )
+            ).scalars().unique().all()
+
+            if not rows:
+                click.echo(
+                    f"No stuck trades (OPEN + delayed + null fill_price) "
+                    f"with markets ended > {grace_hours}h ago. Nothing to do."
+                )
+                return
+
+            click.echo(
+                f"Found {len(rows)} stuck trade(s) totalling "
+                f"${sum(t.stake_usd for t in rows):.2f} in tied-up exposure.\n"
+            )
+
+            # Lazy Web3 setup so --dry-run with zero matches doesn't pay
+            # the connection cost. (Connection is needed for any non-dry
+            # path because we need the on-chain balance.)
+            try:
+                w3, ctf, address, rpc_url = get_ctf_readonly()
+            except Exception as exc:
+                click.echo(f"Error connecting to chain: {exc}")
+                raise SystemExit(1)
+            click.echo(f"Connected to {rpc_url} as {address}\n")
+
+            def _check_balance(token_id_int: int) -> int:
+                return ctf.functions.balanceOf(address, token_id_int).call()
+
+            # Cache Gamma lookups across trades sharing market_id.
+            # Lookup of YES/NO token pair only happens for trades whose
+            # token_id is NULL (legacy rows from before token_id capture).
+            token_id_cache: dict[str, tuple[str, str] | None] = {}
+
+            # Backfill missing market.condition_id from data-api positions.
+            # Gamma drops resolved markets from /markets?id=… so direct
+            # lookup returns []; data-api.polymarket.com/positions is the
+            # only feed that still carries conditionId for closed positions.
+            # Same fallback path the redeem flow uses for legacy NULL rows.
+            funder_addr = (
+                settings.POLYMARKET_FUNDER_ADDRESS or address
+            )
+            asset_to_cond: dict[str, str] = {}
+            missing_cond_market_ids = {
+                t.market_id for t in rows
+                if t.market and not t.market.condition_id
+            }
+            if missing_cond_market_ids:
+                import httpx as _httpx
+                try:
+                    async with _httpx.AsyncClient(timeout=20) as http:
+                        resp = await http.get(
+                            "https://data-api.polymarket.com/positions",
+                            params={
+                                "user": funder_addr,
+                                "sizeThreshold": "0",
+                                "limit": "500",
+                            },
+                        )
+                        resp.raise_for_status()
+                        payload = resp.json()
+                    if isinstance(payload, list):
+                        for p in payload:
+                            asset = str(p.get("asset", ""))
+                            cond = str(p.get("conditionId", ""))
+                            if asset and cond:
+                                asset_to_cond[asset] = cond
+                    click.echo(
+                        f"data-api positions: fetched {len(asset_to_cond)} "
+                        f"asset→conditionId mappings\n"
+                    )
+                except Exception as exc:
+                    click.echo(
+                        f"  warning: data-api positions lookup failed ({exc}); "
+                        f"payout settlement will fall back to backfill-only"
+                    )
+
+            decisions: list[dict] = []
+
+            for trade in rows:
+                token_id = trade.token_id
+                if not token_id:
+                    if trade.market_id not in token_id_cache:
+                        try:
+                            token_id_cache[trade.market_id] = await get_token_ids(
+                                trade.market_id
+                            )
+                        except Exception as exc:
+                            click.echo(
+                                f"  trade {trade.id}: token lookup failed ({exc})"
+                            )
+                            token_id_cache[trade.market_id] = None
+                    pair = token_id_cache[trade.market_id]
+                    if pair is None:
+                        decisions.append({
+                            "trade": trade, "action": "skip-no-token",
+                            "balance": None,
+                        })
+                        continue
+                    yes_tok, no_tok = pair
+                    token_id = (
+                        yes_tok if trade.direction == TradeDirection.BUY_YES else no_tok
+                    )
+
+                try:
+                    asset_id_int = int(token_id)
+                except (TypeError, ValueError):
+                    click.echo(f"  trade {trade.id}: invalid token_id {token_id!r}")
+                    decisions.append({
+                        "trade": trade, "action": "skip-bad-token", "balance": None,
+                    })
+                    continue
+
+                try:
+                    bal = rpc_call_with_retry(
+                        lambda aid=asset_id_int: _check_balance(aid)
+                    )
+                except Exception as exc:
+                    click.echo(f"  trade {trade.id}: balance check failed ({exc})")
+                    decisions.append({
+                        "trade": trade, "action": "skip-rpc-error", "balance": None,
+                    })
+                    continue
+
+                # bal == 0  → order never filled on-chain; mark LOST.
+                # bal > 0   → order DID fill. Check on-chain payout
+                #             numerators: if reported, settle WON/LOST
+                #             inline (the CLOB dropped the market so
+                #             resolve_trades would just skip it forever);
+                #             otherwise backfill fill_price and leave OPEN.
+                if bal == 0:
+                    action = "mark-lost"
+                    settled_yes_won: bool | None = None
+                    cond_id_used = ""
+                else:
+                    cond_id_used = (
+                        (trade.market.condition_id or "") if trade.market else ""
+                    )
+                    if not cond_id_used:
+                        # Legacy market (NULL condition_id). Fallback via
+                        # data-api positions feed populated above.
+                        cond_id_used = asset_to_cond.get(token_id, "")
+                        if cond_id_used and trade.market is not None:
+                            trade.market.condition_id = cond_id_used
+                    try:
+                        settled_yes_won = rpc_call_with_retry(
+                            lambda c=cond_id_used: get_payout_outcome(ctf, c)
+                        ) if cond_id_used else None
+                    except Exception as exc:
+                        click.echo(
+                            f"  trade {trade.id}: payout check failed ({exc})"
+                        )
+                        settled_yes_won = None
+                    if settled_yes_won is None:
+                        action = "backfill-fill"
+                    else:
+                        trade_won = (
+                            (trade.direction == TradeDirection.BUY_YES and settled_yes_won)
+                            or (trade.direction == TradeDirection.BUY_NO and not settled_yes_won)
+                        )
+                        action = "settle-won" if trade_won else "settle-lost"
+
+                decisions.append({
+                    "trade": trade,
+                    "action": action,
+                    "balance": bal,
+                    "token_id": token_id,
+                    "condition_id": cond_id_used,
+                    "yes_won": settled_yes_won,
+                })
+
+            # Summary table
+            click.echo("Decisions:")
+            click.echo(
+                f"  {'id':>6} {'opened_at':<25} {'stake':>8} {'action':<18}  market"
+            )
+            for d in decisions:
+                t = d["trade"]
+                bal_str = "—" if d["balance"] is None else f"bal={d['balance']}"
+                q = (t.market.question[:50] + "…") if t.market and len(t.market.question or "") > 50 else (t.market.question if t.market else "?")
+                click.echo(
+                    f"  {t.id:>6} {t.opened_at.isoformat():<25} "
+                    f"${t.stake_usd:>7.2f} {d['action']:<18}  {bal_str}  {q}"
+                )
+
+            to_mark_lost = [d for d in decisions if d["action"] == "mark-lost"]
+            to_settle_won = [d for d in decisions if d["action"] == "settle-won"]
+            to_settle_lost = [d for d in decisions if d["action"] == "settle-lost"]
+            to_backfill = [d for d in decisions if d["action"] == "backfill-fill"]
+            released = sum(
+                d["trade"].stake_usd
+                for d in (to_mark_lost + to_settle_won + to_settle_lost)
+            )
+            click.echo()
+            click.echo(
+                f"Summary: {len(to_mark_lost)} mark-LOST (never filled), "
+                f"{len(to_settle_won)} settle-WON, "
+                f"{len(to_settle_lost)} settle-LOST (filled, on-chain payout), "
+                f"{len(to_backfill)} backfill-only (not yet reported on-chain), "
+                f"{len(decisions) - len(to_mark_lost) - len(to_settle_won) - len(to_settle_lost) - len(to_backfill)} skipped. "
+                f"Will release ${released:.2f} of exposure."
+            )
+
+            if dry_run:
+                click.echo("\n--dry-run: no changes written.")
+                return
+
+            if not skip_confirm and (
+                to_mark_lost or to_settle_won or to_settle_lost or to_backfill
+            ):
+                click.confirm("Apply these changes?", abort=True)
+
+            now = datetime.now(timezone.utc)
+            for d in to_mark_lost:
+                t = d["trade"]
+                t.status = TradeStatus.LOST
+                t.pnl = -float(t.stake_usd)
+                t.exit_price = 0.0
+                t.closed_at = now
+            for d in to_settle_won:
+                t = d["trade"]
+                # Backfill fill_price first so PnL math has a clean basis.
+                t.fill_price = float(t.entry_price or 0.0)
+                t.filled_size = (
+                    float(t.stake_usd) / float(t.entry_price)
+                    if t.entry_price and t.entry_price > 0 else 0.0
+                )
+                t.status = TradeStatus.WON
+                entry = float(t.entry_price or 0.0)
+                t.pnl = (
+                    float(t.stake_usd) * (1.0 / entry - 1.0) if entry > 0 else 0.0
+                )
+                t.exit_price = 1.0
+                t.closed_at = now
+            for d in to_settle_lost:
+                t = d["trade"]
+                t.fill_price = float(t.entry_price or 0.0)
+                t.filled_size = (
+                    float(t.stake_usd) / float(t.entry_price)
+                    if t.entry_price and t.entry_price > 0 else 0.0
+                )
+                t.status = TradeStatus.LOST
+                t.pnl = -float(t.stake_usd)
+                t.exit_price = 0.0
+                t.closed_at = now
+            for d in to_backfill:
+                t = d["trade"]
+                t.fill_price = float(t.entry_price or 0.0)
+                t.filled_size = (
+                    float(t.stake_usd) / float(t.entry_price)
+                    if t.entry_price and t.entry_price > 0 else 0.0
+                )
+                # Status stays OPEN; market not yet reported on-chain.
+                # resolve_trades will catch it once CLOB or the E2
+                # fallback succeeds.
+
+            await session.commit()
+            click.echo(
+                f"\nApplied: {len(to_mark_lost)} LOST (never filled), "
+                f"{len(to_settle_won)} WON, "
+                f"{len(to_settle_lost)} LOST (settled from on-chain payout), "
+                f"{len(to_backfill)} backfilled-only. "
+                f"Exposure released: ${released:.2f}."
+            )
+
+    asyncio.run(_reconcile_stuck())
+
+
 if __name__ == "__main__":
     main()

@@ -321,3 +321,106 @@ class TestResolveTradesPriceRefresh:
         assert trade.status == TradeStatus.WON
         assert trade.exit_price == 1.0
         assert trade.pnl == pytest.approx(100.0)  # 100 * (1/0.5 - 1)
+
+
+class TestResolveTradesCatchTwoFallback:
+    """Tests for the ``_refresh_market_price returns None`` fallback in
+    ``resolve_trades``. Polymarket drops resolved markets from the CLOB
+    listing, so ``_refresh_market_price`` returns None and pre-2026-05-17
+    the loop's ``continue`` left trades OPEN forever, pinning the
+    exposure cap. Fallback marks LOST when the trade never filled
+    (``fill_price IS NULL``) after the grace period; leaves OPEN with a
+    warning otherwise (operator runs ``admin reconcile-stuck``)."""
+
+    def _stuck_trade(self, *, fill_price, hours_past_end):
+        market = MagicMock()
+        market.id = "cond_stuck"
+        # Both the live CLOB lookup AND the stored snapshot return None
+        # — this is the catch-22 state pre-2026-05-17 (Polymarket drops
+        # the market from CLOB; the local snapshot was never populated
+        # because resolution happened before the next scan_markets tick).
+        market.current_yes_price = None
+        market.end_date = datetime.utcnow() - timedelta(hours=hours_past_end)
+
+        trade = MagicMock()
+        trade.id = 1234
+        trade.market = market
+        trade.market_id = market.id
+        trade.direction = TradeDirection.BUY_NO
+        trade.stake_usd = 10.0
+        trade.entry_price = 0.80
+        trade.fill_price = fill_price
+        trade.status = TradeStatus.OPEN
+        return trade
+
+    @pytest.mark.asyncio
+    async def test_null_fill_past_grace_marks_lost(self, mock_session):
+        """Delayed-never-filled trade with no on-chain position is marked
+        LOST after the grace window so exposure releases."""
+        trade = self._stuck_trade(fill_price=None, hours_past_end=24)
+        scalars = MagicMock()
+        scalars.unique.return_value = [trade]
+        result = MagicMock()
+        result.scalars.return_value = scalars
+        mock_session.execute.return_value = result
+
+        # CLOB returns no token IDs → _refresh_market_price returns
+        # None via the early-return path.
+        with patch(
+            "src.execution.polymarket_client.get_token_ids",
+            new=AsyncMock(return_value=None),
+        ):
+            resolved = await resolve_trades(mock_session)
+
+        assert len(resolved) == 1
+        assert trade.status == TradeStatus.LOST
+        assert trade.pnl == pytest.approx(-10.0)
+        assert trade.exit_price == 0.0
+
+    @pytest.mark.asyncio
+    async def test_null_fill_within_grace_left_open(self, mock_session):
+        """Grace window guards against transient CLOB blips — recent
+        end_dates leave the trade OPEN so retry on next tick."""
+        trade = self._stuck_trade(fill_price=None, hours_past_end=1)
+        scalars = MagicMock()
+        scalars.unique.return_value = [trade]
+        result = MagicMock()
+        result.scalars.return_value = scalars
+        mock_session.execute.return_value = result
+
+        with patch(
+            "src.execution.polymarket_client.get_token_ids",
+            new=AsyncMock(return_value=None),
+        ):
+            resolved = await resolve_trades(mock_session)
+
+        assert resolved == []
+        assert trade.status == TradeStatus.OPEN
+
+    @pytest.mark.asyncio
+    async def test_populated_fill_past_grace_left_open_with_warning(
+        self, mock_session, caplog,
+    ):
+        """fill_price IS NOT NULL → real on-chain position. Don't silently
+        LOST; emit a warning telling the operator to run
+        ``admin reconcile-stuck`` for on-chain payout settlement."""
+        import logging as _logging
+        trade = self._stuck_trade(fill_price=0.80, hours_past_end=48)
+        scalars = MagicMock()
+        scalars.unique.return_value = [trade]
+        result = MagicMock()
+        result.scalars.return_value = scalars
+        mock_session.execute.return_value = result
+
+        with patch(
+            "src.execution.polymarket_client.get_token_ids",
+            new=AsyncMock(return_value=None),
+        ), caplog.at_level(_logging.WARNING, logger="src.resolution"):
+            resolved = await resolve_trades(mock_session)
+
+        assert resolved == []
+        assert trade.status == TradeStatus.OPEN
+        assert any(
+            "reconcile-stuck" in r.message and r.levelname == "WARNING"
+            for r in caplog.records
+        )

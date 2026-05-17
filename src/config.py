@@ -94,6 +94,18 @@ class Settings(BaseSettings):
     MAX_POSITION_USD: float = 200.0
     DEPTH_POSITION_CAP_PCT: float = 0.20
 
+    # Absolute USD floor on the per-tick exposure cap. The exposure cap
+    # math in ``src/risk/kelly.py`` is ``max(MAX_EXPOSURE_PCT × bankroll,
+    # MAX_EXPOSURE_USD_FLOOR)``. At small bankroll the percent cap binds
+    # too tightly (e.g. $441 × 25% = $110 = only ~5 simultaneous $22
+    # positions), so a single batch of stuck OPEN trades silences the
+    # bot (incident 2026-05-17). The floor "fires" only when bankroll
+    # < ``floor / MAX_EXPOSURE_PCT`` (≈ $1200 at the defaults); above
+    # that the percent cap binds again. Per-trade caps
+    # (``MAX_POSITION_PCT``, ``MAX_POSITION_USD``) and the drawdown
+    # state machine still gate runaway risk.
+    MAX_EXPOSURE_USD_FLOOR: float = 300.0
+
     # Same-day same-city bracket/exactly cluster total stake cap. Outcomes
     # across buckets of one bracket are anti-correlated — only one bucket
     # can win — so each bucket's Kelly stake is mis-priced as if
@@ -144,6 +156,16 @@ class Settings(BaseSettings):
     # remain blind. Disable by setting to 0.
     ORDER_RECONCILE_INTERVAL_MINUTES: int = 5
     ORDER_RECONCILE_LOOKBACK_HOURS: int = 24
+
+    # ``resolve_trades`` catch-22 grace window. When ``_refresh_market_price``
+    # returns None for an OPEN trade whose market ended more than this many
+    # hours ago, fall back to: (a) mark LOST if ``fill_price IS NULL`` (the
+    # order never landed on-chain — no real position), (b) leave OPEN with a
+    # warning if ``fill_price`` is populated (operator should run
+    # ``admin reconcile-stuck`` for on-chain payout settlement). Without
+    # this fallback, the CLOB drops resolved markets and trades stay OPEN
+    # forever, pinning the ``MAX_EXPOSURE_PCT`` cap (incident 2026-05-17).
+    RESOLVE_NO_PRICE_GRACE_HOURS: int = 4
 
     # Lock-rule trader (deterministic physical-condition path)
     LOCK_RULE_ENABLED: bool = True
