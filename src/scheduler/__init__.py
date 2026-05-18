@@ -13,10 +13,11 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.exc import ProgrammingError
 
 from src.config import settings
 from src.db.engine import async_session, engine
-from src.db.models import EvaluationLog, Market, Signal, Trade, TradeStatus
+from src.db.models import BotState, EvaluationLog, Market, Signal, Trade, TradeStatus
 from src.execution.alerter import get_alerter
 from src.execution.binary_market import (
     display_bucket as _display_bucket,
@@ -56,7 +57,7 @@ from src.resolution import (
 )
 from src.risk.cluster_cap import cluster_stake_used as _cluster_stake_used
 from src.risk.drawdown import DrawdownLevel, DrawdownMonitor
-from src.risk.kelly import size_locked_position, size_position
+from src.risk.kelly import MAX_EXPOSURE_PCT, size_locked_position, size_position
 from src.signals.calibration import get_calibration_coefficients
 from src.signals.edge_calculator import binary_market_edge as _binary_market_edge
 from src.signals.decision_log import (
@@ -933,7 +934,7 @@ async def job_daily_settlement() -> None:
                 exposure = await get_current_exposure(session)
                 bankroll = await get_current_bankroll(session)
                 effective_cap = max(
-                    settings.MAX_EXPOSURE_PCT * bankroll,
+                    MAX_EXPOSURE_PCT * bankroll,
                     settings.MAX_EXPOSURE_USD_FLOOR,
                 )
                 if effective_cap > 0 and exposure > 0.80 * effective_cap:
@@ -1309,6 +1310,69 @@ async def job_fast_lock_poll() -> None:
             logger.warning("Alerter failed to send fast-poll error")
 
 
+# ---------------------------------------------------------------------------
+# Stuck-OPEN heartbeat cooldown helpers — mirror the
+# ``circuit_breakers._load_paused_until`` / ``_persist_paused_until`` pattern
+# so a process restart doesn't reset the cooldown timer, and the missing
+# ``bot_state`` table fails open (rather than killing the reconcile tick).
+# ---------------------------------------------------------------------------
+
+_STUCK_ALERT_KEY = "reconcile.stuck_alert_last_pushed_at"
+
+
+async def _load_stuck_alert_cooldown(
+    session: "AsyncSessionType",
+) -> datetime | None:
+    try:
+        row = await session.get(BotState, _STUCK_ALERT_KEY)
+    except ProgrammingError:
+        await session.rollback()
+        logger.warning(
+            "bot_state table missing — stuck-trade alert cooldown not "
+            "persisted. Run `alembic upgrade head`."
+        )
+        return None
+    if row is None or row.value is None:
+        return None
+    iso = row.value.get("at_iso") if isinstance(row.value, dict) else None
+    if not iso:
+        return None
+    try:
+        return datetime.fromisoformat(iso)
+    except ValueError:
+        logger.warning(
+            "Invalid stuck-alert cooldown value in bot_state: %r", row.value
+        )
+        return None
+
+
+async def _persist_stuck_alert_cooldown(
+    session: "AsyncSessionType", at: datetime,
+) -> None:
+    try:
+        stmt = (
+            pg_insert(BotState)
+            .values(
+                key=_STUCK_ALERT_KEY,
+                value={"at_iso": at.isoformat()},
+                updated_at=datetime.now(timezone.utc),
+            )
+            .on_conflict_do_update(
+                index_elements=["key"],
+                set_={
+                    "value": {"at_iso": at.isoformat()},
+                    "updated_at": datetime.now(timezone.utc),
+                },
+            )
+        )
+        await session.execute(stmt)
+    except ProgrammingError:
+        await session.rollback()
+        logger.warning(
+            "bot_state table missing — stuck-alert cooldown not persisted."
+        )
+
+
 async def job_reconcile_orders() -> None:
     """Poll PENDING/OPEN trades whose fill data hasn't been written yet.
 
@@ -1325,6 +1389,19 @@ async def job_reconcile_orders() -> None:
     is one of {``delayed``, ``matched``, ``matching``}. For each, calls
     ``check_order_status`` (which itself triggers ``_update_fill_details``
     when the order has reached ``matched``).
+
+    After the per-row reconcile, runs a **log-only stale-OPEN sweep**:
+    any OPEN+null-fill rows whose market ended more than
+    ``STALE_OPEN_RECONCILE_GRACE_HOURS`` ago are summarised as a high-
+    signal warning, and a Telegram heartbeat is pushed when the stuck
+    set crosses the count or exposure-fraction threshold (cooldown in
+    ``bot_state``). The sweep NEVER marks rows LOST — that requires
+    on-chain ``balanceOf`` which is the operator's
+    ``admin reconcile-stuck`` flow. Added 2026-05-18 after a 12+ hour
+    silencer driven by ``matched``-but-no-fill rows that
+    ``check_order_status`` couldn't drive forward (it was silently
+    crashing on ``None`` from the CLOB; that bug also fixed in the
+    same change).
 
     No-op in dry-run / no-private-key mode.
     """
@@ -1391,6 +1468,90 @@ async def job_reconcile_orders() -> None:
                 logger.info(
                     "reconcile: filled %d/%d delayed/matched orders",
                     updated, len(trades),
+                )
+
+            # ---------------- Stale-OPEN sweep + heartbeat ----------------
+            # Rows that ``check_order_status`` couldn't drive forward AND
+            # whose market has ended past grace. Log-only here; the
+            # operator's ``admin reconcile-stuck`` flow is what touches
+            # on-chain state. Mirrors the analogous fallback in
+            # ``resolution.resolve_trades`` but is reachable WITHOUT
+            # requiring ``_refresh_market_price`` to return None first —
+            # that gap is exactly what hid incident 2026-05-18.
+            try:
+                stale_cutoff = now - timedelta(
+                    hours=settings.STALE_OPEN_RECONCILE_GRACE_HOURS
+                )
+                stale_stmt = (
+                    select(Trade)
+                    .join(Market, Trade.market_id == Market.id)
+                    .where(
+                        Trade.status == TradeStatus.OPEN,
+                        Trade.fill_price.is_(None),
+                        Trade.stake_usd > 0,
+                        Market.end_date.is_not(None),
+                        Market.end_date < stale_cutoff,
+                    )
+                )
+                stale_rows = (
+                    await session.execute(stale_stmt)
+                ).scalars().all()
+                if stale_rows:
+                    stuck_stake = sum(
+                        float(t.stake_usd) for t in stale_rows
+                    )
+                    logger.warning(
+                        "reconcile: %d stuck OPEN trades past %dh grace "
+                        "(stake $%.2f); run `admin reconcile-stuck "
+                        "--dry-run` to inspect, then live to settle",
+                        len(stale_rows),
+                        settings.STALE_OPEN_RECONCILE_GRACE_HOURS,
+                        stuck_stake,
+                    )
+
+                    bankroll = await get_current_bankroll(session)
+                    effective_cap = max(
+                        MAX_EXPOSURE_PCT * bankroll,
+                        settings.MAX_EXPOSURE_USD_FLOOR,
+                    )
+                    crosses_count = (
+                        len(stale_rows) >= settings.STUCK_ALERT_MIN_COUNT
+                    )
+                    crosses_exposure = (
+                        effective_cap > 0
+                        and stuck_stake
+                        >= settings.STUCK_ALERT_EXPOSURE_FRACTION
+                        * effective_cap
+                    )
+                    if crosses_count or crosses_exposure:
+                        last_at = await _load_stuck_alert_cooldown(session)
+                        cooldown = timedelta(
+                            hours=settings.STUCK_ALERT_COOLDOWN_HOURS
+                        )
+                        if last_at is None or (now - last_at) >= cooldown:
+                            pct = (
+                                100 * stuck_stake / effective_cap
+                                if effective_cap > 0
+                                else 0.0
+                            )
+                            alerter = get_alerter()
+                            await alerter._enqueue(
+                                f"🚨 *Stuck OPEN trades pinning exposure*\n"
+                                f"Count: {len(stale_rows)} "
+                                f"(stake ${stuck_stake:,.2f})\n"
+                                f"Effective cap: ${effective_cap:,.2f}  "
+                                f"({pct:.0f}% pinned)\n"
+                                f"Bankroll: ${bankroll:,.2f}\n"
+                                f"Action: run "
+                                f"`python -m src.cli admin reconcile-stuck "
+                                f"--dry-run` to inspect, then live to release."
+                            )
+                            await _persist_stuck_alert_cooldown(session, now)
+                            await session.commit()
+            except Exception:
+                logger.warning(
+                    "Stuck-trade heartbeat check failed (non-fatal)",
+                    exc_info=True,
                 )
     except Exception:
         logger.warning("Order reconciliation job failed", exc_info=True)

@@ -167,6 +167,34 @@ class Settings(BaseSettings):
     # forever, pinning the ``MAX_EXPOSURE_PCT`` cap (incident 2026-05-17).
     RESOLVE_NO_PRICE_GRACE_HOURS: int = 4
 
+    # Stuck-OPEN sweep + heartbeat in ``job_reconcile_orders``.
+    #
+    # When ``check_order_status`` keeps returning None for a trade row
+    # (CLOB endpoint dropped the order after market resolution; see the
+    # docstring in ``polymarket_client.check_order_status``), the row
+    # stays ``status=OPEN`` with ``fill_price IS NULL`` indefinitely,
+    # pinning the ``max(MAX_EXPOSURE_PCT × bankroll,
+    # MAX_EXPOSURE_USD_FLOOR)`` cap. Incident 2026-05-18 silenced the
+    # bot for 12+ hours because the 22:00-UTC daily-settlement
+    # 80%-of-cap alert is too coarse to catch the failure inside the
+    # 24h window.
+    #
+    # The 5-minute reconcile job logs a high-signal warning when the
+    # stuck-trade set is non-empty past this grace, and pushes a
+    # Telegram alert when either the count threshold or the relative
+    # exposure-fraction threshold trips. ``BotState`` row keyed
+    # ``reconcile.stuck_alert_last_pushed_at`` enforces the cooldown
+    # so the queue isn't spammed every tick during a multi-hour
+    # silence.
+    #
+    # The job itself NEVER marks trades LOST — that requires on-chain
+    # ``balanceOf`` + ``payoutNumerators`` which is the operator's
+    # ``admin reconcile-stuck`` flow.
+    STALE_OPEN_RECONCILE_GRACE_HOURS: int = 4
+    STUCK_ALERT_MIN_COUNT: int = 5
+    STUCK_ALERT_EXPOSURE_FRACTION: float = 0.50
+    STUCK_ALERT_COOLDOWN_HOURS: int = 4
+
     # Lock-rule trader (deterministic physical-condition path)
     LOCK_RULE_ENABLED: bool = True
     LOCK_RULE_MAX_PRICE: float = 0.95

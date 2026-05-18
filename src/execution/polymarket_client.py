@@ -797,23 +797,59 @@ async def sell_position(
 
 
 async def check_order_status(trade: Trade) -> str | None:
-    """Check current status of an open order. Returns the status string."""
+    """Check current status of an open order. Returns the status string.
+
+    ``client.get_order`` returns ``None`` for two distinct CLOB states:
+    (a) the order is still queued in the matching engine, (b) the
+    matching engine acked it but the market has since been dropped from
+    the order endpoint (the same CLOB behaviour that resolves into the
+    ``_fetch_orderbook`` 404 gotcha and the
+    ``resolve_trades`` catch-22). We can't distinguish from this
+    endpoint, so we leave ``trade.exchange_status`` untouched — the
+    reconcile filter then finds the row again next tick, and the
+    stale-OPEN sweep in ``job_reconcile_orders`` is the eventual
+    safety net for case (b).
+
+    Pre-2026-05-18 this function called ``order.get("status", ...)``
+    without a ``None`` check, raising ``AttributeError`` into a bare
+    ``except`` that swallowed the cause with a contextless one-line
+    warning. The result was that 24 ``matched``-but-no-fill rows from
+    2026-05-17 spammed the same "Could not check order" line every 5
+    minutes for 12+ hours while staying invisible to the operator.
+    """
     client = _get_client()
     if client is None or not trade.order_id:
         return None
 
     try:
         order = client.get_order(trade.order_id)
-        status = order.get("status", "unknown")
-        trade.exchange_status = status
-
-        if status.lower() == "matched" and not trade.fill_price:
-            await _update_fill_details(trade, client)
-
-        return status
     except Exception:
-        logger.warning("Could not check order %s", trade.order_id)
+        # Real lookup failure (auth, transport, 5xx). Log with traceback
+        # so the cause is debuggable instead of just "Could not check".
+        logger.warning(
+            "Could not check order %s (lookup raised)",
+            trade.order_id, exc_info=True,
+        )
         return None
+
+    if order is None:
+        # See docstring — queued OR market-dropped. ``info`` (not
+        # ``warning``) because the trade row is left in a consistent
+        # state and the next reconcile tick will retry.
+        logger.info(
+            "Order %s not retrievable from CLOB (queued or market dropped); "
+            "leaving exchange_status=%r unchanged",
+            trade.order_id, trade.exchange_status,
+        )
+        return None
+
+    status = order.get("status", "unknown")
+    trade.exchange_status = status
+
+    if status.lower() == "matched" and not trade.fill_price:
+        await _update_fill_details(trade, client)
+
+    return status
 
 
 async def cancel_order(trade: Trade) -> bool:

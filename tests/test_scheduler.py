@@ -709,3 +709,100 @@ class TestLogEvaluation:
         assert row.passes is False
         assert "outside" in row.reject_reason
         assert row.signal_kind == "lock"
+
+
+class TestStuckAlertCooldown:
+    """``_load_stuck_alert_cooldown`` / ``_persist_stuck_alert_cooldown``
+    persist the heartbeat-suppression timer in ``bot_state`` so a process
+    restart doesn't reset the cooldown window. Mirror the same pattern
+    as ``circuit_breakers._load_paused_until`` / ``_persist_paused_until``.
+    """
+
+    @pytest.mark.asyncio
+    async def test_load_returns_none_when_row_missing(self):
+        from src.scheduler import _load_stuck_alert_cooldown
+
+        session = AsyncMock()
+        session.get = AsyncMock(return_value=None)
+
+        assert await _load_stuck_alert_cooldown(session) is None
+
+    @pytest.mark.asyncio
+    async def test_load_returns_none_when_value_empty_or_invalid(self):
+        from src.scheduler import _load_stuck_alert_cooldown
+
+        # value=None
+        session = AsyncMock()
+        session.get = AsyncMock(return_value=SimpleNamespace(value=None))
+        assert await _load_stuck_alert_cooldown(session) is None
+
+        # value missing at_iso key
+        session.get = AsyncMock(return_value=SimpleNamespace(value={}))
+        assert await _load_stuck_alert_cooldown(session) is None
+
+        # value with malformed iso string — returns None and warns
+        session.get = AsyncMock(
+            return_value=SimpleNamespace(value={"at_iso": "not-a-date"})
+        )
+        assert await _load_stuck_alert_cooldown(session) is None
+
+    @pytest.mark.asyncio
+    async def test_load_parses_iso_timestamp(self):
+        from src.scheduler import _load_stuck_alert_cooldown
+
+        at = datetime(2026, 5, 18, 12, 30, tzinfo=timezone.utc)
+        session = AsyncMock()
+        session.get = AsyncMock(
+            return_value=SimpleNamespace(value={"at_iso": at.isoformat()})
+        )
+
+        got = await _load_stuck_alert_cooldown(session)
+        assert got == at
+
+    @pytest.mark.asyncio
+    async def test_load_fails_open_when_bot_state_table_missing(self):
+        """Same graceful-degrade as circuit_breakers — a missing migration
+        must not kill the reconcile job."""
+        from sqlalchemy.exc import ProgrammingError
+
+        from src.scheduler import _load_stuck_alert_cooldown
+
+        session = AsyncMock()
+        session.get = AsyncMock(
+            side_effect=ProgrammingError("missing table", None, None)
+        )
+
+        assert await _load_stuck_alert_cooldown(session) is None
+        session.rollback.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_persist_emits_upsert_with_iso_value(self):
+        from src.scheduler import _persist_stuck_alert_cooldown
+
+        session = AsyncMock()
+        at = datetime(2026, 5, 18, 12, 30, tzinfo=timezone.utc)
+
+        await _persist_stuck_alert_cooldown(session, at)
+
+        # Statement was executed once (the upsert) — exact bound values
+        # are exercised by integration tests against a real DB; here we
+        # assert the helper got to the execute() call without raising.
+        session.execute.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_persist_fails_open_when_bot_state_table_missing(self):
+        from sqlalchemy.exc import ProgrammingError
+
+        from src.scheduler import _persist_stuck_alert_cooldown
+
+        session = AsyncMock()
+        session.execute = AsyncMock(
+            side_effect=ProgrammingError("missing table", None, None)
+        )
+
+        # Must not raise — the reconcile loop must keep running even when
+        # the bot_state migration hasn't been applied.
+        await _persist_stuck_alert_cooldown(
+            session, datetime(2026, 5, 18, 12, 30, tzinfo=timezone.utc)
+        )
+        session.rollback.assert_awaited_once()

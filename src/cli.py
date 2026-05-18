@@ -3115,11 +3115,18 @@ def reconcile_stuck(skip_confirm: bool, dry_run: bool, grace_hours: int) -> None
 
     Symptom: ``size_position`` returns $0 because ``get_current_exposure``
     sums OPEN ``stake_usd`` and the bot is already over the
-    ``MAX_EXPOSURE_PCT`` cap. Root cause: delayed CLOB orders that never
-    matched but were promoted to ``status=OPEN`` despite ``fill_price IS
-    NULL``; ``job_resolve_trades`` then can't settle them because the
-    CLOB drops resolved markets from its listings and
-    ``_refresh_market_price`` returns None.
+    ``MAX_EXPOSURE_PCT`` cap. Root cause: delayed or matched CLOB orders
+    whose fill data never landed in our DB — promoted to ``status=OPEN``
+    despite ``fill_price IS NULL``. ``job_resolve_trades`` then can't
+    settle them because the CLOB drops resolved markets from its
+    listings and ``_refresh_market_price`` returns None.
+
+    Scope matches ``job_reconcile_orders`` (exchange_status in
+    {delayed, matched, matching}) so the manual and automated reconcile
+    paths share the same row-set. Pre-2026-05-18 this filter was
+    ``=="delayed"`` only, which silently skipped 24 of 25 stuck rows
+    when the matching-engine acked with ``status="matched"`` but
+    ``client.get_order`` never returned readable fill data.
 
     For each affected trade, query on-chain ``balanceOf`` for the
     market's conditional token:
@@ -3128,6 +3135,10 @@ def reconcile_stuck(skip_confirm: bool, dry_run: bool, grace_hours: int) -> None
       * balance > 0  → trade DID land; backfill ``fill_price`` from
         ``entry_price`` and ``filled_size`` from ``stake_usd/entry_price``
         and leave OPEN so ``job_resolve_trades`` settles it next tick.
+
+    Use ``--dry-run`` first to confirm on-chain balanceOf +
+    payoutNumerators per row before letting the live pass write
+    WON/LOST.
 
     Requires ``POLYMARKET_PRIVATE_KEY`` set (read-only chain access; no
     signed transactions).
@@ -3164,7 +3175,9 @@ def reconcile_stuck(skip_confirm: bool, dry_run: bool, grace_hours: int) -> None
                     .where(
                         Trade.status == TradeStatus.OPEN,
                         Trade.fill_price.is_(None),
-                        Trade.exchange_status == "delayed",
+                        Trade.exchange_status.in_(
+                            ("delayed", "matched", "matching")
+                        ),
                         Market.end_date < cutoff,
                     )
                     .order_by(Trade.opened_at)
@@ -3173,8 +3186,9 @@ def reconcile_stuck(skip_confirm: bool, dry_run: bool, grace_hours: int) -> None
 
             if not rows:
                 click.echo(
-                    f"No stuck trades (OPEN + delayed + null fill_price) "
-                    f"with markets ended > {grace_hours}h ago. Nothing to do."
+                    f"No stuck trades (OPEN + delayed/matched/matching + "
+                    f"null fill_price) with markets ended > {grace_hours}h "
+                    f"ago. Nothing to do."
                 )
                 return
 
