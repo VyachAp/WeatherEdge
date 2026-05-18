@@ -1386,7 +1386,12 @@ async def job_reconcile_orders() -> None:
 
     Scope: trades within the last ``ORDER_RECONCILE_LOOKBACK_HOURS`` whose
     ``order_id`` is set, ``fill_price`` is NULL, and ``exchange_status``
-    is one of {``delayed``, ``matched``, ``matching``}. For each, calls
+    is one of {``delayed``, ``matched``, ``matching``}. Status filter is
+    ``PENDING/OPEN/WON``: WON is included so historical rows that
+    ``resolve_trades`` flipped terminal before fill details landed
+    (pre-2026-05-19 CLOB-mid path) can still be backfilled. When a
+    WON row gets fill data populated here, the per-trade pnl is
+    recomputed against the corrected entry_price. For each, calls
     ``check_order_status`` (which itself triggers ``_update_fill_details``
     when the order has reached ``matched``).
 
@@ -1433,13 +1438,19 @@ async def job_reconcile_orders() -> None:
                     Trade.order_id.is_not(None),
                     Trade.fill_price.is_(None),
                     Trade.exchange_status.in_(["delayed", "matched", "matching"]),
-                    # Terminal trades (WON/LOST) have already been settled
-                    # by ``resolve_trades`` against ``entry_price`` — the
-                    # ``fill_price IS NULL`` is permanent and polling them
-                    # only produces "Could not check order" noise. Filter
-                    # them out (added 2026-05-17 after the E3 widening
-                    # exposed ~90 stale terminals being polled every tick).
-                    Trade.status.in_([TradeStatus.PENDING, TradeStatus.OPEN]),
+                    # PENDING / OPEN: still waiting for fill data.
+                    # WON: pre-2026-05-19 ``resolve_trades`` could flip
+                    # OPEN→WON on CLOB-mid before fill details landed,
+                    # leaving the row terminal with NULL fill_price.
+                    # After Fix 1 that resolution now waits for the
+                    # on-chain payout, but we still need to backfill
+                    # the historical WON+null-fill rows so pnl/stake
+                    # accounting catches up. LOST stays excluded —
+                    # fill_price=NULL there means the order genuinely
+                    # never landed and there's nothing to fix.
+                    Trade.status.in_(
+                        [TradeStatus.PENDING, TradeStatus.OPEN, TradeStatus.WON]
+                    ),
                     (
                         (Trade.opened_at >= recent_cutoff)
                         | (Market.end_date >= longtail_cutoff)
@@ -1454,9 +1465,30 @@ async def job_reconcile_orders() -> None:
             updated = 0
             for trade in trades:
                 try:
+                    prior_fill = trade.fill_price
+                    prior_stake = float(trade.stake_usd or 0.0)
                     status = await check_order_status(trade)
-                    if trade.fill_price is not None:
+                    if trade.fill_price is not None and prior_fill is None:
                         updated += 1
+                        # ``_update_fill_details`` rewrote entry_price /
+                        # stake_usd to the actual fill values. For trades
+                        # already flipped to WON by ``resolve_trades``,
+                        # the pnl was computed against the pre-backfill
+                        # entry_price — recompute against the corrected
+                        # one so downstream accounting (daily PnL,
+                        # drawdown, calibration) sees real numbers.
+                        if trade.status == TradeStatus.WON:
+                            entry = trade.entry_price or 0.0
+                            trade.pnl = (
+                                trade.stake_usd * (1.0 / entry - 1.0)
+                                if entry > 0 else 0.0
+                            )
+                            logger.info(
+                                "reconcile: backfilled WON trade %s "
+                                "(stake %.2f→%.2f, fill_price=%.3f, pnl=%.2f)",
+                                trade.id, prior_stake, trade.stake_usd,
+                                trade.fill_price, trade.pnl,
+                            )
                 except Exception:
                     logger.warning(
                         "reconcile: lookup failed for order %s",

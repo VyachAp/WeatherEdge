@@ -286,11 +286,20 @@ class TestRefreshMarketPrice:
 
 
 class TestResolveTradesPriceRefresh:
+    """Legacy CLOB-mid fallback path (``market.condition_id IS NULL``).
+
+    With on-chain ``payoutDenominator`` as the primary resolution
+    signal (shipped 2026-05-19), the CLOB-mid 0.95/0.05 heuristic is
+    only used for pre-caching legacy rows where the bot never
+    persisted a ``condition_id``. These tests pin that fallback.
+    """
+
     @pytest.mark.asyncio
     async def test_stale_price_refreshed_to_resolution_threshold(self, mock_session):
         """Stored price is 0.50 (stale), live mid is 0.975 — trade resolves WON."""
         market = MagicMock()
         market.id = "cond_1"
+        market.condition_id = None  # force legacy fallback path
         market.current_yes_price = 0.50
         market.end_date = datetime.utcnow() - timedelta(hours=1)
 
@@ -335,6 +344,10 @@ class TestResolveTradesCatchTwoFallback:
     def _stuck_trade(self, *, fill_price, hours_past_end):
         market = MagicMock()
         market.id = "cond_stuck"
+        # ``condition_id = None`` forces the legacy CLOB-mid fallback
+        # path; the new chain-primary path is covered separately in
+        # ``TestResolveTradesOnChain``.
+        market.condition_id = None
         # Both the live CLOB lookup AND the stored snapshot return None
         # — this is the catch-22 state pre-2026-05-17 (Polymarket drops
         # the market from CLOB; the local snapshot was never populated
@@ -414,6 +427,201 @@ class TestResolveTradesCatchTwoFallback:
 
         with patch(
             "src.execution.polymarket_client.get_token_ids",
+            new=AsyncMock(return_value=None),
+        ), caplog.at_level(_logging.WARNING, logger="src.resolution"):
+            resolved = await resolve_trades(mock_session)
+
+        assert resolved == []
+        assert trade.status == TradeStatus.OPEN
+        assert any(
+            "reconcile-stuck" in r.message and r.levelname == "WARNING"
+            for r in caplog.records
+        )
+
+
+class TestResolveTradesOnChain:
+    """Chain-primary resolution path (added 2026-05-19).
+
+    ``resolve_trades`` now calls ``payoutDenominator(conditionId)``
+    on the ConditionalTokens contract before falling back to
+    CLOB-mid. The chain is authoritative — CLOB-mid had been
+    flipping trades WON hours-to-days before UMA actually
+    reported on-chain, producing false ``💸 redeem`` nudges that
+    reverted with ``result for condition not received yet``.
+    """
+
+    def _trade(self, *, direction, fill_price=0.5):
+        market = MagicMock()
+        market.id = "mk_chain"
+        market.condition_id = "0xabc123"
+        market.end_date = datetime.now(timezone.utc) - timedelta(hours=2)
+
+        trade = MagicMock()
+        trade.id = 7777
+        trade.market = market
+        trade.market_id = market.id
+        trade.direction = direction
+        trade.stake_usd = 100.0
+        trade.entry_price = 0.40
+        trade.fill_price = fill_price
+        trade.status = TradeStatus.OPEN
+        return trade
+
+    @pytest.fixture
+    def mock_ctf(self):
+        return MagicMock(name="ctf")
+
+    @pytest.mark.asyncio
+    async def test_chain_yes_buy_yes_marks_won(self, mock_session, mock_ctf):
+        """On-chain says YES won + we hold YES → WON, full payout."""
+        trade = self._trade(direction=TradeDirection.BUY_YES)
+        scalars = MagicMock()
+        scalars.unique.return_value = [trade]
+        result = MagicMock()
+        result.scalars.return_value = scalars
+        mock_session.execute.return_value = result
+
+        with patch(
+            "src.resolution._build_ctf_readonly",
+            new=AsyncMock(return_value=mock_ctf),
+        ), patch(
+            "src.resolution._query_payout_outcome",
+            new=AsyncMock(return_value=True),  # YES won
+        ):
+            resolved = await resolve_trades(mock_session)
+
+        assert len(resolved) == 1
+        assert trade.status == TradeStatus.WON
+        assert trade.exit_price == 1.0
+        assert trade.pnl == pytest.approx(100.0 * (1 / 0.40 - 1))
+
+    @pytest.mark.asyncio
+    async def test_chain_yes_buy_no_marks_lost(self, mock_session, mock_ctf):
+        """On-chain says YES won + we hold NO → LOST."""
+        trade = self._trade(direction=TradeDirection.BUY_NO)
+        scalars = MagicMock()
+        scalars.unique.return_value = [trade]
+        result = MagicMock()
+        result.scalars.return_value = scalars
+        mock_session.execute.return_value = result
+
+        with patch(
+            "src.resolution._build_ctf_readonly",
+            new=AsyncMock(return_value=mock_ctf),
+        ), patch(
+            "src.resolution._query_payout_outcome",
+            new=AsyncMock(return_value=True),  # YES won
+        ):
+            resolved = await resolve_trades(mock_session)
+
+        assert len(resolved) == 1
+        assert trade.status == TradeStatus.LOST
+        assert trade.pnl == pytest.approx(-100.0)
+
+    @pytest.mark.asyncio
+    async def test_chain_no_buy_no_marks_won(self, mock_session, mock_ctf):
+        """On-chain says NO won + we hold NO → WON."""
+        trade = self._trade(direction=TradeDirection.BUY_NO)
+        scalars = MagicMock()
+        scalars.unique.return_value = [trade]
+        result = MagicMock()
+        result.scalars.return_value = scalars
+        mock_session.execute.return_value = result
+
+        with patch(
+            "src.resolution._build_ctf_readonly",
+            new=AsyncMock(return_value=mock_ctf),
+        ), patch(
+            "src.resolution._query_payout_outcome",
+            new=AsyncMock(return_value=False),  # NO won
+        ):
+            resolved = await resolve_trades(mock_session)
+
+        assert len(resolved) == 1
+        assert trade.status == TradeStatus.WON
+        assert trade.exit_price == 1.0
+
+    @pytest.mark.asyncio
+    async def test_chain_unresolved_within_grace_left_open(
+        self, mock_session, mock_ctf,
+    ):
+        """``payoutDenominator == 0`` + within grace → wait, leave OPEN.
+
+        Prevents the false-WON failure mode where CLOB-mid would
+        trigger a redeem nudge that reverts on-chain.
+        """
+        trade = self._trade(direction=TradeDirection.BUY_NO)
+        # 2h past end_date < RESOLVE_NO_PRICE_GRACE_HOURS (4h default)
+        scalars = MagicMock()
+        scalars.unique.return_value = [trade]
+        result = MagicMock()
+        result.scalars.return_value = scalars
+        mock_session.execute.return_value = result
+
+        with patch(
+            "src.resolution._build_ctf_readonly",
+            new=AsyncMock(return_value=mock_ctf),
+        ), patch(
+            "src.resolution._query_payout_outcome",
+            new=AsyncMock(return_value=None),  # UMA hasn't reported
+        ):
+            resolved = await resolve_trades(mock_session)
+
+        assert resolved == []
+        assert trade.status == TradeStatus.OPEN
+
+    @pytest.mark.asyncio
+    async def test_chain_unresolved_past_grace_null_fill_marks_lost(
+        self, mock_session, mock_ctf,
+    ):
+        """``payoutDenominator == 0`` + past grace + null fill → LOST.
+
+        Order never landed on-chain; release the exposure rather
+        than wait forever for a UMA report on a position that
+        doesn't exist.
+        """
+        trade = self._trade(direction=TradeDirection.BUY_NO, fill_price=None)
+        trade.market.end_date = datetime.now(timezone.utc) - timedelta(hours=24)
+        scalars = MagicMock()
+        scalars.unique.return_value = [trade]
+        result = MagicMock()
+        result.scalars.return_value = scalars
+        mock_session.execute.return_value = result
+
+        with patch(
+            "src.resolution._build_ctf_readonly",
+            new=AsyncMock(return_value=mock_ctf),
+        ), patch(
+            "src.resolution._query_payout_outcome",
+            new=AsyncMock(return_value=None),
+        ):
+            resolved = await resolve_trades(mock_session)
+
+        assert len(resolved) == 1
+        assert trade.status == TradeStatus.LOST
+        assert trade.pnl == pytest.approx(-100.0)
+
+    @pytest.mark.asyncio
+    async def test_chain_unresolved_past_grace_filled_warns(
+        self, mock_session, mock_ctf, caplog,
+    ):
+        """``payoutDenominator == 0`` + past grace + filled position →
+        WARN + leave OPEN. Real on-chain position needs operator
+        intervention (``admin reconcile-stuck``), not silent LOST."""
+        import logging as _logging
+        trade = self._trade(direction=TradeDirection.BUY_NO, fill_price=0.20)
+        trade.market.end_date = datetime.now(timezone.utc) - timedelta(hours=48)
+        scalars = MagicMock()
+        scalars.unique.return_value = [trade]
+        result = MagicMock()
+        result.scalars.return_value = scalars
+        mock_session.execute.return_value = result
+
+        with patch(
+            "src.resolution._build_ctf_readonly",
+            new=AsyncMock(return_value=mock_ctf),
+        ), patch(
+            "src.resolution._query_payout_outcome",
             new=AsyncMock(return_value=None),
         ), caplog.at_level(_logging.WARNING, logger="src.resolution"):
             resolved = await resolve_trades(mock_session)
