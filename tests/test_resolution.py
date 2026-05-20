@@ -363,13 +363,24 @@ class TestResolveTradesCatchTwoFallback:
         trade.stake_usd = 10.0
         trade.entry_price = 0.80
         trade.fill_price = fill_price
+        trade.filled_size = None  # exercises _backfill_null_fill
+        trade.token_id = "12345"
         trade.status = TradeStatus.OPEN
         return trade
 
     @pytest.mark.asyncio
-    async def test_null_fill_past_grace_marks_lost(self, mock_session):
-        """Delayed-never-filled trade with no on-chain position is marked
-        LOST after the grace window so exposure releases."""
+    async def test_null_fill_past_grace_balance_zero_marks_lost(
+        self, mock_session,
+    ):
+        """Delayed-never-filled trade with **on-chain balance 0** is marked
+        LOST with ``pnl=0`` after the grace window so exposure releases
+        without inventing a phantom loss (2026-05-20 fix).
+
+        Pre-fix this path assigned ``pnl=-stake`` on the assumption
+        ``fill_price IS NULL`` ⇒ "order never landed", but that conflated
+        truly-never-landed orders (bal==0) with reconcile-backfill-gap
+        orders (bal>0). Now the balanceOf reading is authoritative.
+        """
         trade = self._stuck_trade(fill_price=None, hours_past_end=24)
         scalars = MagicMock()
         scalars.unique.return_value = [trade]
@@ -378,10 +389,85 @@ class TestResolveTradesCatchTwoFallback:
         mock_session.execute.return_value = result
 
         # CLOB returns no token IDs → _refresh_market_price returns
-        # None via the early-return path.
+        # None via the early-return path. Force the on-chain balance
+        # check to return 0 so we're testing the "truly never landed"
+        # exit (the legacy fallback path; condition_id is None so
+        # branch 4 runs).
         with patch(
             "src.execution.polymarket_client.get_token_ids",
             new=AsyncMock(return_value=None),
+        ), patch(
+            "src.resolution._build_ctf_readonly",
+            new=AsyncMock(return_value=(MagicMock(), "0xfunder")),
+        ), patch(
+            "src.resolution._query_token_balance",
+            new=AsyncMock(return_value=0),
+        ):
+            resolved = await resolve_trades(mock_session)
+
+        assert len(resolved) == 1
+        assert trade.status == TradeStatus.LOST
+        assert trade.pnl == pytest.approx(0.0)  # no money moved
+        assert trade.exit_price == 0.0
+
+    @pytest.mark.asyncio
+    async def test_null_fill_past_grace_balance_positive_preserves_open(
+        self, mock_session,
+    ):
+        """On-chain balance > 0 ⇒ the order DID match on-chain (just
+        missing fill data in our DB). Don't mark LOST — preserve OPEN
+        status, backfill ``fill_price`` from ``entry_price``, and wait
+        for UMA to report. This is the post-2026-05-20 phantom-loss
+        guard."""
+        trade = self._stuck_trade(fill_price=None, hours_past_end=24)
+        scalars = MagicMock()
+        scalars.unique.return_value = [trade]
+        result = MagicMock()
+        result.scalars.return_value = scalars
+        mock_session.execute.return_value = result
+
+        with patch(
+            "src.execution.polymarket_client.get_token_ids",
+            new=AsyncMock(return_value=None),
+        ), patch(
+            "src.resolution._build_ctf_readonly",
+            new=AsyncMock(return_value=(MagicMock(), "0xfunder")),
+        ), patch(
+            "src.resolution._query_token_balance",
+            new=AsyncMock(return_value=10_000_000),  # 10 shares atomic
+        ):
+            resolved = await resolve_trades(mock_session)
+
+        # Trade stays OPEN, no resolution row appended.
+        assert resolved == []
+        assert trade.status == TradeStatus.OPEN
+        # fill_price was backfilled from entry_price.
+        assert trade.fill_price == pytest.approx(0.80)
+        # filled_size = stake_usd / entry_price
+        assert trade.filled_size == pytest.approx(10.0 / 0.80)
+
+    @pytest.mark.asyncio
+    async def test_null_fill_past_grace_balance_unknown_no_chain(
+        self, mock_session,
+    ):
+        """When the chain is unreachable (no CTF, no funder), we cannot
+        distinguish "never landed" from "matched but reconcile gap".
+        Conservative posture: preserve pre-fix ``pnl=-stake`` so an RPC
+        outage doesn't silently mask losses (operator still has the
+        warning + `admin reconcile-stuck` to investigate)."""
+        trade = self._stuck_trade(fill_price=None, hours_past_end=24)
+        scalars = MagicMock()
+        scalars.unique.return_value = [trade]
+        result = MagicMock()
+        result.scalars.return_value = scalars
+        mock_session.execute.return_value = result
+
+        with patch(
+            "src.execution.polymarket_client.get_token_ids",
+            new=AsyncMock(return_value=None),
+        ), patch(
+            "src.resolution._build_ctf_readonly",
+            new=AsyncMock(return_value=(None, None)),
         ):
             resolved = await resolve_trades(mock_session)
 
@@ -483,7 +569,7 @@ class TestResolveTradesOnChain:
 
         with patch(
             "src.resolution._build_ctf_readonly",
-            new=AsyncMock(return_value=mock_ctf),
+            new=AsyncMock(return_value=(mock_ctf, "0xfunder")),
         ), patch(
             "src.resolution._query_payout_outcome",
             new=AsyncMock(return_value=True),  # YES won
@@ -507,7 +593,7 @@ class TestResolveTradesOnChain:
 
         with patch(
             "src.resolution._build_ctf_readonly",
-            new=AsyncMock(return_value=mock_ctf),
+            new=AsyncMock(return_value=(mock_ctf, "0xfunder")),
         ), patch(
             "src.resolution._query_payout_outcome",
             new=AsyncMock(return_value=True),  # YES won
@@ -530,7 +616,7 @@ class TestResolveTradesOnChain:
 
         with patch(
             "src.resolution._build_ctf_readonly",
-            new=AsyncMock(return_value=mock_ctf),
+            new=AsyncMock(return_value=(mock_ctf, "0xfunder")),
         ), patch(
             "src.resolution._query_payout_outcome",
             new=AsyncMock(return_value=False),  # NO won
@@ -560,7 +646,7 @@ class TestResolveTradesOnChain:
 
         with patch(
             "src.resolution._build_ctf_readonly",
-            new=AsyncMock(return_value=mock_ctf),
+            new=AsyncMock(return_value=(mock_ctf, "0xfunder")),
         ), patch(
             "src.resolution._query_payout_outcome",
             new=AsyncMock(return_value=None),  # UMA hasn't reported
@@ -571,16 +657,19 @@ class TestResolveTradesOnChain:
         assert trade.status == TradeStatus.OPEN
 
     @pytest.mark.asyncio
-    async def test_chain_unresolved_past_grace_null_fill_marks_lost(
+    async def test_chain_unresolved_past_grace_null_fill_balance_zero(
         self, mock_session, mock_ctf,
     ):
-        """``payoutDenominator == 0`` + past grace + null fill → LOST.
+        """``payoutDenominator == 0`` + past grace + null fill + bal==0
+        → LOST with ``pnl=0`` (2026-05-20 fix).
 
-        Order never landed on-chain; release the exposure rather
-        than wait forever for a UMA report on a position that
-        doesn't exist.
+        Order truly never landed on-chain (balanceOf confirms zero
+        position); release the exposure but don't invent a loss. Pre-fix
+        this path assigned ``pnl=-stake``, contributing to the phantom
+        $228 of "losses" on 2026-05-20.
         """
         trade = self._trade(direction=TradeDirection.BUY_NO, fill_price=None)
+        trade.token_id = "12345"
         trade.market.end_date = datetime.now(timezone.utc) - timedelta(hours=24)
         scalars = MagicMock()
         scalars.unique.return_value = [trade]
@@ -590,16 +679,63 @@ class TestResolveTradesOnChain:
 
         with patch(
             "src.resolution._build_ctf_readonly",
-            new=AsyncMock(return_value=mock_ctf),
+            new=AsyncMock(return_value=(mock_ctf, "0xfunder")),
         ), patch(
             "src.resolution._query_payout_outcome",
             new=AsyncMock(return_value=None),
+        ), patch(
+            "src.resolution._query_token_balance",
+            new=AsyncMock(return_value=0),
         ):
             resolved = await resolve_trades(mock_session)
 
         assert len(resolved) == 1
         assert trade.status == TradeStatus.LOST
-        assert trade.pnl == pytest.approx(-100.0)
+        assert trade.pnl == pytest.approx(0.0)  # no money moved
+
+    @pytest.mark.asyncio
+    async def test_chain_unresolved_past_grace_null_fill_balance_positive(
+        self, mock_session, mock_ctf,
+    ):
+        """``payoutDenominator == 0`` + past grace + null fill + bal>0
+        → preserve OPEN, backfill fill_price (2026-05-20 phantom-loss
+        guard).
+
+        The order DID match on-chain (balanceOf > 0) — ``fill_price=None``
+        is just a ``job_reconcile_orders`` backfill gap, not proof of
+        non-existence. Pre-fix the bot wrote off these healthy positions
+        as full-stake losses, producing the $228 phantom-loss event on
+        2026-05-20.
+        """
+        trade = self._trade(direction=TradeDirection.BUY_NO, fill_price=None)
+        trade.filled_size = None
+        trade.token_id = "12345"
+        trade.market.end_date = datetime.now(timezone.utc) - timedelta(hours=24)
+        scalars = MagicMock()
+        scalars.unique.return_value = [trade]
+        result = MagicMock()
+        result.scalars.return_value = scalars
+        mock_session.execute.return_value = result
+
+        with patch(
+            "src.resolution._build_ctf_readonly",
+            new=AsyncMock(return_value=(mock_ctf, "0xfunder")),
+        ), patch(
+            "src.resolution._query_payout_outcome",
+            new=AsyncMock(return_value=None),
+        ), patch(
+            "src.resolution._query_token_balance",
+            new=AsyncMock(return_value=10_000_000),  # 10 shares atomic
+        ):
+            resolved = await resolve_trades(mock_session)
+
+        # Trade stays OPEN, no resolution row appended.
+        assert resolved == []
+        assert trade.status == TradeStatus.OPEN
+        # fill_price was backfilled from entry_price (set in _trade()).
+        assert trade.fill_price is not None
+        assert trade.filled_size is not None
+        assert trade.filled_size > 0
 
     @pytest.mark.asyncio
     async def test_chain_unresolved_past_grace_filled_warns(
@@ -619,7 +755,7 @@ class TestResolveTradesOnChain:
 
         with patch(
             "src.resolution._build_ctf_readonly",
-            new=AsyncMock(return_value=mock_ctf),
+            new=AsyncMock(return_value=(mock_ctf, "0xfunder")),
         ), patch(
             "src.resolution._query_payout_outcome",
             new=AsyncMock(return_value=None),

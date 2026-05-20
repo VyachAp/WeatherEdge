@@ -11,7 +11,7 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import ProgrammingError
 
@@ -146,6 +146,29 @@ async def check_circuit_breakers(session: AsyncSession) -> CircuitBreakerState:
             reason=f"{consecutive} consecutive losses — pausing {settings.CONSECUTIVE_LOSS_PAUSE_HOURS}h",
         )
 
+    # 3. Submission-failure stop (2026-05-20). Many ``exception:*`` rows
+    # in the last window means the CLOB / SDK is rejecting orders en
+    # masse — usually a Polymarket protocol migration or wallet
+    # allowance issue. Pause new submissions and Telegram-alert so the
+    # operator can react before the failure mode buries the decision
+    # logs in noise.
+    submit_fails = await _get_recent_submit_failures(session)
+    if submit_fails >= settings.SUBMIT_FAIL_PAUSE_COUNT:
+        _paused_until = now + timedelta(
+            minutes=settings.SUBMIT_FAIL_PAUSE_MINUTES
+        )
+        await _persist_paused_until(session, _paused_until)
+        await _maybe_alert_submit_failures(submit_fails)
+        return CircuitBreakerState(
+            can_trade=False,
+            paused_until=_paused_until,
+            reason=(
+                f"{submit_fails} submission failures in last "
+                f"{settings.SUBMIT_FAIL_PAUSE_WINDOW_MINUTES}m — "
+                f"pausing {settings.SUBMIT_FAIL_PAUSE_MINUTES}m"
+            ),
+        )
+
     return CircuitBreakerState(can_trade=True, paused_until=None, reason=None)
 
 
@@ -178,3 +201,65 @@ async def _get_consecutive_losses(session: AsyncSession) -> int:
         else:
             break
     return count
+
+
+async def _get_recent_submit_failures(session: AsyncSession) -> int:
+    """Count trades whose order submission raised an exception within
+    the recent window (``SUBMIT_FAIL_PAUSE_WINDOW_MINUTES``).
+
+    ``polymarket_client.place_order`` sets ``exchange_status`` to
+    ``f"exception:{type(exc).__name__}"`` (e.g. ``exception:
+    PolyApiException``) when the SDK / CLOB raises. Counting rows
+    opened in the recent window with that prefix lets us detect a
+    burst of submission failures (Polymarket protocol migration,
+    wallet allowance drop, etc.) before they bury the decision logs.
+    """
+    window_start = datetime.now(timezone.utc) - timedelta(
+        minutes=settings.SUBMIT_FAIL_PAUSE_WINDOW_MINUTES
+    )
+    stmt = select(func.count()).select_from(Trade).where(
+        and_(
+            Trade.opened_at >= window_start,
+            Trade.exchange_status.startswith("exception"),
+        )
+    )
+    result = await session.execute(stmt)
+    return int(result.scalar() or 0)
+
+
+_submit_fail_alerted_at: datetime | None = None
+
+
+async def _maybe_alert_submit_failures(count: int) -> None:
+    """One-shot-per-window Telegram alert for the submission-failure
+    circuit breaker. Re-arms after ``SUBMIT_FAIL_PAUSE_MINUTES`` so the
+    alert isn't a one-time-ever event (rebooting the bot would clear
+    in-memory state anyway)."""
+    global _submit_fail_alerted_at
+
+    now = datetime.now(timezone.utc)
+    if _submit_fail_alerted_at is not None and (
+        now - _submit_fail_alerted_at
+        < timedelta(minutes=settings.SUBMIT_FAIL_PAUSE_MINUTES)
+    ):
+        return
+    _submit_fail_alerted_at = now
+
+    try:
+        from src.execution.alerter import get_alerter
+
+        alerter = get_alerter()
+        await alerter._enqueue(
+            f"\U0001f6a8 *Submission failure circuit breaker tripped*\n"
+            f"{count} CLOB submissions raised exceptions in the last "
+            f"{settings.SUBMIT_FAIL_PAUSE_WINDOW_MINUTES}m. Trading "
+            f"paused for {settings.SUBMIT_FAIL_PAUSE_MINUTES}m. Check "
+            f"`trades.exchange_error` for the SDK / CLOB response — "
+            f"likely a Polymarket protocol migration or wallet "
+            f"allowance issue."
+        )
+    except Exception:
+        logger.warning(
+            "Failed to send submit-failure circuit-breaker alert",
+            exc_info=True,
+        )

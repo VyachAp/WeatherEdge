@@ -144,6 +144,11 @@ class Trade(Base):
     fill_price = Column(Float)  # Actual execution price
     filled_size = Column(Float)  # Shares filled
     exchange_status = Column(String)  # live|matched|delayed|unmatched|failed
+    # Full str(exc) when order submission raised. Pre-2026-05-20 only the
+    # exception class name was stored (in exchange_status, truncated to
+    # 50 chars), losing the API response body and making PolyApiException
+    # postmortems require trawling DigitalOcean logs.
+    exchange_error = Column(Text, nullable=True)
 
     # Submit-time market context — populated by place_order before the FAK
     # call. Lets post-mortems decompose `fill_price - entry_price` into

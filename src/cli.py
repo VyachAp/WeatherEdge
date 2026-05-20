@@ -3110,7 +3110,24 @@ def reset_drawdown_peak(skip_confirm: bool, dry_run: bool) -> None:
     type=int,
     help="Only touch trades whose market ended at least this many hours ago.",
 )
-def reconcile_stuck(skip_confirm: bool, dry_run: bool, grace_hours: int) -> None:
+@click.option(
+    "--include-lost",
+    is_flag=True,
+    default=False,
+    help=(
+        "Also process LOST trades whose fill_price is NULL — recovers "
+        "the 2026-05-20 phantom-LOST class (matched orders prematurely "
+        "marked LOST by resolve_trades' null-fill grace fallback). For "
+        "each such trade we balanceOf the on-chain token: bal>0 reverts "
+        "to OPEN + backfill, bal==0 stays LOST with pnl=0."
+    ),
+)
+def reconcile_stuck(
+    skip_confirm: bool,
+    dry_run: bool,
+    grace_hours: int,
+    include_lost: bool,
+) -> None:
     """Resolve OPEN trades with no fill_price whose markets have ended.
 
     Symptom: ``size_position`` returns $0 because ``get_current_exposure``
@@ -3131,7 +3148,8 @@ def reconcile_stuck(skip_confirm: bool, dry_run: bool, grace_hours: int) -> None
     For each affected trade, query on-chain ``balanceOf`` for the
     market's conditional token:
       * balance == 0 → trade never landed; mark ``LOST`` with
-        ``pnl = -stake_usd``. Releases exposure budget.
+        ``pnl = 0`` (post-2026-05-20: no money moved, so no phantom
+        loss). Releases exposure budget.
       * balance > 0  → trade DID land; backfill ``fill_price`` from
         ``entry_price`` and ``filled_size`` from ``stake_usd/entry_price``
         and leave OPEN so ``job_resolve_trades`` settles it next tick.
@@ -3142,6 +3160,16 @@ def reconcile_stuck(skip_confirm: bool, dry_run: bool, grace_hours: int) -> None
 
     Requires ``POLYMARKET_PRIVATE_KEY`` set (read-only chain access; no
     signed transactions).
+
+    Pass ``--include-lost`` to also process LOST trades with NULL
+    fill_price — recovers the 2026-05-20 phantom-LOST class where
+    ``resolve_trades`` prematurely marked OPEN trades LOST via the
+    null-fill grace fallback. For each balanced > 0 row, status
+    reverts to OPEN, ``pnl``/``exit_price``/``closed_at`` clear, and
+    ``fill_price``/``filled_size`` backfill — letting normal resolve
+    flow re-settle from chain when UMA reports. For bal==0 rows, the
+    LOST stays but ``pnl`` resets to 0 (true accounting cleanup, was
+    -stake pre-fix).
     """
 
     async def _reconcile_stuck() -> None:
@@ -3167,13 +3195,18 @@ def reconcile_stuck(skip_confirm: bool, dry_run: bool, grace_hours: int) -> None
         cutoff = datetime.now(timezone.utc) - timedelta(hours=grace_hours)
 
         async with async_session() as session:
+            status_filter = (
+                [TradeStatus.OPEN, TradeStatus.LOST]
+                if include_lost
+                else [TradeStatus.OPEN]
+            )
             rows = (
                 await session.execute(
                     select(Trade)
                     .options(joinedload(Trade.market))
                     .join(Market, Trade.market_id == Market.id)
                     .where(
-                        Trade.status == TradeStatus.OPEN,
+                        Trade.status.in_(status_filter),
                         Trade.fill_price.is_(None),
                         Trade.exchange_status.in_(
                             ("delayed", "matched", "matching")
@@ -3185,8 +3218,11 @@ def reconcile_stuck(skip_confirm: bool, dry_run: bool, grace_hours: int) -> None
             ).scalars().unique().all()
 
             if not rows:
+                scope = (
+                    "OPEN/LOST" if include_lost else "OPEN"
+                )
                 click.echo(
-                    f"No stuck trades (OPEN + delayed/matched/matching + "
+                    f"No stuck trades ({scope} + delayed/matched/matching + "
                     f"null fill_price) with markets ended > {grace_hours}h "
                     f"ago. Nothing to do."
                 )
@@ -3397,7 +3433,11 @@ def reconcile_stuck(skip_confirm: bool, dry_run: bool, grace_hours: int) -> None
             for d in to_mark_lost:
                 t = d["trade"]
                 t.status = TradeStatus.LOST
-                t.pnl = -float(t.stake_usd)
+                # 2026-05-20: bal==0 means order never landed; no wallet
+                # debit, so pnl=0. Pre-fix this was -stake, which
+                # invented phantom losses when balanceOf was never
+                # checked.
+                t.pnl = 0.0
                 t.exit_price = 0.0
                 t.closed_at = now
             for d in to_settle_won:
@@ -3433,6 +3473,16 @@ def reconcile_stuck(skip_confirm: bool, dry_run: bool, grace_hours: int) -> None
                     float(t.stake_usd) / float(t.entry_price)
                     if t.entry_price and t.entry_price > 0 else 0.0
                 )
+                # When --include-lost recovers a phantom-LOST row, the
+                # trade was already marked terminal (status=LOST, pnl
+                # set, exit_price/closed_at populated). Re-opening
+                # requires clearing the terminal-state fields so
+                # subsequent resolution doesn't see stale data.
+                if t.status != TradeStatus.OPEN:
+                    t.status = TradeStatus.OPEN
+                    t.pnl = None
+                    t.exit_price = None
+                    t.closed_at = None
                 # Status stays OPEN; market not yet reported on-chain.
                 # resolve_trades will catch it once CLOB or the E2
                 # fallback succeeds.

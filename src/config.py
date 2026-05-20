@@ -142,6 +142,18 @@ class Settings(BaseSettings):
     CONSECUTIVE_LOSS_PAUSE_COUNT: int = 3
     CONSECUTIVE_LOSS_PAUSE_HOURS: int = 2
 
+    # Submission-failure circuit breaker (2026-05-20). When the CLOB
+    # rejects ``N`` orders in a row within the recent window, pause new
+    # submissions for ``SUBMIT_FAIL_PAUSE_MINUTES`` and Telegram-alert.
+    # Prevents the May 2026 failure mode: 115 PolyApiException rows in
+    # one week silently piling up while the bot kept retrying every
+    # 5-min tick, generating decision-log noise + phantom-PENDING rows
+    # that later got swept LOST. Detected via ``trades.exchange_status
+    # LIKE 'exception:%'`` over the recent window.
+    SUBMIT_FAIL_PAUSE_COUNT: int = 5
+    SUBMIT_FAIL_PAUSE_WINDOW_MINUTES: int = 10
+    SUBMIT_FAIL_PAUSE_MINUTES: int = 30
+
     # Fast-poll lock loop. Runs between unified-pipeline ticks, re-checking
     # only the EASY lock direction (observed max already clears threshold by
     # margin) so latency from METAR publication to order placement is seconds

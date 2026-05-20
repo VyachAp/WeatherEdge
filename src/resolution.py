@@ -119,7 +119,7 @@ async def resolve_trades(session: AsyncSession) -> list[Trade]:
     if not trades:
         return []
 
-    ctf = await _build_ctf_readonly()
+    ctf, funder_address = await _build_ctf_readonly()
     chain_outcomes: dict[str, bool | None] = {}
     refreshed_prices: dict[str, float | None] = {}
     grace = timedelta(hours=settings.RESOLVE_NO_PRICE_GRACE_HOURS)
@@ -161,16 +161,57 @@ async def resolve_trades(session: AsyncSession) -> list[Trade]:
                 # Within grace — UMA reporting is just slow; wait.
                 continue
             if trade.fill_price is None:
-                # Past grace, no on-chain position. The order never
-                # landed (delayed → never indexed). Release exposure.
+                # Past grace, ``fill_price IS NULL``. Pre-2026-05-20 this
+                # path assumed "order never landed" and marked LOST with
+                # ``pnl=-stake``, but that conflated two cases:
+                #   * order_id IS NULL / exchange_status='exception:*'
+                #     → really never landed; safe to flag LOST.
+                #   * exchange_status='matched' with a valid order_id
+                #     → DID land on the engine; fill_price=None is just
+                #       a reconcile-job backfill gap. The on-chain NO
+                #       position is still live and waiting for UMA.
+                # The Bug 2026-05-20 phantom-LOST incident wrote off
+                # $228 of healthy positions this way. Cross-check the
+                # on-chain balance before deciding.
+                bal = await _query_token_balance(
+                    ctf, funder_address, trade.token_id
+                )
+                if bal is None:
+                    logger.warning(
+                        "Trade %s on market %s: balanceOf check failed "
+                        "(%.0fh past end_date). Leaving OPEN — operator "
+                        "should run `admin reconcile-stuck` to settle "
+                        "manually.",
+                        trade.id, trade.market_id,
+                        (now - end_date).total_seconds() / 3600.0,
+                    )
+                    continue
+                if bal > 0:
+                    _backfill_null_fill(trade)
+                    logger.warning(
+                        "Trade %s on market %s: on-chain position "
+                        "exists (%.4f shares) — fill_price was NULL but "
+                        "order DID land. Backfilled fill_price=%.3f and "
+                        "holding OPEN. UMA still unresolved %.0fh past "
+                        "end_date.",
+                        trade.id, trade.market_id, bal / 1e6,
+                        trade.fill_price or 0.0,
+                        (now - end_date).total_seconds() / 3600.0,
+                    )
+                    continue
+                # bal == 0 → order truly never landed. Release exposure
+                # without inventing a loss. Wallet wasn't debited; this
+                # is accounting cleanup, not a P&L event.
                 trade.status = TradeStatus.LOST
-                trade.pnl = -float(trade.stake_usd)
+                trade.pnl = 0.0
                 trade.exit_price = 0.0
                 trade.closed_at = now
                 resolved.append(trade)
                 logger.warning(
-                    "Resolved trade %s on market %s (null fill, UMA "
-                    "unresolved %.0fh past end_date) → LOST",
+                    "Resolved trade %s on market %s (null fill, "
+                    "on-chain balance=0, UMA unresolved %.0fh past "
+                    "end_date) → LOST (no-op, pnl=0; order never "
+                    "landed)",
                     trade.id, trade.market_id,
                     (now - end_date).total_seconds() / 3600.0,
                 )
@@ -192,16 +233,48 @@ async def resolve_trades(session: AsyncSession) -> list[Trade]:
             if end_date is None or end_date > now - grace:
                 continue
             if trade.fill_price is None:
+                # Same phantom-LOST guard as branch 2 above. Even without
+                # a condition_id we can still ``balanceOf`` the trade's
+                # token_id when a CTF handle is available — the legacy
+                # fallback is only taken on the CTF-up path (we hit this
+                # branch when ``market.condition_id`` is NULL but ``ctf``
+                # may still exist). The on-chain position check is the
+                # only way to distinguish "matched then dropped" from
+                # "never landed".
+                bal: int | None = None
+                if ctf is not None and funder_address:
+                    bal = await _query_token_balance(
+                        ctf, funder_address, trade.token_id
+                    )
+                if bal is not None and bal > 0:
+                    _backfill_null_fill(trade)
+                    logger.warning(
+                        "Trade %s (legacy fallback, market %s): "
+                        "on-chain position exists (%.4f shares) — "
+                        "backfilled fill_price=%.3f and holding OPEN "
+                        "%.0fh past end_date (CLOB dropped market).",
+                        trade.id, trade.market_id, bal / 1e6,
+                        trade.fill_price or 0.0,
+                        (now - end_date).total_seconds() / 3600.0,
+                    )
+                    continue
                 trade.status = TradeStatus.LOST
-                trade.pnl = -float(trade.stake_usd)
+                # bal == 0 → no money moved. bal is None (no ctf) →
+                # we can't tell, but pre-fix behavior was pnl=-stake;
+                # preserve that conservative posture only when the
+                # chain is fully unreachable.
+                trade.pnl = (
+                    0.0 if bal == 0 else -float(trade.stake_usd)
+                )
                 trade.exit_price = 0.0
                 trade.closed_at = now
                 resolved.append(trade)
                 logger.warning(
                     "Resolved trade %s (null fill, legacy fallback) on "
-                    "market %s → LOST (CLOB dropped market %.0fh past "
-                    "end_date; no on-chain position)",
-                    trade.id, trade.market_id,
+                    "market %s → LOST (pnl=%.2f; bal=%s; CLOB dropped "
+                    "market %.0fh past end_date)",
+                    trade.id, trade.market_id, trade.pnl,
+                    "unknown" if bal is None else str(bal),
                     (now - end_date).total_seconds() / 3600.0,
                 )
                 continue
@@ -232,26 +305,30 @@ async def resolve_trades(session: AsyncSession) -> list[Trade]:
     return resolved
 
 
-async def _build_ctf_readonly():
-    """Build a read-only CTF contract handle, or return None on failure.
+async def _build_ctf_readonly() -> tuple[object | None, str | None]:
+    """Build a read-only CTF contract handle + funder address.
 
     Wraps the sync ``get_ctf_readonly`` in ``asyncio.to_thread`` so the
-    Polygon RPC handshake doesn't block the event loop. A failure here
-    downgrades the whole resolve_trades batch to the legacy CLOB-mid
-    path rather than aborting.
+    Polygon RPC handshake doesn't block the event loop. Returns
+    ``(ctf, funder_address)`` where ``funder_address`` is the proxy/safe
+    holding the conditional tokens (``POLYMARKET_FUNDER_ADDRESS`` when
+    set, else the EOA derived from the private key). A failure here
+    returns ``(None, None)`` and downgrades the whole resolve_trades
+    batch to the legacy CLOB-mid path rather than aborting.
     """
     from src.bet_helpers import get_ctf_readonly
 
     try:
-        _, ctf, _, _ = await asyncio.to_thread(get_ctf_readonly)
-        return ctf
+        _, ctf, address, _ = await asyncio.to_thread(get_ctf_readonly)
+        funder = settings.POLYMARKET_FUNDER_ADDRESS or address
+        return ctf, funder
     except Exception:
         logger.warning(
             "Could not build CTF readonly connection; falling back to "
             "CLOB-mid heuristic for this resolve_trades tick",
             exc_info=True,
         )
-        return None
+        return None, None
 
 
 async def _query_payout_outcome(ctf, condition_id: str) -> bool | None:
@@ -259,6 +336,64 @@ async def _query_payout_outcome(ctf, condition_id: str) -> bool | None:
     from src.bet_helpers import get_payout_outcome
 
     return await asyncio.to_thread(get_payout_outcome, ctf, condition_id)
+
+
+async def _query_token_balance(
+    ctf, address: str, token_id: str | None
+) -> int | None:
+    """Off-thread ``balanceOf`` lookup for a Polymarket conditional token.
+
+    Returns the on-chain balance in atomic units (1e6 per share) or
+    ``None`` if the lookup failed (invalid token_id, RPC error). A return
+    of ``0`` means the order did NOT land on-chain — the wallet still
+    holds the would-be stake. A return ``> 0`` means the order DID land
+    and the position is real, regardless of what our DB ``fill_price``
+    says (likely a ``job_reconcile_orders`` backfill gap).
+
+    Used by ``resolve_trades`` to gate the null-fill grace fallback —
+    without this check, every ``fill_price IS NULL`` trade past the
+    4h grace window was being flagged ``LOST`` with ``pnl=-stake``
+    even when the on-chain position existed and was still tradeable
+    (the phantom-loss bug fixed 2026-05-20).
+    """
+    if not ctf or not address or not token_id:
+        return None
+    try:
+        tid_int = int(token_id)
+    except (TypeError, ValueError):
+        return None
+
+    from src.bet_helpers import rpc_call_with_retry
+
+    def _call() -> int:
+        return ctf.functions.balanceOf(address, tid_int).call()
+
+    try:
+        return await asyncio.to_thread(rpc_call_with_retry, _call)
+    except Exception:
+        logger.warning(
+            "balanceOf failed for trade token_id=%s; treating as unknown",
+            token_id,
+            exc_info=True,
+        )
+        return None
+
+
+def _backfill_null_fill(trade: Trade) -> None:
+    """Best-effort fill_price / filled_size backfill from entry_price.
+
+    Used when on-chain ``balanceOf`` confirms a trade DID land but our
+    DB row still has ``fill_price IS NULL`` because the SDK couldn't
+    return fill details at order time. ``job_reconcile_orders`` will
+    refine these with the real fill data on its next tick, but the
+    backfill is sufficient for ``_apply_settlement`` to compute PnL.
+    """
+    if trade.fill_price is None:
+        trade.fill_price = float(trade.entry_price or 0.0)
+    if trade.filled_size is None and trade.entry_price:
+        trade.filled_size = float(trade.stake_usd or 0.0) / float(
+            trade.entry_price
+        )
 
 
 async def calculate_daily_pnl(session: AsyncSession) -> float:
