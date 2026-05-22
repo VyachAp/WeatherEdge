@@ -436,8 +436,12 @@ class TestBranchTagging:
 class TestRangeMarkets:
     """Lock-rule support for 'between X-Y°F' and 'X°C exactly' shapes."""
 
-    def test_overshoot_locks_no(self):
+    def test_overshoot_locks_no(self, monkeypatch):
         # 'between 80-81°F' market, observed max already 85°F → NO lock.
+        # range_overshoot is gated off by default — enable it to test the mechanics.
+        monkeypatch.setattr(
+            "src.signals.lock_rules.settings.RANGE_OVERSHOOT_LOCK_ENABLED", True
+        )
         mkt = _FakeMarket(
             parsed_threshold=None,
             parsed_operator="bracket",
@@ -494,9 +498,12 @@ class TestRangeMarkets:
         )
         assert _eval(state, mkt).side is None
 
-    def test_celsius_exactly_overshoot_locks_no(self):
+    def test_celsius_exactly_overshoot_locks_no(self, monkeypatch):
         # '17°C exactly' resolves to °F bucket {62, 63}. Observed 70°F
-        # (>> 63 + margin) → NO.
+        # (>> 63 + margin) → NO. Overshoot gated off by default — enable it.
+        monkeypatch.setattr(
+            "src.signals.lock_rules.settings.RANGE_OVERSHOOT_LOCK_ENABLED", True
+        )
         from src.signals.mapper import f_to_c
 
         c17_in_f = 17.0 * 9.0 / 5.0 + 32.0  # = 62.6°F
@@ -564,10 +571,14 @@ class TestRangeLockTighterGates:
     tightened gates here are the live safety net.
     """
 
-    def test_overshoot_1x_margin_does_not_lock(self):
+    def test_overshoot_1x_margin_does_not_lock(self, monkeypatch):
         # current=64 vs exactly=62.6 (range [62, 63]) → overshoot=1°F.
         # 1x margin = 2°F (LOCK_MARGIN_F default), so 1x rule would fire.
-        # 2x margin = 4°F, so it must NOT fire.
+        # 2x margin = 4°F, so it must NOT fire. Enable the branch so this
+        # asserts the margin gate, not the default-off flag.
+        monkeypatch.setattr(
+            "src.signals.lock_rules.settings.RANGE_OVERSHOOT_LOCK_ENABLED", True
+        )
         c17_in_f = 17.0 * 9.0 / 5.0 + 32.0
         mkt = _FakeMarket(
             parsed_threshold=c17_in_f, parsed_operator="exactly",
@@ -576,8 +587,12 @@ class TestRangeLockTighterGates:
         state = _state(current_max_f=64.0, routine_count=5)
         assert _eval(state, mkt).side is None
 
-    def test_overshoot_2x_margin_locks_no(self):
-        # current=67 vs exactly=62.6, overshoot ≈ 4°F = 2x margin → fires.
+    def test_overshoot_2x_margin_locks_no(self, monkeypatch):
+        # current=67 vs exactly=62.6, overshoot ≈ 4°F = 2x margin → fires
+        # (when the branch is enabled; it's gated off by default).
+        monkeypatch.setattr(
+            "src.signals.lock_rules.settings.RANGE_OVERSHOOT_LOCK_ENABLED", True
+        )
         c17_in_f = 17.0 * 9.0 / 5.0 + 32.0
         mkt = _FakeMarket(
             parsed_threshold=c17_in_f, parsed_operator="exactly",
@@ -588,9 +603,13 @@ class TestRangeLockTighterGates:
         assert decision.side == "NO"
         assert decision.branch == "range_overshoot"
 
-    def test_overshoot_rc_3_does_not_lock(self):
+    def test_overshoot_rc_3_does_not_lock(self, monkeypatch):
         # current=70 vs exactly=62.6 (>> 2x margin) but only 3 routines.
-        # Old rule fired at rc>=3; new rule needs rc>=4.
+        # Old rule fired at rc>=3; new rule needs rc>=4. Enable the branch
+        # so this asserts the rc gate, not the default-off flag.
+        monkeypatch.setattr(
+            "src.signals.lock_rules.settings.RANGE_OVERSHOOT_LOCK_ENABLED", True
+        )
         c17_in_f = 17.0 * 9.0 / 5.0 + 32.0
         mkt = _FakeMarket(
             parsed_threshold=c17_in_f, parsed_operator="exactly",
@@ -599,8 +618,12 @@ class TestRangeLockTighterGates:
         state = _state(current_max_f=70.0, routine_count=3)
         assert _eval(state, mkt).side is None
 
-    def test_overshoot_rc_4_locks(self):
-        # Same as above but with rc=4 — at the new floor.
+    def test_overshoot_rc_4_locks(self, monkeypatch):
+        # Same as above but with rc=4 — at the new floor. (Overshoot branch
+        # gated off by default — enable it.)
+        monkeypatch.setattr(
+            "src.signals.lock_rules.settings.RANGE_OVERSHOOT_LOCK_ENABLED", True
+        )
         c17_in_f = 17.0 * 9.0 / 5.0 + 32.0
         mkt = _FakeMarket(
             parsed_threshold=c17_in_f, parsed_operator="exactly",
@@ -628,6 +651,53 @@ class TestRangeLockTighterGates:
 
     def test_undershoot_2x_margin_locks_no(self):
         # current=58 vs exactly=62.6 → undershoot ≈ 4.6°F > 2x margin (4°F).
+        c17_in_f = 17.0 * 9.0 / 5.0 + 32.0
+        mkt = _FakeMarket(
+            parsed_threshold=c17_in_f, parsed_operator="exactly",
+            question="Will the highest temperature in Amsterdam be 17°C on June 15?",
+        )
+        state = _state(
+            current_max_f=58.0, forecast_peak_f=55.0,
+            solar_declining=True, metar_trend=-0.5, routine_count=5,
+        )
+        decision = _eval(state, mkt)
+        assert decision.side == "NO"
+        assert decision.branch == "range_undershoot"
+
+
+class TestRangeOvershootFlag:
+    """`range_overshoot` NO lock is gated off by default
+    (settings.RANGE_OVERSHOOT_LOCK_ENABLED=False) after live data showed it
+    lost -$57.61 / 56% win across many °C cities — resolver-vs-METAR
+    divergence, not borderline margins. undershoot / in-window are kept.
+    """
+
+    def _overshoot_market_and_state(self):
+        # 17°C exactly = bucket [62, 63]; observed 70°F is >> high + 4°F.
+        c17_in_f = 17.0 * 9.0 / 5.0 + 32.0
+        mkt = _FakeMarket(
+            parsed_threshold=c17_in_f, parsed_operator="exactly",
+            question="Will the highest temperature in Amsterdam be 17°C on June 15?",
+        )
+        state = _state(current_max_f=70.0, routine_count=5)
+        return state, mkt
+
+    def test_overshoot_disabled_by_default(self):
+        # No monkeypatch → default flag is False → no overshoot lock fires.
+        state, mkt = self._overshoot_market_and_state()
+        assert _eval(state, mkt).side is None
+
+    def test_overshoot_enabled_via_flag(self, monkeypatch):
+        monkeypatch.setattr(
+            "src.signals.lock_rules.settings.RANGE_OVERSHOOT_LOCK_ENABLED", True
+        )
+        state, mkt = self._overshoot_market_and_state()
+        decision = _eval(state, mkt)
+        assert decision.side == "NO"
+        assert decision.branch == "range_overshoot"
+
+    def test_undershoot_still_fires_when_overshoot_disabled(self):
+        # Undershoot is independent of the overshoot flag — fires at default.
         c17_in_f = 17.0 * 9.0 / 5.0 + 32.0
         mkt = _FakeMarket(
             parsed_threshold=c17_in_f, parsed_operator="exactly",

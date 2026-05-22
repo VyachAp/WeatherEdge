@@ -317,5 +317,23 @@ class Settings(BaseSettings):
     RANGE_LOCK_MIN_ROUTINES: int = 4
     RANGE_LOCK_MARGIN_MULTIPLIER: float = 2.0
 
+    # Max lead time (hours before close) for bracket-like markets
+    # (exactly / range / bracket) in the PROBABILITY path. Live data
+    # (2026-05-22): exactly-market probability trades lose -$126 in the
+    # 12-24h lead band but make +$57 in the 0-12h band — far from peak the
+    # Gaussian collapses P(a single ~2°F bucket) → ~0, manufacturing NO
+    # edge that empirically reverts. Edges evaluated earlier than this are
+    # rejected. Threshold markets (above/at_least/below/at_most) are
+    # unaffected.
+    EXACTLY_MAX_LEAD_HOURS: float = 12.0
+
+    # The range_overshoot lock branch (NO when observed max overshoots the
+    # range high by 2× margin) lost -$57.61 across 18 trades (56% win) on
+    # exactly markets — systematic resolver/observation divergence (our
+    # routine-METAR daily max reads hotter than Polymarket's resolver), not
+    # a margin problem (2× was already applied). Disabled by default; the
+    # range_undershoot (+$8, 100%) and range_in_window branches are kept.
+    RANGE_OVERSHOOT_LOCK_ENABLED: bool = False
+
 
 settings = Settings()

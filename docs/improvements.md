@@ -233,3 +233,61 @@ week confirms the flag is right.
 **Leverage:** risk (avoid `order_version_mismatch` halting trades
 after a Polymarket-side change).
 **Files:** `.env` (`POLYMARKET_USE_NEW_EXCHANGES`).
+
+## [backlog] °C resolver/observation divergence on `exactly` markets
+
+**Why:** Root cause behind the `exactly`-market bleed fixed surgically
+on 2026-05-22 (max-lead gate + `RANGE_OVERSHOOT_LOCK_ENABLED=False`).
+The `range_overshoot` NO lock fires only when our observed daily max is
+already ≥ window-high + 4°F — which *should* be near-certain — yet it
+won only 56% (18 trades, -$57.61), **spread across many °C cities**
+(Toronto, Buenos Aires, Shanghai, Guangzhou, Busan, Seoul, Beijing…).
+That pattern means our `routine_history` daily max reads systematically
+*hotter* than Polymarket's resolver. Suspects: SPECI observations
+leaking into `routine_history` (resolution mirrors **routine** METARs
+only), ICAO ≠ Polymarket resolver-station mismatch (cf. excluded
+VHHH/LLBG), or °C rounding at the bucket boundary. Fixing this would
+let us re-enable the overshoot lock AND remove the overconfidence the
+probability path also suffers on these markets.
+**Success criteria:** for a sample of overshoot-LOST `exactly` trades,
+reconcile our recorded daily max against Wunderground's published max
+for the resolver station; classify the gap (SPECI leakage / station
+mismatch / rounding); quantify per-city.
+**Effort:** 4-6h (audit query + per-trade Wunderground cross-check;
+overlaps with the never-built `scripts/audit_lock_observed_max.py`).
+**Leverage:** revenue (unlocks re-enabling overshoot + de-biases the
+probability path) + correctness.
+**Files:** `src/ingestion/aviation/` (routine vs SPECI filter),
+`src/signals/mapper.py` (`CITY_ICAO` resolver-station mapping),
+`src/signals/state_aggregator.py::_routine_daily_max`.
+
+## [backlog] Tune EXACTLY_MAX_LEAD_HOURS once live data accrues
+
+**Why:** Shipped 2026-05-22 at 12.0h based on the historical PnL cliff
+(0-12h lead +$57 / 12-24h -$126 on the probability path). With a few
+weeks of live `evaluation_logs` carrying the new `bracket-like lead …`
+reject reason, re-fit the cutoff (10h vs 12h vs require-past-peak).
+**Success criteria:** updated `EXACTLY_MAX_LEAD_HOURS` backed by ≥3
+weeks of post-gate live data; consider replacing the time proxy with a
+direct `state.hours_until_peak <= 0` (past-peak) gate.
+**Effort:** 1-2h analysis + `.env` change.
+**Leverage:** revenue (marginal tuning).
+**Files:** `src/config.py` (`EXACTLY_MAX_LEAD_HOURS`),
+`src/signals/edge_calculator.py::binary_market_edge`.
+
+## [backlog] Single-bucket overconfidence cap (defense-in-depth)
+
+**Why:** The `exactly` probability-path losses concentrate in the
+`model_prob ≥ 0.999` band (-$163.84 / 179 trades): the Gaussian
+collapses P(a single ~2°F bucket) → ~0 and bets NO at full confidence,
+but the bucket hits ~28%. The max-lead gate removes most of this by
+timing, but a probability floor on single-bucket windows would cap the
+overconfidence directly (e.g. floor P(window) so `model_prob_NO` can't
+exceed ~0.92), independent of lead time.
+**Success criteria:** `binary_market_edge` clamps the single-bucket
+`our_prob_yes` to a floor before computing the NO side; the ≥0.999
+band disappears from `evaluation_logs`.
+**Effort:** 2-3h + tests.
+**Leverage:** risk (caps tail overconfidence even inside the 0-12h window).
+**Files:** `src/signals/edge_calculator.py::binary_market_edge`,
+`src/config.py`.

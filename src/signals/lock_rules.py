@@ -318,8 +318,13 @@ def _evaluate_range_lock(
     range_min_rc = max(settings.MIN_ROUTINE_COUNT, RANGE_LOCK_MIN_ROUTINES)
 
     # NO overshoot — require 2x margin to filter out borderline early-day fires.
+    # Gated off by default (settings.RANGE_OVERSHOOT_LOCK_ENABLED): live data
+    # (2026-05-22) shows this branch lost -$57.61 / 56% win across many °C
+    # cities — systematic resolver-vs-METAR divergence, not a margin issue.
+    # Read the flag live off `settings` so .env + monkeypatch take effect.
     if (
-        current_max_f >= high_f + RANGE_LOCK_MARGIN_MULTIPLIER * margin
+        settings.RANGE_OVERSHOOT_LOCK_ENABLED
+        and current_max_f >= high_f + RANGE_LOCK_MARGIN_MULTIPLIER * margin
         and routine_count >= range_min_rc
     ):
         return LockDecision(

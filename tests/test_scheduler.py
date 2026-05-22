@@ -365,6 +365,72 @@ class TestBinaryMarketEdgeAsymmetricPricing:
         assert abs(edge.edge - 0.182) < 0.001
 
 
+class TestBinaryMarketEdgeLeadGate:
+    """Bracket-like (exactly/range/bracket) markets must not be traded too
+    far before close. Live data (2026-05-22): exactly-market probability
+    trades lose -$126 in the 12-24h lead band but make +$57 in the 0-12h
+    band — far from peak the Gaussian collapses P(a single bucket) → ~0,
+    inventing NO edge. The gate (settings.EXACTLY_MAX_LEAD_HOURS=12)
+    rejects edges evaluated earlier than the cutoff; threshold ops are exempt.
+    """
+
+    @staticmethod
+    def _eval(*, hours_to_close, op="exactly", our_prob_yes=0.10,
+              yes_bid=0.45, yes_ask=0.55, threshold=82):
+        from src.scheduler import _binary_market_edge
+        from src.signals.probability_engine import BucketDistribution
+
+        market = SimpleNamespace(
+            id="m1",
+            question="Will the highest temperature in Amsterdam be 28°C on April 26",
+            parsed_threshold=threshold, parsed_operator=op,
+            current_yes_price=(yes_bid + yes_ask) / 2,
+            end_date=None, outcomes=["Yes", "No"],
+        )
+        # Strong NO edge by default: P(NO)=0.90, NO cost 1-0.45=0.55, edge 0.35
+        # — clears every standard filter, so only the lead gate can reject it.
+        dist = BucketDistribution(
+            current_max_f=78,
+            probabilities={threshold: our_prob_yes, threshold - 1: 1.0 - our_prob_yes},
+            reasoning=["test"],
+        )
+        end_time = datetime.now(timezone.utc) + timedelta(hours=hours_to_close)
+        return _binary_market_edge(
+            dist, market, end_time, routine_count=5,
+            depth_yes=100.0, depth_no_fn=lambda: 100.0,
+            yes_bid=yes_bid, yes_ask=yes_ask,
+        )
+
+    def test_exactly_far_lead_rejected(self):
+        # 20h before close — passes every standard filter but the lead gate.
+        from src.db.models import TradeDirection
+
+        edge = self._eval(hours_to_close=20)
+        assert edge.direction == TradeDirection.BUY_NO
+        assert edge.passes is False
+        assert "lead" in (edge.reject_reason or "")
+
+    def test_exactly_near_lead_passes(self):
+        # Same edge 6h before close — within the 12h window → passes.
+        edge = self._eval(hours_to_close=6)
+        assert edge.passes is True
+
+    def test_exactly_at_boundary_passes(self):
+        # Exactly 12h out: gate is strict `>` and the function recomputes
+        # `now` microseconds later, so minutes_to_close lands just under 720.
+        edge = self._eval(hours_to_close=12)
+        assert edge.passes is True
+
+    def test_threshold_far_lead_not_gated(self):
+        # at_least market 20h out with a passing YES edge — threshold ops are
+        # exempt from the bracket-like lead gate.
+        from src.db.models import TradeDirection
+
+        edge = self._eval(hours_to_close=20, op="at_least", our_prob_yes=0.90)
+        assert edge.direction == TradeDirection.BUY_YES
+        assert edge.passes is True
+
+
 # ---------------------------------------------------------------------------
 # Per-station local-day cache rollover (replaces the legacy 22:00 UTC wipe)
 # ---------------------------------------------------------------------------

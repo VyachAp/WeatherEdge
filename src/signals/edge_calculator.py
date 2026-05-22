@@ -238,6 +238,23 @@ def binary_market_edge(
         depth=side_depth,
     )
 
+    # Bracket-like (exactly/range/bracket) max-lead gate. Far from peak the
+    # Gaussian collapses P(a single ~2°F bucket) → ~0, manufacturing NO edge
+    # that empirically loses in the 12-24h lead band (-$126 live) while the
+    # 0-12h band is profitable (+$57). Applied after `_check_filters` under
+    # the `reason is None` guard so an edge that already fails (e.g. depth)
+    # keeps its original reason — the lead reason only marks edges that would
+    # otherwise have passed. Threshold ops are never in this tuple.
+    if (
+        reason is None
+        and op in ("exactly", "range", "bracket")
+        and minutes_to_close > settings.EXACTLY_MAX_LEAD_HOURS * 60.0
+    ):
+        reason = (
+            f"bracket-like lead {minutes_to_close / 60.0:.1f}h "
+            f"> {settings.EXACTLY_MAX_LEAD_HOURS:.0f}h max"
+        )
+
     return BucketEdge(
         bucket_value=bucket_value,
         our_probability=side_prob,
