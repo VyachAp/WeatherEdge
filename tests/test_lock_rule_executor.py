@@ -67,10 +67,17 @@ def _market(
 
 
 def _state(*, routine_count: int = 5) -> SimpleNamespace:
-    """Minimal WeatherState stand-in. The executor only reads
-    ``routine_count_today`` directly; ``evaluate_lock`` is mocked so
-    none of the other fields matter."""
-    return SimpleNamespace(routine_count_today=routine_count)
+    """Minimal WeatherState stand-in. The executor reads
+    ``routine_count_today`` directly plus the forecast-context fields
+    that get logged on the EvaluationLog row; ``evaluate_lock`` is mocked
+    so none of the other fields matter."""
+    return SimpleNamespace(
+        routine_count_today=routine_count,
+        forecast_peak_f=80.0,
+        current_max_f=78.0,
+        hours_until_peak=2.0,
+        forecast_sigma_f=2.0,
+    )
 
 
 def _monitor(multiplier: float = 1.0) -> MagicMock:

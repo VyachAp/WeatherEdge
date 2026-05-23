@@ -201,6 +201,19 @@ class EvaluationLog(Base):
     depth_usd = Column(Float)
     minutes_to_close = Column(Float)
     routine_count = Column(Integer)
+    # Forecast/observation context at evaluation time (added 2026-05-23).
+    # Lets filter-tuning recompute the single-bucket NO guards from
+    # telemetry alone: the landing-band guard needs forecast_peak_f +
+    # current_max_f, and the peak-relative lead gate needs
+    # hours_until_peak (minutes_to_close above measures lead to *close*,
+    # which differs when close precedes the peak). forecast_sigma_f is the
+    # ensemble peak σ — captured to diagnose the σ-collapse root cause
+    # (tight model agreement ≠ accuracy) behind the deferred σ-floor work.
+    # NULL on lock-path rows without forecast context and on legacy rows.
+    forecast_peak_f = Column(Float)
+    current_max_f = Column(Float)
+    hours_until_peak = Column(Float)
+    forecast_sigma_f = Column(Float)
     created_at = Column(
         DateTime(timezone=True),
         nullable=False,

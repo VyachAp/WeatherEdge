@@ -135,6 +135,10 @@ async def try_lock_rule_trade(
             depth_usd=depth_usd,
             minutes_to_close=minutes_to_close,
             routine_count=decision.routine_count,
+            forecast_peak_f=state.forecast_peak_f,
+            current_max_f=state.current_max_f,
+            hours_until_peak=state.hours_until_peak,
+            forecast_sigma_f=state.forecast_sigma_f,
         )
 
     # Hard guard against double-betting. Mirrors the probability path.

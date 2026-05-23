@@ -501,6 +501,10 @@ async def job_unified_pipeline() -> None:
                         routine_count=state.routine_count_today,
                         raw_model_prob=edge_result.raw_probability,
                         calibrated=edge_result.calibrated,
+                        forecast_peak_f=state.forecast_peak_f,
+                        current_max_f=state.current_max_f,
+                        hours_until_peak=state.hours_until_peak,
+                        forecast_sigma_f=state.forecast_sigma_f,
                     )
 
                     edges = [edge_result]

@@ -270,6 +270,10 @@ probability path) + correctness.
 close-vs-peak mismatch that let pre-dawn Amsterdam bets through (close
 12:00 UTC, peak 14:00 UTC). **Still open:** re-fit the 12h cutoff with ≥3
 weeks of post-gate live `evaluation_logs` (10h vs 12h vs require-past-peak).
+Now unblocked: `evaluation_logs` carries `forecast_peak_f` / `current_max_f`
+/ `hours_until_peak` / `forecast_sigma_f` (migration `p6q7r8s9t0u1`,
+2026-05-23), so the lead gate and landing-band margins can be recomputed and
+re-fit directly from telemetry.
 **Effort:** 1-2h analysis + `.env` change.
 **Leverage:** revenue (marginal tuning).
 **Files:** `src/config.py` (`EXACTLY_MAX_LEAD_HOURS`),

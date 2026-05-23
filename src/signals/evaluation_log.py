@@ -32,6 +32,10 @@ async def log_evaluation(
     routine_count: int | None,
     raw_model_prob: float | None = None,
     calibrated: bool = False,
+    forecast_peak_f: float | None = None,
+    current_max_f: float | None = None,
+    hours_until_peak: float | None = None,
+    forecast_sigma_f: float | None = None,
 ) -> None:
     """Append one ``EvaluationLog`` row capturing this edge evaluation.
 
@@ -58,4 +62,8 @@ async def log_evaluation(
         depth_usd=depth_usd,
         minutes_to_close=minutes_to_close,
         routine_count=routine_count,
+        forecast_peak_f=forecast_peak_f,
+        current_max_f=current_max_f,
+        hours_until_peak=hours_until_peak,
+        forecast_sigma_f=forecast_sigma_f,
     ))
