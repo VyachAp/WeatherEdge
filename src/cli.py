@@ -184,6 +184,264 @@ def paper_trade(days: int) -> None:
     asyncio.run(_paper_trade())
 
 
+# --- Telemetry-report shared helpers -------------------------------------
+# Operator classification splits the two telemetry tables the same way the
+# trading paths treat them: the 2026-05-22/23 quality cuts (lead gate,
+# landing-band, NO-prob cap, range_overshoot) all target *bracket-like* ops,
+# while *threshold* ops are the clean class. The reports pivot on this split
+# so "expected bracket-guard cuts" can be told apart from "threshold volume
+# suppressed by the bracket-era global MIN_PROBABILITY / MIN_EDGE".
+_OP_THRESHOLD = ("above", "at_least", "below", "at_most")
+_OP_BRACKET = ("exactly", "range", "bracket")
+
+
+def _op_class(op: str | None) -> str:
+    if op in _OP_THRESHOLD:
+        return "threshold"
+    if op in _OP_BRACKET:
+        return "bracket-like"
+    return "other"
+
+
+async def _load_market_map(session, market_ids):
+    """Batch-load ``market_id -> Market`` for a set of telemetry rows.
+
+    ``evaluation_logs`` / ``decision_logs`` carry only ``market_id``; the
+    operator lives on ``markets.parsed_operator``. One round-trip keeps the
+    remote DigitalOcean DB happy (mirrors how ``evals_report`` already
+    batches ``Trade`` rows).
+    """
+    from sqlalchemy import select
+    from src.db.models import Market
+
+    ids = list({mid for mid in market_ids if mid})
+    if not ids:
+        return {}
+    rows = (
+        await session.execute(select(Market).where(Market.id.in_(ids)))
+    ).scalars().all()
+    return {m.id: m for m in rows}
+
+
+async def _daily_max_by_station_day(session, icaos, utc_start, utc_end):
+    """Build ``{(icao, local_date): max_temp_f}`` from routine METARs.
+
+    Single query over the whole window for all stations; bucketed in Python
+    by each observation's *station-local* date (the day Polymarket's
+    "highest temperature" question is anchored to). Mirrors the ground-truth
+    query shape in ``simulate_distribution_pipeline`` (routine-only,
+    non-null temp). NOTE: routine-METAR max can diverge from Polymarket's
+    resolver for °C cities — see the caveat printed by the recoverable-band
+    section.
+    """
+    from sqlalchemy import select
+    from src.db.models import MetarObservation
+    from src.signals.mapper import icao_timezone
+
+    icao_list = list({i for i in icaos if i})
+    if not icao_list:
+        return {}
+    rows = (
+        await session.execute(
+            select(
+                MetarObservation.station_icao,
+                MetarObservation.observed_at,
+                MetarObservation.temp_f,
+            ).where(
+                MetarObservation.station_icao.in_(icao_list),
+                MetarObservation.observed_at >= utc_start,
+                MetarObservation.observed_at < utc_end,
+                MetarObservation.is_speci == False,  # noqa: E712
+                MetarObservation.temp_f.isnot(None),
+            )
+        )
+    ).all()
+
+    tz_cache: dict[str, object] = {}
+    out: dict[tuple[str, object], float] = {}
+    for icao, observed_at, temp_f in rows:
+        tz = tz_cache.get(icao)
+        if tz is None:
+            tz = icao_timezone(icao)
+            tz_cache[icao] = tz
+        local_date = observed_at.astimezone(tz).date()
+        key = (icao, local_date)
+        if key not in out or temp_f > out[key]:
+            out[key] = temp_f
+    return out
+
+
+def _threshold_yes_won(op: str, threshold: float, actual_max_f: float) -> bool:
+    """Did the YES side win under real resolution semantics.
+
+    Uses the true inequality the market resolves on (not the engine's integer
+    bucket approximation): ``above`` is strict ``>``, ``at_least`` is ``>=``,
+    ``below`` strict ``<``, ``at_most`` is ``<=``. ``actual_max_f`` is the
+    routine-METAR daily max (our proxy for Polymarket's resolver max — they
+    diverge for °C cities, hence the advisory caveat). Threshold is in °F to
+    match ``actual_max_f`` (binary_market_edge treats parsed_threshold as °F).
+    """
+    if op == "above":
+        return actual_max_f > threshold
+    if op == "at_least":
+        return actual_max_f >= threshold
+    if op == "below":
+        return actual_max_f < threshold
+    # at_most
+    return actual_max_f <= threshold
+
+
+async def _recoverable_band_section(session, rows, op_of) -> None:
+    """Print the recoverable-band table for THRESHOLD-op probability evals.
+
+    For each candidate ``(min_probability, min_edge)`` pair we re-run the real
+    :func:`_check_filters` against each currently-rejected threshold eval's
+    recorded fields. The newly-passing set is then scored against the actual
+    routine-METAR daily max for the market's target local day:
+
+      * **won%** — would-have-won rate (YES/NO per the eval's direction).
+      * **break-even** — mean side price (``market_prob``); won% must clear
+        this for the band to be +EV.
+      * **EV/$1** — mean realised return per $1 staked (``1/price`` on a win,
+        else 0, minus 1).
+
+    A baseline row reports the quality of the threshold evals that ALREADY
+    pass, so the recovered band can be compared like-for-like. Ground truth
+    is routine-METAR-derived and diverges from Polymarket's resolver for °C
+    cities — see the printed caveat.
+    """
+    from src.config import settings
+    from src.signals.edge_calculator import _check_filters
+    from src.signals.mapper import (
+        icao_for_location,
+        icao_timezone,
+        resolve_target_local_day,
+    )
+
+    click.echo("## Recoverable rejected band (threshold ops)")
+    click.echo()
+
+    # Threshold-op probability evals with the fields needed to re-run filters.
+    th_rows = [
+        r for r in rows
+        if _op_class(op_of[r.market_id]) == "threshold"
+        and r.signal_kind == "probability"
+        and r.depth_usd is not None
+        and r.minutes_to_close is not None
+        and r.routine_count is not None
+    ]
+    if not th_rows:
+        click.echo("_No threshold probability evals with complete filter fields._")
+        click.echo()
+        return
+
+    # Resolve ground-truth daily max per (icao, target local day). One METAR
+    # query for the whole window; the market map is needed for icao + end_date.
+    market_map = await _load_market_map(session, (r.market_id for r in th_rows))
+    created = [r.created_at for r in th_rows]
+    win_start = min(created) - timedelta(days=2)
+    win_end = max(created) + timedelta(days=2)
+    icaos = {
+        icao_for_location(m.parsed_location)
+        for m in market_map.values() if m.parsed_location
+    }
+    daily_max = await _daily_max_by_station_day(session, icaos, win_start, win_end)
+
+    def _ground_truth_won(row) -> bool | None:
+        m = market_map.get(row.market_id)
+        if m is None or m.parsed_location is None or m.parsed_threshold is None:
+            return None
+        if m.end_date is None or m.parsed_operator not in _OP_THRESHOLD:
+            return None
+        icao = icao_for_location(m.parsed_location)
+        if icao is None:
+            return None
+        tz = icao_timezone(icao)
+        target_day = resolve_target_local_day(m.end_date, tz)
+        if target_day is None:
+            return None
+        amax = daily_max.get((icao, target_day))
+        if amax is None:
+            return None
+        yes_won = _threshold_yes_won(m.parsed_operator, m.parsed_threshold, amax)
+        return yes_won if row.direction.value == "BUY_YES" else (not yes_won)
+
+    def _score(rows_subset) -> tuple[int, int, int, float, float]:
+        """(count, n_resolved, won, mean_break_even, mean_ev_per_$1)."""
+        won = resolved = 0
+        prices: list[float] = []
+        evs: list[float] = []
+        for r in rows_subset:
+            gt = _ground_truth_won(r)
+            if gt is None:
+                continue
+            resolved += 1
+            prices.append(r.market_prob)
+            if gt:
+                won += 1
+                evs.append((1.0 / r.market_prob - 1.0) if r.market_prob > 0 else 0.0)
+            else:
+                evs.append(-1.0)
+        be = (sum(prices) / len(prices)) if prices else 0.0
+        ev = (sum(evs) / len(evs)) if evs else 0.0
+        return len(rows_subset), resolved, won, be, ev
+
+    cur_edge = settings.MIN_EDGE
+    cur_prob = settings.MIN_PROBABILITY
+    rejected_th = [r for r in th_rows if not r.passes]
+    passing_th = [r for r in th_rows if r.passes]
+
+    click.echo(
+        f"_Current threshold floors: MIN_PROBABILITY={cur_prob}, "
+        f"MIN_EDGE={cur_edge}. Ground truth = routine-METAR daily max "
+        f"(advisory for °C cities; diverges from Polymarket's resolver)._"
+    )
+    click.echo()
+    click.echo("| Candidate (min_prob, min_edge) | Newly-pass | Resolved | Won% | Break-even | EV/$1 |")
+    click.echo("|---|---:|---:|---:|---:|---:|")
+
+    # Baseline: quality of threshold evals that ALREADY pass.
+    n, res, won, be, ev = _score(passing_th)
+    won_pct = f"{won/res*100:5.1f}%" if res else "  n/a"
+    click.echo(
+        f"| baseline (already passing) | {n:,} | {res:,} | {won_pct} "
+        f"| {be:.3f} | {ev:+.3f} |"
+    )
+
+    # Candidate grid: loosen prob (edge held current), loosen edge (prob held
+    # current), then a couple of combined loosenings. Skip candidates that
+    # aren't actually looser than the current floor on at least one axis.
+    candidates: list[tuple[float, float]] = [
+        (0.80, cur_edge), (0.78, cur_edge), (0.75, cur_edge), (0.70, cur_edge),
+        (cur_prob, 0.07), (cur_prob, 0.05),
+        (0.78, 0.05), (0.75, 0.05),
+    ]
+    seen: set[tuple[float, float]] = set()
+    for cand_prob, cand_edge in candidates:
+        if (cand_prob, cand_edge) in seen:
+            continue
+        seen.add((cand_prob, cand_edge))
+        if cand_prob >= cur_prob and cand_edge >= cur_edge:
+            continue  # not a loosening
+        newly = [
+            r for r in rejected_th
+            if _check_filters(
+                edge=r.edge, prob=r.model_prob, price=r.market_prob,
+                routine_count=r.routine_count,
+                minutes_to_close=r.minutes_to_close,
+                depth=r.depth_usd,
+                min_edge=cand_edge, min_probability=cand_prob,
+            ) is None
+        ]
+        n, res, won, be, ev = _score(newly)
+        won_pct = f"{won/res*100:5.1f}%" if res else "  n/a"
+        click.echo(
+            f"| prob≥{cand_prob}, edge≥{cand_edge} | {n:,} | {res:,} | "
+            f"{won_pct} | {be:.3f} | {ev:+.3f} |"
+        )
+    click.echo()
+
+
 @main.command("evals-report")
 @click.option("--days", default=30, show_default=True, help="Look-back window in days.")
 @click.option(
@@ -191,18 +449,31 @@ def paper_trade(days: int) -> None:
     type=click.Choice(["probability", "lock"], case_sensitive=False),
     help="Restrict to one path. Default: both.",
 )
-def evals_report(days: int, signal_kind: str | None) -> None:
+@click.option(
+    "--operator", "operator_class", default=None,
+    type=click.Choice(["threshold", "bracket-like"], case_sensitive=False),
+    help="Restrict to one operator class. Default: both.",
+)
+def evals_report(days: int, signal_kind: str | None, operator_class: str | None) -> None:
     """Markdown filter-tuning report from the ``evaluation_logs`` table.
 
     For every per-side edge evaluation in the look-back window:
       * Pass-rate by ``reject_reason`` — which filter rejects most candidates?
+      * Reject reasons split by operator class (threshold vs bracket-like) —
+        separates the *expected* 2026-05-22/23 bracket-guard cuts from
+        *threshold* volume suppressed by the bracket-era global floors.
+      * Recoverable rejected band (threshold ops) — for candidate
+        THRESHOLD_MIN_PROBABILITY / THRESHOLD_MIN_EDGE values, how many
+        rejected threshold evals would newly pass and would they have WON
+        against the actual routine-METAR daily max (with break-even / EV)?
       * Edge / probability / price distribution split by PASSING vs REJECTED.
       * Slippage post-mortem joining passing rows to the resulting Trade
         (``fill_price`` vs the snapshotted ``submit_yes_*`` quote).
 
     ``evaluation_logs`` is the source of truth for filter tuning — ``signals``
     only carries passing edges and is de-duplicated per (market, side), so
-    this is the only place to count the rejected mass.
+    this is the only place to count the rejected mass. Use ``--operator
+    threshold`` to focus the recoverable-band analysis on the clean class.
     """
     from statistics import mean, median
 
@@ -238,11 +509,25 @@ def evals_report(days: int, signal_kind: str | None) -> None:
                 stmt = stmt.where(EvaluationLog.signal_kind == signal_kind.lower())
             rows = (await session.execute(stmt)).scalars().all()
 
+            # Operator class lives on the Market row, not the eval row — batch
+            # load once and tag each eval so every section can pivot on it.
+            market_map = await _load_market_map(session, (r.market_id for r in rows))
+            op_of = {
+                r.market_id: (
+                    market_map[r.market_id].parsed_operator
+                    if r.market_id in market_map else None
+                )
+                for r in rows
+            }
+            if operator_class:
+                rows = [r for r in rows if _op_class(op_of[r.market_id]) == operator_class]
+
             total = len(rows)
             if total == 0:
                 click.echo(
                     f"No evaluation_logs rows in the last {days}d "
-                    f"(signal_kind={signal_kind or 'any'}). "
+                    f"(signal_kind={signal_kind or 'any'}, "
+                    f"operator={operator_class or 'any'}). "
                     "Has the scheduler been running?"
                 )
                 return
@@ -251,7 +536,8 @@ def evals_report(days: int, signal_kind: str | None) -> None:
             rejected = [r for r in rows if not r.passes]
 
             kind_label = signal_kind.lower() if signal_kind else "all"
-            click.echo(f"# Evaluation report — {kind_label} path, last {days}d")
+            op_label = operator_class or "all ops"
+            click.echo(f"# Evaluation report — {kind_label} path, {op_label}, last {days}d")
             click.echo()
             click.echo(f"- **Total evaluations:** {total:,}")
             click.echo(f"- **Passing:** {len(passing):,}  ({_pct(len(passing), total).strip()})")
@@ -276,6 +562,42 @@ def evals_report(days: int, signal_kind: str | None) -> None:
             for prefix, count in sorted(buckets.items(), key=lambda kv: -kv[1]):
                 click.echo(f"| {prefix} | {count:,} | {_pct(count, total).strip()} |")
             click.echo()
+
+            # --- 1b. Reject reasons split by operator class. THIS is the
+            #     headline that separates the *expected* bracket-guard cuts
+            #     (lead/landing-band/NO-cap — keep) from *threshold* volume
+            #     suppressed by the bracket-era global MIN_PROBABILITY /
+            #     MIN_EDGE (recoverable).
+            click.echo("## Reject reasons by operator class")
+            click.echo()
+            click.echo("| Op class | Reason prefix | Count | % of class evals |")
+            click.echo("|---|---|---:|---:|")
+            class_totals: dict[str, int] = {}
+            for r in rows:
+                cls = _op_class(op_of[r.market_id])
+                class_totals[cls] = class_totals.get(cls, 0) + 1
+            class_reject: dict[tuple[str, str], int] = {}
+            for r in rejected:
+                cls = _op_class(op_of[r.market_id])
+                prefix = (r.reject_reason or "(unknown)").split(" ")[0]
+                class_reject[(cls, prefix)] = class_reject.get((cls, prefix), 0) + 1
+            for (cls, prefix), count in sorted(
+                class_reject.items(), key=lambda kv: (kv[0][0], -kv[1])
+            ):
+                click.echo(
+                    f"| {cls} | {prefix} | {count:,} | "
+                    f"{_pct(count, class_totals.get(cls, 0)).strip()} |"
+                )
+            click.echo()
+
+            # --- 1c. Recoverable rejected band (THRESHOLD ops only). For a
+            #     sweep of candidate THRESHOLD_MIN_PROBABILITY / THRESHOLD_MIN_EDGE
+            #     values, count currently-rejected threshold evals that WOULD
+            #     pass under the looser floors, and check whether they'd have
+            #     WON against the actual routine-METAR daily max. A band whose
+            #     would-have-won rate clears its break-even (mean price) is +EV
+            #     and safe to recover; a coin-flip / -EV band is correctly cut.
+            await _recoverable_band_section(session, rows, op_of)
 
             # --- 2. Split by signal_kind so the user can spot if e.g. the
             #     probability path is dominated by rejects while lock fires
@@ -377,6 +699,134 @@ def evals_report(days: int, signal_kind: str | None) -> None:
                     "paying away spread on entry; investigate whether MIN_DEPTH_USD "
                     "or the close-buffer gate needs tightening._"
                 )
+
+    asyncio.run(_run())
+
+
+@main.command("decisions-report")
+@click.option("--days", default=7, show_default=True, help="Look-back window in days.")
+@click.option(
+    "--signal-kind", default=None,
+    type=click.Choice(["probability", "lock"], case_sensitive=False),
+    help="Restrict to one path. Default: both.",
+)
+@click.option(
+    "--operator", "operator_class", default=None,
+    type=click.Choice(["threshold", "bracket-like"], case_sensitive=False),
+    help="Restrict to one operator class. Default: both.",
+)
+def decisions_report(days: int, signal_kind: str | None, operator_class: str | None) -> None:
+    """Markdown post-filter funnel report from the ``decision_logs`` table.
+
+    ``evaluation_logs`` answers "did the edge clear ``_check_filters``?";
+    ``decision_logs`` answers "what happened next." Use this to confirm that
+    a filter loosening actually produces trades rather than dying downstream
+    at ``stake_below_min`` / ``cap_exceeded`` / ``drawdown_paused`` — the
+    failure mode that would make a recovered threshold band invisible.
+
+    Sections:
+      * Outcomes overall + split by operator class.
+      * For ``stake_below_min`` / ``drawdown_paused``: the binding constraint
+        (``size_reason``), raw Kelly %, and depth from ``metadata_json``.
+    """
+    from sqlalchemy import select
+
+    from src.db.engine import async_session
+    from src.db.models import DecisionLog
+
+    def _pct(num: int, denom: int) -> str:
+        return f"{(num / denom * 100):5.1f}%" if denom else "  n/a"
+
+    async def _run() -> None:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+        async with async_session() as session:
+            stmt = (
+                select(DecisionLog)
+                .where(DecisionLog.created_at >= cutoff)
+                .order_by(DecisionLog.created_at)
+            )
+            if signal_kind:
+                stmt = stmt.where(DecisionLog.signal_kind == signal_kind.lower())
+            rows = (await session.execute(stmt)).scalars().all()
+
+            market_map = await _load_market_map(session, (r.market_id for r in rows))
+            op_of = {
+                r.market_id: (
+                    market_map[r.market_id].parsed_operator
+                    if r.market_id in market_map else None
+                )
+                for r in rows
+            }
+            if operator_class:
+                rows = [r for r in rows if _op_class(op_of[r.market_id]) == operator_class]
+
+            total = len(rows)
+            if total == 0:
+                click.echo(
+                    f"No decision_logs rows in the last {days}d "
+                    f"(signal_kind={signal_kind or 'any'}, "
+                    f"operator={operator_class or 'any'})."
+                )
+                return
+
+            kind_label = signal_kind.lower() if signal_kind else "all"
+            op_label = operator_class or "all ops"
+            click.echo(f"# Decision funnel — {kind_label} path, {op_label}, last {days}d")
+            click.echo()
+            click.echo(f"- **Total decisions:** {total:,}")
+            click.echo()
+
+            # --- 1. Outcome counts. The post-filter funnel: success branches
+            #     (signal_written/trade_pending/trade_filled) vs skip/fail.
+            click.echo("## Outcomes")
+            click.echo()
+            click.echo("| Outcome | Count | % |")
+            click.echo("|---|---:|---:|")
+            outcomes: dict[str, int] = {}
+            for r in rows:
+                outcomes[r.outcome] = outcomes.get(r.outcome, 0) + 1
+            for outcome, count in sorted(outcomes.items(), key=lambda kv: -kv[1]):
+                click.echo(f"| {outcome} | {count:,} | {_pct(count, total).strip()} |")
+            click.echo()
+
+            # --- 2. Outcomes by operator class — does the threshold class
+            #     reach trade_* or stall at a sizing/exposure gate?
+            click.echo("## Outcomes by operator class")
+            click.echo()
+            click.echo("| Op class | Outcome | Count |")
+            click.echo("|---|---|---:|")
+            class_outcome: dict[tuple[str, str], int] = {}
+            for r in rows:
+                key = (_op_class(op_of[r.market_id]), r.outcome)
+                class_outcome[key] = class_outcome.get(key, 0) + 1
+            for (cls, outcome), count in sorted(
+                class_outcome.items(), key=lambda kv: (kv[0][0], -kv[1])
+            ):
+                click.echo(f"| {cls} | {outcome} | {count:,} |")
+            click.echo()
+
+            # --- 3. Binding-constraint detail for the sizing-stall outcomes.
+            #     metadata_json carries size_reason / kelly_pct / depth_usd
+            #     (populated 2026-05-17) — tells us WHICH cap zeroed the stake.
+            stall = [
+                r for r in rows
+                if r.outcome in ("stake_below_min", "drawdown_paused")
+                and r.metadata_json
+            ]
+            if stall:
+                click.echo("## Sizing-stall binding constraints")
+                click.echo()
+                click.echo("| Outcome | size_reason | Count |")
+                click.echo("|---|---|---:|")
+                reason_counts: dict[tuple[str, str], int] = {}
+                for r in stall:
+                    sr = str(r.metadata_json.get("size_reason", "(none)"))
+                    reason_counts[(r.outcome, sr)] = reason_counts.get((r.outcome, sr), 0) + 1
+                for (outcome, sr), count in sorted(
+                    reason_counts.items(), key=lambda kv: -kv[1]
+                ):
+                    click.echo(f"| {outcome} | {sr} | {count:,} |")
+                click.echo()
 
     asyncio.run(_run())
 

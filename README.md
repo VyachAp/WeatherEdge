@@ -125,8 +125,8 @@ python -m src.cli bet redeem --all        # CTF redemption after resolution
 python -m src.cli admin reset-drawdown-peak    # Reset DrawdownMonitor's stuck peak; restart scheduler after
 python -m src.cli admin reconcile-stuck        # Resolve OPEN+delayed+null-fill trades against on-chain payout; releases stuck exposure
 
-# Standalone backtest of the lock-rule trader
-python scripts/backtest_lock_rule.py --days 30
+# Trace the unified pipeline for one market/station (no orders)
+python debug_pipeline.py
 ```
 
 ## Dashboard
@@ -255,11 +255,7 @@ src/
     polymarket_client.py       CLOB client (FOK orders, orderbook depth)
     alerter.py                 Telegram queue + inline buttons (exec/skip/detail)
 
-scripts/
-  backtest_lock_rule.py        Replay lock-rule against resolved markets
-  debug_pipeline.py            Trace pipeline for one market/station
-  inspect_loss.py              Drilldown on a losing trade
-  backfill_station_bias_tz.py  Idempotent bias recompute (tz-correct windows)
+debug_pipeline.py              Trace pipeline for one market/station (repo root)
 ```
 
 ## FAQ

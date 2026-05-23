@@ -129,20 +129,18 @@ proj_RMSE > 6°F.
 range before they bleed PnL).
 **Files:** `scripts/station_calibration_report.py` (already exists).
 
-## [backlog] Aggregation CLI for decision_logs funnel
+## [done 2026-05-23] Aggregation CLI for decision_logs funnel
 
-**Why:** Phase C wrote 12 instrumentation points but querying the
-funnel breakdown still requires hand-rolled SQL. A `python -m src.cli
-decisions-report --days 1` that prints outcome counts grouped by
-`signal_kind` would make the post-filter funnel as cheap to inspect as
-`evals-report`.
-**Success criteria:** one command outputs total / passing-by-signal-kind
-/ outcome breakdown / top reject reasons. Run weekly to spot drift in
-the funnel shape (e.g. sudden spike in `cluster_cap_hit` = bracket
-markets re-enabled and clustering aggressively).
-**Effort:** 1-2h.
-**Leverage:** observability (closes the loop on the Phase C investment).
-**Files:** new subcommand in `src/cli.py`, mirroring `evals_report`.
+**Shipped:** `python -m src.cli decisions-report --days N [--signal-kind …]
+[--operator threshold|bracket-like]` mirrors `evals_report`. Outputs:
+outcome counts overall, outcomes split by operator class, and the
+binding-constraint (`size_reason`) breakdown for `stake_below_min` /
+`drawdown_paused` from `metadata_json`.
+**First finding (7d prod):** `dup_blocked_inproc` 63%, **`stake_below_min`
+27%** (dominant real throttle; `size_reason` "below $5 minimum" leads),
+`trade_filled` only 2%. The $5 floor at small bankroll is eating most
+passing decisions — see the threshold-floor entry below.
+**Files:** `src/cli.py::decisions_report`.
 
 ## [backlog] Bound the keyword-scan fallback offset configurably
 
@@ -167,22 +165,65 @@ still pass.
 **Leverage:** code clarity (low priority).
 **Files:** new alembic migration, `src/db/models.py::Signal`.
 
-## [backlog] Reconsider MIN_PROBABILITY for threshold markets only
+## [code shipped 2026-05-23, awaiting .env enable] Operator-aware MIN_PROBABILITY / MIN_EDGE (threshold-only)
 
-**Why:** `MIN_PROBABILITY=0.85` was raised from 0.50 in the 2026-05-08
-bracket-overconfidence fix. Brackets are now disabled, so the 0.85
-floor is gating *threshold* markets that may have a different
-calibration curve. Threshold-only band 0.75-0.85 might be profitable
-post-calibration.
-**Success criteria:** after `decisions-report` CLI lands, look at win
-rate by predicted-probability bucket for threshold-only trades over
-30 days. If 0.75-0.85 band wins >75%, lower `MIN_PROBABILITY` for
-threshold markets only (or globally, since brackets are disabled).
-**Effort:** measurement first; if data supports, 5 min config change.
-**Leverage:** volume (would re-open a probability band currently
-silently filtered).
-**Files:** `.env`, `src/signals/edge_calculator.py` (if we want per-kind
-floors, more invasive).
+**Why:** `MIN_PROBABILITY=0.85` / `MIN_EDGE=0.10` were tightened for the
+2026-05-08 *bracket* crisis; threshold markets were never the source of
+that bleed but inherit the strict global floors.
+**Shipped:** `THRESHOLD_MIN_PROBABILITY` / `THRESHOLD_MIN_EDGE` Settings
+(both `None` = no-op) + `_check_filters` `min_edge`/`min_probability`
+overrides + `binary_market_edge` threading them for threshold ops only.
+Bracket-like ops keep the strict globals + the three single-bucket NO
+guards. Deploying is a no-op until set via `.env`.
+**Data (7d prod, `evals-report --operator threshold` recoverable band,
+ground truth = routine-METAR daily max):**
+- baseline already-passing threshold: 93.6% won, +0.183 EV/$1.
+- **prob≥0.78 (edge held 0.10): +122 evals, 91.0% won, +0.568 EV/$1** ← sweet spot.
+- prob≥0.78, edge≥0.05: +144 evals, 92.4% won, +0.540 EV.
+- prob≥0.75: ~76-79% won (degrading); prob≥0.70: 66% won (marginal).
+**Recommendation:** set `THRESHOLD_MIN_PROBABILITY=0.78`; optionally
+`THRESHOLD_MIN_EDGE=0.05`. Do NOT go below 0.78. Note: "newly-pass" counts
+are eval ROWS (deduped per tick downstream), so distinct-market volume is
+lower; win-rate/EV per-row are valid since a market's outcome is constant.
+**Blocker on realized volume:** `decisions-report` shows `stake_below_min`
+is the dominant downstream throttle ($5 floor at ~$487 bankroll). Loosening
+filters recovers eval-volume but a chunk stalls before becoming a trade —
+pair with a sizing review (KELLY_FRACTION / MIN_STAKE_USD / bankroll).
+**Files:** `src/config.py`, `src/signals/edge_calculator.py`, `.env` (enable).
+
+## [active 2026-05-23] Quantity throttle is the exposure cap saturated by LIVE bets (capital-bound, not a bug)
+
+**Diagnosis (7d prod, `decisions-report` + ad-hoc):** 27% of decisions die at
+`stake_below_min` — but `requested_stake_usd ≈ $0.00` for 98.6% of them (p90
+= 0.00), not "just under $5". So **raising KELLY_FRACTION or lowering
+MIN_STAKE_USD does nothing** — Kelly sizes to ~0 *upstream* of the floor.
+Cause: the **exposure cap is fully deployed by legitimate in-flight bets**.
+equity ≈ $414, `MAX_EXPOSURE_PCT × bankroll = $103 < $300 floor` so cap =
+$300; 28 OPEN hold ~$275 → only **~$25-32 room** split across all per-tick
+candidates → each sizes to ~0 → `stake_below_min`. **Correction to an earlier
+read: these are NOT stuck.** Inspecting the 28: 23 are *today's* markets (end
+12:00 UTC, awaiting end-of-local-day resolution), 5 are *tomorrow's*; only **1
+is genuinely stale** (Wellington, target Apr 29, ~577h past end, $7 — clean
+via `admin reconcile-stuck`). So this is the **risk cap working as designed**
+at a small bankroll, not the stuck-OPEN silencer. Capital recycles daily as
+positions resolve → headroom returns and the newly-unlocked threshold band
+fills into it.
+**Notable side-observations:**
+- All 28 OPEN have `fill_price=NULL` (separate, minor reconcile gap — fill
+  backfill not landing; doesn't affect exposure but blinds slippage analysis).
+- ~22 of 28 OPEN are `exactly` (bracket-like) bets — bracket-like YES is
+  eating most of the exposure budget, crowding out threshold trades. Possible
+  capital-allocation lever (cap bracket-like exposure share?).
+- 248 PENDING `exception:PolyApiException` over the window but **0 in last
+  24h** — the May-2026 CLOB submission-failure class, self-resolved.
+**Levers (genuine, since it's capital not a bug):** (a) grow bankroll;
+(b) raise `MAX_EXPOSURE_USD_FLOOR` (trades drawdown safety for volume; risky
+when floor approaches/exceeds equity); (c) faster capital recycling (resolve +
+`bet redeem` cadence so freed capital re-enters sooner); (d) cap bracket-like
+exposure share so threshold trades aren't crowded out. The threshold-filter
+loosening is correct + EV but its realized volume is gated by available
+headroom, which is intraday-saturated at this bankroll.
+**Files:** `src/risk/kelly.py`, `src/config.py`, `src/resolution.py`.
 
 ## [backlog] Investigate Polymarket Gamma listing recovery
 

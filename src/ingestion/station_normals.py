@@ -1,6 +1,8 @@
 """Station climatological normals — multi-year mean and std of daily-max
 temperature per (station, day-of-year). Read by the probability engine as
-a Bayesian prior; written by ``scripts/backfill_station_normals.py``.
+a Bayesian prior. TODO: the ``scripts/backfill_station_normals.py`` loader
+meant to populate this table does not exist yet, so the table is unpopulated
+and CLIMATE_PRIOR_ENABLED stays off until it is written.
 """
 
 from __future__ import annotations

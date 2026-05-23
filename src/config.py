@@ -39,17 +39,11 @@ class Settings(BaseSettings):
     # Multi-provider aviation API keys (empty = provider disabled)
     CHECKWX_API_KEY: str = ""
     AVWX_API_KEY: str = ""
-    CHECKWX_DAILY_BUDGET: int = 2000
-    IEM_RATE_LIMIT_RPS: float = 1.0
-    OGIMET_RATE_LIMIT_RPS: float = 0.2
-    NOAA_RATE_LIMIT_RPS: float = 1.0
-    AVWX_RATE_LIMIT_RPS: float = 1.0
 
     # Weather Company v3 observations (airport ICAO stations)
     WX_API_KEY: str = ""  # Empty = WX pipeline disabled
     WX_RATE_LIMIT_RPS: float = 1.5  # ~90/min conservative
     WX_DAILY_BUDGET: int = 10000
-    WX_PIPELINE_INTERVAL_MINUTES: int = 1  # Poll every minute
     WX_RETENTION_HOURS: int = 48
     WX_PEAK_CONFIRM_MINUTES: int = 15  # Minutes of decline before declaring peak done
 
@@ -65,11 +59,6 @@ class Settings(BaseSettings):
     POLYMARKET_SIGNATURE_TYPE: int = 0
     POLYMARKET_FUNDER_ADDRESS: str = ""  # Empty = derive EOA from private key
     # Polymarket migrated to new exchange contracts (collateral=pUSD) in 2026.
-    # Set True after depositing to pUSD via the polymarket.com UI. The flag
-    # monkey-patches py-clob-client to sign for the new exchanges instead of
-    # the old USDC.e ones; without it every order is rejected with
-    # ``order_version_mismatch``.
-    POLYMARKET_USE_NEW_EXCHANGES: bool = False
     AUTO_EXECUTE: bool = False  # Set True to place orders automatically
     DAILY_SPEND_CAP_USD: float = 200.0  # Max total spend per 24h
     MIN_STAKE_USD: float = 5.0  # Skip orders below this amount
@@ -88,6 +77,19 @@ class Settings(BaseSettings):
     MIN_PROBABILITY: float = 0.85
     MIN_ENTRY_PRICE: float = 0.40
     MAX_ENTRY_PRICE: float = 0.97
+    # Operator-aware overrides for the two filters that were globally
+    # tightened during the 2026-05-08 bracket-overconfidence crisis
+    # (MIN_PROBABILITY 0.50→0.85, MIN_EDGE→0.10). Threshold markets
+    # (above/at_least/below/at_most) were never the source of that bleed —
+    # all the 2026-05-22/23 quality cuts target bracket-like ops — yet they
+    # inherit the strict global floors. When set, `binary_market_edge`
+    # applies these to threshold ops ONLY; bracket-like ops keep the strict
+    # global MIN_PROBABILITY / MIN_EDGE plus the three single-bucket NO
+    # guards. `None` (default) = no override = current behavior, so deploying
+    # is a no-op until a value is set via .env after telemetry validation
+    # (see evals-report --operator threshold recoverable-band analysis).
+    THRESHOLD_MIN_PROBABILITY: float | None = None
+    THRESHOLD_MIN_EDGE: float | None = None
     MIN_DEPTH_USD: float = 10.0
     MIN_ROUTINE_COUNT: int = 3
     MARKET_CLOSE_BUFFER_MINUTES: int = 30
@@ -217,11 +219,6 @@ class Settings(BaseSettings):
     LOCK_RULE_MIN_PRICE: float = 0.05
     LOCK_MARGIN_F: float = 2.0
     LOCK_POSITION_PCT: float = 0.02
-    LOCK_RULE_LOSS_WINDOW_HOURS: int = 72
-    LOCK_RULE_LOSS_DISABLE_COUNT: int = 3
-
-    # Open-Meteo forecast
-    OPENMETEO_RATE_LIMIT_RPS: float = 2.0
 
     # Multi-model ensemble (Open-Meteo models= param). Spread across these
     # models drives the probability-engine sigma instead of the hardcoded
@@ -250,11 +247,11 @@ class Settings(BaseSettings):
     # Climate-normal prior. Multi-year per-station per-DOY climatology
     # acts as the Bayesian prior for the daily-max distribution before the
     # forecast Gaussian (likelihood) and METAR observations update it.
-    # Ships disabled — backfill the `station_normals` table first via
-    # `scripts/backfill_station_normals.py`, sanity-check the values,
-    # then flip CLIMATE_PRIOR_ENABLED=true.
+    # Ships disabled. Enabling requires backfilling the `station_normals`
+    # table, sanity-checking the values, then flipping this to true. NOTE:
+    # the `scripts/backfill_station_normals.py` loader does not exist yet —
+    # the feature cannot be bootstrapped as documented until it is written.
     CLIMATE_PRIOR_ENABLED: bool = False
-    CLIMATE_NORMAL_YEARS: int = 10
     # Floor on posterior σ after the Bayesian blend — prevents tropical
     # / oceanic stations (low climatological σ) from collapsing the
     # distribution width to ~1°F and over-confidently quoting narrow

@@ -346,3 +346,122 @@ class TestSingleBucketNoGuards:
         )
         assert edge.direction == TradeDirection.BUY_YES
         assert edge.passes is True
+
+
+class TestCheckFiltersThresholdOverrides:
+    """`_check_filters` accepts `min_edge` / `min_probability` overrides so
+    `binary_market_edge` can run threshold ops on the (optional) looser
+    THRESHOLD_MIN_* floors while bracket-like ops keep the strict globals.
+    None defaults must reproduce the global-setting behavior exactly."""
+
+    def test_min_probability_override_loosens(self):
+        from src.signals.edge_calculator import _check_filters
+
+        # prob 0.80 fails the global 0.85 floor but passes a 0.78 override.
+        assert _check_filters(
+            edge=0.2, prob=0.80, price=0.6,
+            routine_count=5, minutes_to_close=120, depth=100.0,
+        ) is not None  # default 0.85 floor rejects
+        assert _check_filters(
+            edge=0.2, prob=0.80, price=0.6,
+            routine_count=5, minutes_to_close=120, depth=100.0,
+            min_probability=0.78,
+        ) is None
+
+    def test_min_edge_override_loosens(self):
+        from src.signals.edge_calculator import _check_filters
+        from src.config import settings
+
+        # edge 0.06 fails when the global floor is 0.10 (the live .env value)
+        # but passes a 0.05 override. Skip the negative leg if the active
+        # global floor already admits 0.06 (default 0.05 build).
+        if settings.MIN_EDGE > 0.06:
+            assert _check_filters(
+                edge=0.06, prob=0.95, price=0.6,
+                routine_count=5, minutes_to_close=120, depth=100.0,
+            ) is not None
+        assert _check_filters(
+            edge=0.06, prob=0.95, price=0.6,
+            routine_count=5, minutes_to_close=120, depth=100.0,
+            min_edge=0.05,
+        ) is None
+
+    def test_none_defaults_reproduce_global(self):
+        from src.signals.edge_calculator import _check_filters
+        from src.config import settings
+
+        # Explicit None == omitted == global settings. prob just below the
+        # global floor must reject identically with and without the kwargs.
+        prob = settings.MIN_PROBABILITY - 0.01
+        a = _check_filters(
+            edge=0.5, prob=prob, price=0.3,
+            routine_count=5, minutes_to_close=120, depth=100.0,
+        )
+        b = _check_filters(
+            edge=0.5, prob=prob, price=0.3,
+            routine_count=5, minutes_to_close=120, depth=100.0,
+            min_edge=None, min_probability=None,
+        )
+        assert a == b
+        assert a is not None and "probability" in a
+
+
+class TestBinaryMarketEdgeThresholdFloors:
+    """`binary_market_edge` applies THRESHOLD_MIN_* to threshold ops ONLY.
+    Bracket-like ops keep the strict global floors (and their NO guards)."""
+
+    def test_threshold_passes_under_loosened_floor(self, monkeypatch):
+        from src.config import settings
+        from src.db.models import TradeDirection
+
+        monkeypatch.setattr(settings, "THRESHOLD_MIN_PROBABILITY", 0.78)
+        monkeypatch.setattr(settings, "THRESHOLD_MIN_EDGE", 0.05)
+        # above-80 YES at prob 0.80: fails the default 0.85 global floor,
+        # passes the 0.78 threshold override. yes_ask 0.62 → edge 0.18.
+        edge = _eval_binary(
+            question="Will the highest temperature be above 80F",
+            threshold_f=80.0, op="above",
+            our_prob_in_window=0.80, yes_bid=0.60, yes_ask=0.62,
+            forecast_peak_f=85.0, current_max_f=70.0, hours_until_peak=3.0,
+        )
+        assert edge.direction == TradeDirection.BUY_YES
+        assert edge.passes is True
+
+    def test_threshold_rejected_without_override(self, monkeypatch):
+        from src.config import settings
+        from src.db.models import TradeDirection
+
+        # Pin the overrides to None so this exercises the documented
+        # "no override" path regardless of what the live .env sets.
+        monkeypatch.setattr(settings, "THRESHOLD_MIN_PROBABILITY", None)
+        monkeypatch.setattr(settings, "THRESHOLD_MIN_EDGE", None)
+        # Same trade, default floors (THRESHOLD_MIN_* unset = None): the
+        # 0.80 prob is below the global 0.85 floor → rejected.
+        edge = _eval_binary(
+            question="Will the highest temperature be above 80F",
+            threshold_f=80.0, op="above",
+            our_prob_in_window=0.80, yes_bid=0.60, yes_ask=0.62,
+            forecast_peak_f=85.0, current_max_f=70.0, hours_until_peak=3.0,
+        )
+        assert edge.direction == TradeDirection.BUY_YES
+        assert edge.passes is False
+        assert "probability" in (edge.reject_reason or "")
+
+    def test_bracket_like_unaffected_by_threshold_override(self, monkeypatch):
+        from src.config import settings
+        from src.db.models import TradeDirection
+
+        monkeypatch.setattr(settings, "THRESHOLD_MIN_PROBABILITY", 0.78)
+        monkeypatch.setattr(settings, "THRESHOLD_MIN_EDGE", 0.05)
+        # YES on an `exactly` window at prob 0.80, near peak (no lead gate),
+        # YES side (no landing-band/NO-cap). The threshold override must NOT
+        # apply → still rejected by the strict global 0.85 floor.
+        edge = _eval_binary(
+            question="Will the highest temperature be 80F on May 23",
+            threshold_f=80.0, op="exactly",
+            our_prob_in_window=0.80, yes_bid=0.60, yes_ask=0.62,
+            forecast_peak_f=80.0, current_max_f=79.0, hours_until_peak=2.0,
+        )
+        assert edge.direction == TradeDirection.BUY_YES
+        assert edge.passes is False
+        assert "probability" in (edge.reject_reason or "")

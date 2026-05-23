@@ -917,7 +917,7 @@ def _compute_depth(book: object, price: float) -> float:
 
     Verified against py_clob_client semantics 2026-04-28: bids are buy
     orders, asks are sell orders, and the binary CLOB invariant
-    `YES.bid + NO.ask = 1.0` holds. See `scripts/inspect_orderbook.py`.
+    `YES.bid + NO.ask = 1.0` holds.
     """
     asks = book.asks if hasattr(book, "asks") else book.get("asks", [])  # type: ignore[union-attr]
     depth = 0.0

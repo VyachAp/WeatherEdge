@@ -20,9 +20,10 @@ python -m src.cli run                  # full daemon (health on :8080)
 python -m src.cli backfill --days 30   # historical markets
 python -m src.cli backtest-v2 --days 30   # replay probability pipeline
 python -m src.cli paper-trade --days 30   # dry simulation
-python -m src.cli evals-report --days 7   # filter-tuning markdown report
+python -m src.cli evals-report --days 7   # filter-tuning report (--operator threshold for recoverable band)
+python -m src.cli decisions-report --days 7   # post-filter funnel by outcome (why passing evals didn't trade)
 python -m src.cli bet find --city Phoenix --date 2026-04-30  # market lookup
-python scripts/backtest_lock_rule.py --days 30  # lock-rule backtest
+python debug_pipeline.py                  # trace unified pipeline for one market/station
 ```
 
 ## Architecture
@@ -152,7 +153,7 @@ Routine-count gates:
 
 `_try_lock_rule_trade` flow: (1) `evaluate_lock` → return None if no side; (2) `effective_price` = `yes_price` (YES) or `1 - yes_price` (NO), reject outside `[LOCK_RULE_MIN_PRICE=0.05, LOCK_RULE_MAX_PRICE=0.95]`; (3) `_check_filters` with `min_routine_count=2` (already gated), close buffer, depth — stub edge/prob, no edge gate; (4) size via `size_locked_position` (`LOCK_POSITION_PCT=2%`, capped at `MAX_POSITION_USD/2` and 15% of depth), apply drawdown multiplier, place FOK; (5) write `Signal(model_prob=1.0, market_prob=effective_price, edge=1-effective_price)` and `Trade(direction, stake_usd, entry_price=effective_price)`. Telegram 🔒 alert.
 
-Settings: `LOCK_RULE_ENABLED`, `LOCK_RULE_{MIN,MAX}_PRICE`, `LOCK_MARGIN_F`, `LOCK_POSITION_PCT`, `LOCK_RULE_LOSS_WINDOW_HOURS=72`, `LOCK_RULE_LOSS_DISABLE_COUNT=3`, `FAST_LOCK_POLL_{ENABLED,INTERVAL_SECONDS}`. Range constants are module-level in `lock_rules.py`: `RANGE_LOCK_MIN_ROUTINES=4`, `RANGE_LOCK_MARGIN_MULTIPLIER=2.0`. **`RANGE_OVERSHOOT_LOCK_ENABLED` (Settings, default False, added 2026-05-22)** disables the `range_overshoot` NO branch: live data showed it lost -$57.61 / 56% win across many °C cities (Toronto/Buenos Aires/Shanghai/…) — our routine-METAR daily max reads hotter than Polymarket's resolver, so the "obviously locked" overshoot fires on a max the resolver never recorded. `range_undershoot` (+$8, 100%) and `range_in_window` are unaffected and read the flag live off `settings`.
+Settings: `LOCK_RULE_ENABLED`, `LOCK_RULE_{MIN,MAX}_PRICE`, `LOCK_MARGIN_F`, `LOCK_POSITION_PCT`, `FAST_LOCK_POLL_{ENABLED,INTERVAL_SECONDS}`. Range constants are module-level in `lock_rules.py`: `RANGE_LOCK_MIN_ROUTINES=4`, `RANGE_LOCK_MARGIN_MULTIPLIER=2.0`. **`RANGE_OVERSHOOT_LOCK_ENABLED` (Settings, default False, added 2026-05-22)** disables the `range_overshoot` NO branch: live data showed it lost -$57.61 / 56% win across many °C cities (Toronto/Buenos Aires/Shanghai/…) — our routine-METAR daily max reads hotter than Polymarket's resolver, so the "obviously locked" overshoot fires on a max the resolver never recorded. `range_undershoot` (+$8, 100%) and `range_in_window` are unaffected and read the flag live off `settings`.
 
 ### Forecast-exceedance alerts (`src/signals/forecast_exceedance.py`)
 
@@ -166,7 +167,7 @@ Diagnostic + Polymarket-discovery layer. Runs from `aggregate_state` every unifi
 - **v2 (residual slope, default when `PROJECTION_RESIDUAL_SLOPE_ENABLED=True` and ≥3 routines)**: `projected = forecast_peak + (current_residual + slope × min(hours_until_peak, RESIDUAL_SLOPE_HOURS_CAP=3))`. Slope clipped to ±`RESIDUAL_SLOPE_MAX_F_PER_HR=1.5°F/hr`; damped by `solar_decline_magnitude` and `cloud_rise_magnitude`.
 - **v1 (legacy halflife decay, fallback)**: `α·forecast_residual_f` (`α=exp(-h/2)`) plus damped trend-residual carry.
 
-For A/B logging, every exceedance line carries `projected=… (live v2), legacy_projected=… (v1)`. Promote/revert via `PROJECTION_RESIDUAL_SLOPE_ENABLED`.
+For A/B logging, every exceedance line carries `projected=… (live v2), legacy_projected=… (v1)`. Promote/revert via `PROJECTION_RESIDUAL_SLOPE_ENABLED` — code default is `True`, but **the live `.env` currently sets it `False`** (v2 overshoots the warming concavity at high-volume stations like KLAX/KJFK/RKSI/LFPG), so **v1 is the active projector pending a v3 redesign**.
 
 Optional Polymarket-discovery line via `projected_market_lookup.lookup_projected_binary`. Tunables live as module-level constants in `forecast_exceedance.py`; edit + restart.
 
@@ -178,12 +179,14 @@ All filters must pass:
 
 | Filter | Default | Source |
 |--------|---------|--------|
-| `edge >= MIN_EDGE` | 0.05 | `settings.MIN_EDGE` |
-| `our_probability >= MIN_PROBABILITY` | 0.85 | `settings.MIN_PROBABILITY` |
+| `edge >= MIN_EDGE` | 0.05 | `settings.MIN_EDGE` (overridable kwarg; `binary_market_edge` passes `THRESHOLD_MIN_EDGE` for threshold ops) |
+| `our_probability >= MIN_PROBABILITY` | 0.85 | `settings.MIN_PROBABILITY` (overridable kwarg; `binary_market_edge` passes `THRESHOLD_MIN_PROBABILITY` for threshold ops) |
 | `MIN_ENTRY_PRICE <= price <= MAX_ENTRY_PRICE` | 0.40 / 0.97 | `settings` |
 | `routine_count >= min_routine_count` | 3 | `settings.MIN_ROUTINE_COUNT` (overridable kwarg; lock-rule passes 2) |
 | `minutes_to_close >= MARKET_CLOSE_BUFFER_MINUTES` | 30 | `settings` |
 | `depth >= MIN_DEPTH_USD` | 10 | `settings` |
+
+**Operator-aware edge/probability floors (added 2026-05-23).** `_check_filters` takes optional `min_edge` / `min_probability` overrides (same pattern as `min_routine_count`). `binary_market_edge` passes `settings.THRESHOLD_MIN_EDGE` / `THRESHOLD_MIN_PROBABILITY` for **threshold ops only** (`above`/`at_least`/`below`/`at_most`); bracket-like ops keep the strict global floors + the three single-bucket NO guards. Both Settings default `None` (= use global, no behavior change) and take effect only when set via `.env`. Rationale: the global `MIN_PROBABILITY` was tightened to 0.85 for the 2026-05-08 *bracket* crisis (`MIN_EDGE` default is 0.05; the live `.env` overrides it to 0.10), but threshold markets were never the problem — the 7-day prod telemetry recoverable-band analysis (`evals-report --operator threshold`) showed the `prob∈[0.78,0.85)` threshold band wins ~91% at +0.57 EV/$1. `compute_edges` (multi-bucket bracket path) and the lock path stay on the global floors.
 
 ### Binary vs bracket markets
 
@@ -274,6 +277,7 @@ All knobs in `src/config.py` (Pydantic `Settings`, overridable via `.env`):
 - `BRACKET_MARKETS_ENABLED` (False) — gates whether unified pipeline + fast-poll evaluate `parsed_operator IN ('bracket','range')` at all. Threshold/`exactly` unaffected
 - `EXACTLY_MAX_LEAD_HOURS` (12.0, added 2026-05-22) — in the **probability path** (`binary_market_edge`), bracket-like markets (`exactly`/`range`/`bracket`) evaluated more than this many hours before the forecast **peak** are rejected with reason `bracket-like lead …h > Nh to peak`. **Lead is now measured to peak, not close (2026-05-23)** — for cities whose market close precedes the peak (e.g. Amsterdam: close 12:00 UTC, peak 14:00 UTC) the old time-to-close measure let pre-dawn bets through while the day's heating was still entirely ahead. Falls back to time-to-close when `hours_until_peak` is unknown. Live data: `exactly` prob-path trades lost -$126 in the 12-24h band but made +$57 in 0-12h. Threshold markets are exempt. The lock path is unaffected (observation-driven, naturally near peak)
 - `SINGLE_BUCKET_NO_BAND_MARGIN_F` (1.0, added 2026-05-23) + `SINGLE_BUCKET_MAX_NO_PROB` (0.92, added 2026-05-23) — two of the **three single-bucket NO guards** in `binary_market_edge` (the third reuses `EXACTLY_MAX_LEAD_HOURS` above). Defense against the incoherent "NO on every adjacent single-°C bucket" pattern (-$163.84 / 179 trades in the `model_prob ≥ 0.999` band, many °C cities). **Landing-band guard:** refuse a NO bet on a single-bucket (`exactly`/`range`/`bracket`) window overlapping `[current_max_f − margin, max(forecast_peak_f, current_max_f) + margin]` (the band collapses toward `current_max_f` once past peak) — never bet against a bucket the day could still plausibly land in. **Overconfidence cap:** floor `our_prob_yes` so NO confidence can't exceed `SINGLE_BUCKET_MAX_NO_PROB`. Both NO-side only; both no-ops for threshold ops and when forecast context is `None` (legacy callers)
+- `THRESHOLD_MIN_PROBABILITY` / `THRESHOLD_MIN_EDGE` (both `None`, added 2026-05-23) — per-operator-class loosening of `MIN_PROBABILITY` / `MIN_EDGE`. Applied by `binary_market_edge` to **threshold ops only**; bracket-like ops keep the strict globals. `None` = use global (no-op). Set via `.env` *after* validating with `evals-report --operator threshold` (the recoverable-band section recomputes `_check_filters` over candidate values and scores would-have-won vs the routine-METAR daily max). 7-day prod telemetry: the `prob∈[0.78,0.85)` threshold band wins ~91% at +0.57 EV/$1; `prob<0.75` degrades. **Pair with a sizing review:** `decisions-report` shows `stake_below_min` ($5 floor at small bankroll) is the dominant downstream throttle, so filter loosening recovers eval-volume but a chunk stalls before becoming a trade
 - `APPLY_CALIBRATION` (True) — refreshes the calibration cache each tick and applies the linear correction to the chosen side's probability before edge filtering. Requires ≥`MIN_CALIBRATION_SAMPLES=50` resolved trades; below that returns raw probability unchanged. See `src/signals/calibration.py`
 - `ORDER_RECONCILE_INTERVAL_MINUTES` (5), `ORDER_RECONCILE_LOOKBACK_HOURS` (24) — supplemented by a 7-day long-tail filter that catches null-fill delayed trades whose market is still recent (fixes the 2026-05-17 drift bug)
 - `RESOLVE_NO_PRICE_GRACE_HOURS` (4) — `resolve_trades` waits this long before marking null-fill trades LOST when the CLOB returns no price (the catch-22 gotcha)
@@ -337,14 +341,8 @@ Tests in `tests/test_<module>.py`. Mock external APIs at the module boundary (e.
 | `src/db/models.py` | SQLAlchemy ORM | `Market`, `Signal`, `Trade`, `EvaluationLog`, `DecisionLog`, `StationBias`, `MetarObservation`, `ForecastExceedanceAlert`, `ForecastArchive`, etc. |
 | `src/ingestion/forecast_archive.py` | Snapshots every `OpenMeteoForecast` blend into `ForecastArchive` for replay-capable backtests | `archive_forecast_snapshot` |
 | `src/config.py` | Pydantic settings | `settings` |
-| `src/cli.py` | CLI entry points | `run`, `scan`, `backfill`, `status`, `paper-trade`, `evals-report`, `backtest-v2`, `migrate`, `approve`, `test-trade`, `bet {place,info,search,find,cancel,orders,portfolio,redeem}`, `admin {reset-drawdown-peak,reconcile-stuck [--include-lost]}` |
-| `scripts/backtest_lock_rule.py` | Replay lock-rule trader against resolved markets + DB METARs | standalone |
-| `scripts/debug_pipeline.py` | Trace the unified pipeline for one market/station, no orders | standalone |
-| `scripts/inspect_loss.py` | Post-mortem drilldown for a single losing trade | standalone |
-| `scripts/backfill_station_bias_tz.py` | Idempotent recompute of station bias from DB METARs | one-shot |
-| `scripts/compare_projection_versions.py` | RMSE / mean-bias of v2 projection by station + lead bucket + alerted flag | standalone |
-| `scripts/station_calibration_report.py` | Per-ICAO markdown dashboard (bias, projection error, lock strike rate, Brier) | standalone |
-| `scripts/audit_lock_observed_max.py` | Recompute daily max from `metar_observations` for lock-rule LOST trades; flag snapshot contradictions | standalone |
+| `src/cli.py` | CLI entry points | `run`, `scan`, `backfill`, `status`, `paper-trade`, `evals-report` (`--operator threshold\|bracket-like`; operator-split reject reasons + recoverable-band win-rate/EV vs routine-METAR daily max), `decisions-report` (post-filter funnel by `outcome` + operator class + sizing-stall `size_reason`), `backtest-v2`, `migrate`, `approve`, `test-trade`, `bet {place,info,search,find,cancel,orders,portfolio,redeem}`, `admin {reset-drawdown-peak,reconcile-stuck [--include-lost]}` |
+| `debug_pipeline.py` (repo root) | Trace the unified pipeline for one market/station, no orders | standalone |
 
 ## Live Execution
 
@@ -359,10 +357,9 @@ Orders placed via `py-clob-client` in `src/execution/polymarket_client.py::place
 **Safety:**
 - `AUTO_EXECUTE=false` (default) — no orders sent; signals still logged + Telegram-notified.
 - `POLYMARKET_PRIVATE_KEY` empty → dry-run; `py_clob_client` never imported.
-- `DAILY_SPEND_CAP_USD=400` — hard 24h rolling cap (set in `.env`).
+- `DAILY_SPEND_CAP_USD` — hard 24h rolling cap (default 200; live `.env` overrides to 400).
 - `MIN_STAKE_USD=5` — orders below this skipped after drawdown multiplier.
 - `DrawdownMonitor` multiplies stake by level (`NORMAL=1.0`, `CAUTION=0.5`, `PAUSED=0.0`, `RECOVERY=0.5`).
-- Lock-rule auto-disable: `LOCK_RULE_LOSS_DISABLE_COUNT=3` losses within `LOCK_RULE_LOSS_WINDOW_HOURS=72` flips path off until manually re-enabled.
 
 ## Telemetry (calibration data sources)
 
@@ -386,7 +383,7 @@ Migration `j0k1l2m3n4o5_strategy_telemetry`. `signals` carries one row per `(mar
 - **Resolution is chain-gated, not CLOB-gated (changed 2026-05-19).** `resolve_trades` calls `bet_helpers.get_payout_outcome(condition_id)` → `payoutDenominator` on the Polygon ConditionalTokens contract as the **primary** signal. If UMA has reported (denom > 0) → map `payoutNumerators` to YES/NO and settle. If UMA hasn't reported and we're past `RESOLVE_NO_PRICE_GRACE_HOURS` (4h): null-fill rows → mark LOST (release exposure, order never landed); populated-fill rows → log WARNING telling the operator to run `admin reconcile-stuck`. The legacy CLOB-mid 0.95/0.05 heuristic is only used as a fallback when `market.condition_id IS NULL` (pre-caching legacy rows) or the Polygon RPC connection fails. **Why:** pre-fix, the bot flipped trades to WON whenever the CLOB mid crossed 0.95/0.05 — but on-chain UMA reporting can lag hours-to-days behind that signal. That window produced false `💸 redeem` Telegram nudges that, when the operator acted on them, reverted with `result for condition not received yet` from the ConditionalTokens contract. `_refresh_market_price` is now legacy-only.
 - **`job_reconcile_orders` includes WON+null-fill (since 2026-05-19).** Status filter is `PENDING/OPEN/WON` (LOST stays excluded — null-fill there is permanent). Backfills fill data on terminal rows that `resolve_trades` flipped before fill details landed; recomputes `pnl` against the corrected `entry_price` when the trade is already WON. Originally added because the on-chain-gating fix doesn't help the existing pre-fix stuck rows.
 - **Postgres `tradestatus` enum stores uppercase names** (`'WON'`/`'LOST'`/`'OPEN'`/`'PENDING'`). Raw SQL must use the uppercase form (SQLAlchemy uses enum names, not `.value`).
-- **`projected_max_f` in `forecast_exceedance_alerts` is whichever path is live (v2 by default).** The legacy v1 value is only in JSON logs (`legacy_projected=`), not the DB.
+- **`projected_max_f` in `forecast_exceedance_alerts` is whichever path is live (code default v2, but the live `.env` sets `PROJECTION_RESIDUAL_SLOPE_ENABLED=False` → v1 is currently active).** The other version's value is only in JSON logs (`legacy_projected=`), not the DB.
 - **Dry-run trades stay `PENDING` in BOTH paths and keep their requested `stake_usd`.** `place_order`'s dry-run branch sets `trade.exchange_status="dry_run"` without touching `stake_usd`. Both executors check that flag, leave `status=PENDING`, and emit a "(dry-run)" Telegram alert. **Invariant for new code:** any future query summing `Trade.stake_usd` must filter on `status IN (OPEN, WON, LOST)` (or exclude `exchange_status='dry_run'`); otherwise dry-run rows double-count.
 - **Hong Kong (VHHH) and Tel Aviv (LLBG) are silently skipped** even though they're in `CITIES`/`CITY_ICAO`. `_EXCLUDED_ICAOS` filters them at grouping because their Polymarket resolution station diverges from the routine METAR feed.
 - **Bracket markets (`parsed_operator IN ('bracket','range')`) are silently skipped by default** — `BRACKET_MARKETS_ENABLED=False` gates BOTH unified pipeline AND `job_fast_lock_poll`. Threshold/`exactly` unaffected by *that* gate (but see the next two bullets).
@@ -395,7 +392,7 @@ Migration `j0k1l2m3n4o5_strategy_telemetry`. `signals` carries one row per `(mar
 - **`range_overshoot` NO lock is disabled by default (2026-05-22).** `RANGE_OVERSHOOT_LOCK_ENABLED=False` — the branch lost -$57.61 / 56% win across many °C cities (resolver/observation divergence, not margins; 2× margin was already applied). `range_undershoot`/`range_in_window` still fire. Re-enabling requires fixing the °C resolver divergence first (see `docs/improvements.md`).
 - **Cluster-cap helper anti-correlation guard.** `_cluster_stake_used` sums currently-staked $ across same `parsed_location` + same `end_date.date()` (UTC) bracket/exactly cluster, excluding dry-run rows. Both paths reject if `cluster_used + new_stake > settings.CLUSTER_STAKE_CAP_USD`. Threshold markets unaffected (helper returns 0.0 for non-bracket-like operators).
 - **`apply_calibration` is on by default but degrades gracefully.** Needs ≥`MIN_CALIBRATION_SAMPLES=50` resolved trades. Below that, `get_calibration_coefficients` returns None and `apply_calibration` returns the raw probability unchanged with `applied=False`. Cache TTL 30 min in `_CACHE_TTL_SEC`.
-- **`MIN_EDGE` is harmonised on `settings.MIN_EDGE` (default 0.05).** Module-level `edge_calculator.MIN_EDGE` is kept as a re-export but `_check_filters` reads `settings.MIN_EDGE` directly. **The current `.env` has `MIN_EDGE=0.10`** — that env value wins via override; review before assuming default applies.
+- **`MIN_EDGE` is harmonised on `settings.MIN_EDGE` (default 0.05).** `_check_filters` reads `settings.MIN_EDGE` directly (the former module-level `edge_calculator.MIN_EDGE` re-export was removed). **The current `.env` has `MIN_EDGE=0.10`** — that env value wins via override; review before assuming default applies.
 - **`_fetch_orderbook` caches only successful fetches (30s).** Failures are not negative-cached, so two back-to-back calls to a dead token retry 3×3×throttle delay — except 404 ("No orderbook exists for the requested token id"), which short-circuits to `None` on attempt 1 and is silenced by `_CloudflareNoiseFilter`. Resolved markets surface as 404 here.
 - **`_get_client()` is thread-safe via `_client_build_lock`.** `bet portfolio` fans out `get_best_bid_ask` through `asyncio.to_thread`; without the lock every worker raced past the `is None` check and rebuilt the client, each posting to `/auth/api-key`. `bet_helpers.get_clob_client` now delegates to the same singleton instead of building its own. The 400 `Could not create api key` line (transparently retried as a GET-derive by the SDK) is also filtered out.
 - **FOK orders fully fill or cancel** — no partial fills; thin books leave trades in `PENDING`.

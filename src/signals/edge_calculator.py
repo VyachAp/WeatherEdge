@@ -16,11 +16,6 @@ from src.signals.probability_engine import BucketDistribution
 
 logger = logging.getLogger(__name__)
 
-# Re-exported for backwards compatibility — `settings.MIN_EDGE` is the
-# source of truth (default 0.05). Imports of `MIN_EDGE` from this module
-# now resolve to the configured value rather than a hardcoded constant.
-MIN_EDGE: float = settings.MIN_EDGE
-
 
 @dataclass
 class BucketEdge:
@@ -260,11 +255,20 @@ def binary_market_edge(
             round(side_prob_raw - side_price, 4), side_edge,
         )
 
+    # Threshold ops (above/at_least/below/at_most) were never the source of
+    # the bracket-overconfidence bleed that forced the global MIN_PROBABILITY
+    # / MIN_EDGE up, so they may run on the (optional) looser THRESHOLD_MIN_*
+    # floors. Bracket-like ops keep the strict global floors (None override)
+    # plus the three single-bucket NO guards below. Both overrides are None by
+    # default → no behavior change until set via .env after telemetry validation.
+    is_threshold = op in ("above", "at_least", "below", "at_most")
     reason = _check_filters(
         edge=side_edge, prob=side_prob, price=side_price,
         routine_count=routine_count,
         minutes_to_close=minutes_to_close,
         depth=side_depth,
+        min_edge=settings.THRESHOLD_MIN_EDGE if is_threshold else None,
+        min_probability=settings.THRESHOLD_MIN_PROBABILITY if is_threshold else None,
     )
 
     # Layer 1 — bracket-like (exactly/range/bracket) max-lead gate, measured
@@ -344,6 +348,8 @@ def _check_filters(
     minutes_to_close: float,
     depth: float,
     min_routine_count: int | None = None,
+    min_edge: float | None = None,
+    min_probability: float | None = None,
 ) -> str | None:
     """Return rejection reason or None if all filters pass.
 
@@ -357,12 +363,23 @@ def _check_filters(
     ``min_routine_count`` overrides ``settings.MIN_ROUTINE_COUNT`` for
     callers that have their own routine-count gate (e.g. the lock-rule path
     can fire on 2 routines for super-margin EASY locks).
-    """
-    if edge < settings.MIN_EDGE:
-        return f"edge {edge:.4f} < {settings.MIN_EDGE}"
 
-    if prob < settings.MIN_PROBABILITY:
-        return f"probability {prob:.4f} < {settings.MIN_PROBABILITY}"
+    ``min_edge`` / ``min_probability`` override ``settings.MIN_EDGE`` /
+    ``settings.MIN_PROBABILITY`` for callers that gate a specific operator
+    class (``binary_market_edge`` passes the threshold-only
+    ``THRESHOLD_MIN_*`` overrides). ``None`` = use the global setting, so
+    existing callers (``compute_edges``, the lock path) are unchanged.
+    """
+    eff_min_edge = settings.MIN_EDGE if min_edge is None else min_edge
+    eff_min_prob = (
+        settings.MIN_PROBABILITY if min_probability is None else min_probability
+    )
+
+    if edge < eff_min_edge:
+        return f"edge {edge:.4f} < {eff_min_edge}"
+
+    if prob < eff_min_prob:
+        return f"probability {prob:.4f} < {eff_min_prob}"
 
     if price < settings.MIN_ENTRY_PRICE:
         return f"price {price:.2f} < {settings.MIN_ENTRY_PRICE}"
