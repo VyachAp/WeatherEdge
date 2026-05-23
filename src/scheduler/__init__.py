@@ -441,6 +441,9 @@ async def job_unified_pipeline() -> None:
                         depth_yes=mkt_depth,
                         depth_no_fn=_no_depth_for_market,
                         yes_bid=yes_bid, yes_ask=yes_ask,
+                        forecast_peak_f=state.forecast_peak_f,
+                        current_max_f=state.current_max_f,
+                        hours_until_peak=state.hours_until_peak,
                     )
                     if edge_result is None:
                         logger.info(

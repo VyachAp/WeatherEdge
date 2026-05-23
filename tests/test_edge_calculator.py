@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
 
@@ -222,3 +223,126 @@ class TestBucketEdgeDirection:
             direction=TradeDirection.BUY_NO,
         )
         assert e.direction == TradeDirection.BUY_NO
+
+
+def _eval_binary(
+    *, question, threshold_f, op, our_prob_in_window,
+    yes_bid, yes_ask, forecast_peak_f, current_max_f, hours_until_peak,
+    end_hours=5, routine_count=5,
+):
+    """Drive `binary_market_edge` for a single market with the new
+    forecast/observation context kwargs that feed the single-bucket NO
+    guards. Mass is placed inside the bucket window (for bracket-like ops)
+    or at/above threshold (for threshold ops) so `our_prob_yes` is known.
+    """
+    from src.execution.binary_market import market_range_f
+    from src.signals.edge_calculator import binary_market_edge
+
+    market = SimpleNamespace(
+        id="m1", question=question,
+        parsed_threshold=threshold_f, parsed_operator=op,
+        current_yes_price=(yes_bid + yes_ask) / 2,
+        end_date=None, outcomes=["Yes", "No"],
+    )
+    rng = market_range_f(market)
+    probs: dict[int, float] = {}
+    if rng is not None:
+        low, high = rng
+        window = list(range(low, high + 1))
+        per = our_prob_in_window / len(window)
+        for b in window:
+            probs[b] = per
+        probs[low - 12] = max(0.0, 1.0 - our_prob_in_window)
+    else:
+        thr = int(round(threshold_f))
+        probs = {thr: our_prob_in_window, thr - 1: 1.0 - our_prob_in_window}
+
+    dist = BucketDistribution(
+        current_max_f=int(current_max_f), probabilities=probs, reasoning=["test"],
+    )
+    end_time = datetime.now(timezone.utc) + timedelta(hours=end_hours)
+    return binary_market_edge(
+        dist, market, end_time, routine_count=routine_count,
+        depth_yes=100.0, depth_no_fn=lambda: 100.0,
+        yes_bid=yes_bid, yes_ask=yes_ask,
+        forecast_peak_f=forecast_peak_f, current_max_f=current_max_f,
+        hours_until_peak=hours_until_peak,
+    )
+
+
+class TestSingleBucketNoGuards:
+    """Three layered guards stop the incoherent "NO on every adjacent
+    single-°C bucket" pattern (e.g. Amsterdam 2026-05-23: NO on 27/28/29°C
+    while the blended forecast was pinned at 30°C). All guards are no-ops
+    for threshold ops and when the forecast context isn't supplied.
+    """
+
+    Q28 = "Will the highest temperature in Amsterdam be 28°C on May 23"
+    Q30 = "Will the highest temperature in Amsterdam be 30°C on May 23"
+
+    def test_no_inside_landing_band_rejected(self):
+        from src.db.models import TradeDirection
+
+        # forecast 30°C (86.5°F), obs 23°C (73°F), 6.6h pre-peak. The 28°C
+        # window (82-83°F) sits inside the landing band [72, 87.5]°F.
+        edge = _eval_binary(
+            question=self.Q28, threshold_f=82.4, op="exactly",
+            our_prob_in_window=0.05, yes_bid=0.45, yes_ask=0.55,
+            forecast_peak_f=86.5, current_max_f=73.0, hours_until_peak=6.6,
+        )
+        assert edge.direction == TradeDirection.BUY_NO
+        assert edge.passes is False
+        assert "landing band" in (edge.reject_reason or "")
+
+    def test_no_above_band_passes(self):
+        from src.db.models import TradeDirection
+
+        # forecast 25.6°C (78°F), obs 23°C (73°F), 2h to peak. The 30°C
+        # window (86°F) is clear of the band [72, 79]°F → a genuinely
+        # out-of-reach NO bet still fires.
+        edge = _eval_binary(
+            question=self.Q30, threshold_f=86.0, op="exactly",
+            our_prob_in_window=0.10, yes_bid=0.45, yes_ask=0.55,
+            forecast_peak_f=78.0, current_max_f=73.0, hours_until_peak=2.0,
+        )
+        assert edge.direction == TradeDirection.BUY_NO
+        assert edge.passes is True
+        assert edge.reject_reason is None
+
+    def test_overconfidence_cap_clamps_no_prob(self):
+        # P(window)=0 would manufacture NO=1.0; the cap floors YES to
+        # 1 - 0.92 = 0.08, so the NO side can't exceed 0.92.
+        edge = _eval_binary(
+            question=self.Q30, threshold_f=86.0, op="exactly",
+            our_prob_in_window=0.0, yes_bid=0.45, yes_ask=0.55,
+            forecast_peak_f=78.0, current_max_f=73.0, hours_until_peak=2.0,
+        )
+        assert edge.our_probability == pytest.approx(0.92)
+
+    def test_peak_relative_lead_gate_uses_hours_until_peak(self):
+        # Only 2h to CLOSE but 13h to PEAK → rejected. Bucket is clear of the
+        # band, so it's unambiguously the peak-relative lead gate firing
+        # (the close-vs-peak bug that let pre-dawn Amsterdam bets through).
+        edge = _eval_binary(
+            question=self.Q30, threshold_f=86.0, op="exactly",
+            our_prob_in_window=0.10, yes_bid=0.45, yes_ask=0.55,
+            forecast_peak_f=78.0, current_max_f=73.0, hours_until_peak=13.0,
+            end_hours=2,
+        )
+        assert edge.passes is False
+        assert "lead" in (edge.reject_reason or "")
+        assert "peak" in (edge.reject_reason or "")
+
+    def test_threshold_market_unaffected_by_guards(self):
+        from src.db.models import TradeDirection
+
+        # at_least market, 13h to peak, forecast context supplied: threshold
+        # ops bypass the lead gate, the landing-band guard, and the cap.
+        edge = _eval_binary(
+            question="Will the highest temperature in Amsterdam be 82°F or higher",
+            threshold_f=82, op="at_least",
+            our_prob_in_window=0.90, yes_bid=0.45, yes_ask=0.55,
+            forecast_peak_f=86.0, current_max_f=73.0, hours_until_peak=13.0,
+        )
+        assert edge.direction == TradeDirection.BUY_YES
+        assert edge.passes is True

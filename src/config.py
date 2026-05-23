@@ -327,6 +327,25 @@ class Settings(BaseSettings):
     # unaffected.
     EXACTLY_MAX_LEAD_HOURS: float = 12.0
 
+    # Defense-in-depth for single-°C / single-bucket (exactly / range /
+    # bracket) NO bets in the PROBABILITY path. Root cause behind the
+    # -$163.84 / 179-trade `model_prob ≥ 0.999` NO loss class (many °C
+    # cities; e.g. Amsterdam 2026-05-23 bet NO on 27/28/29°C while the
+    # blended forecast was pinned at 30°C with a 1.1°C-wide Gaussian).
+    #
+    # SINGLE_BUCKET_NO_BAND_MARGIN_F — half-width of the "plausible landing
+    # band" margin (°F) around [observed_max, forecast_peak]. A NO bet on a
+    # single-bucket window overlapping that band is refused: never bet
+    # against a bucket the day could still plausibly land in. The band
+    # collapses toward the observed max once past peak, so genuinely
+    # out-of-reach NO bets still fire.
+    SINGLE_BUCKET_NO_BAND_MARGIN_F: float = 1.0
+    # SINGLE_BUCKET_MAX_NO_PROB — hard ceiling on NO-side confidence for
+    # single-bucket windows (floors `our_prob_yes` before the NO side is
+    # computed). Caps tail overconfidence independent of lead time so the
+    # ≥0.999 band can't recur.
+    SINGLE_BUCKET_MAX_NO_PROB: float = 0.92
+
     # The range_overshoot lock branch (NO when observed max overshoots the
     # range high by 2× margin) lost -$57.61 across 18 trades (56% win) on
     # exactly markets — systematic resolver/observation divergence (our

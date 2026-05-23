@@ -124,6 +124,9 @@ def binary_market_edge(
     depth_no_fn=None,
     yes_bid: float | None = None,
     yes_ask: float | None = None,
+    forecast_peak_f: float | None = None,
+    current_max_f: float | None = None,
+    hours_until_peak: float | None = None,
 ) -> BucketEdge | None:
     """Pick the best side (YES or NO) of a binary market and gate it.
 
@@ -152,6 +155,21 @@ def binary_market_edge(
     NO, so the additional CLOB call is skipped on the (more common) YES
     side.
 
+    ``forecast_peak_f`` / ``current_max_f`` / ``hours_until_peak`` carry the
+    ``WeatherState`` context used by three single-bucket (exactly/range/
+    bracket) NO-side guards — defense against the -$164 / 179-trade
+    ``model_prob ≥ 0.999`` NO loss class (e.g. betting NO on 27/28/29°C
+    while the forecast is pinned at 30°C):
+      * Layer 1 — lead gate measured to the forecast **peak** (not close).
+      * Layer 2 — refuse NO on a window inside the plausible landing band
+        ``[observed_max, forecast_peak]`` (± margin), collapsing toward the
+        observed max once past peak.
+      * Layer 3 — floor ``our_prob_yes`` so NO confidence ≤
+        ``SINGLE_BUCKET_MAX_NO_PROB``.
+    All three are no-ops for threshold ops (above/at_least/below/at_most).
+    When the context kwargs are ``None`` (legacy callers / tests) Layer 2 is
+    skipped and Layer 1 falls back to time-to-close.
+
     Returns the passing-side ``BucketEdge`` if one passes; otherwise the
     higher-edge candidate (with ``passes=False`` and a reject reason),
     so callers can still log what was attempted.
@@ -169,6 +187,10 @@ def binary_market_edge(
     yes_buy_price = yes_ask if (yes_ask is not None and yes_ask > 0) else mid_price
     no_buy_price = (1.0 - yes_bid) if (yes_bid is not None and yes_bid > 0) else (1.0 - mid_price)
     bucket_value: int
+    # Bucket window (°F) for bracket-like ops — drives the Layer 2 landing-band
+    # NO guard below. Stays None for threshold ops (no window).
+    bucket_low: int | None = None
+    bucket_high: int | None = None
 
     if op in ("above", "at_least"):
         threshold = int(market.parsed_threshold)
@@ -184,7 +206,14 @@ def binary_market_edge(
             return None
         low, high = rng
         bucket_value = (low + high) // 2
+        bucket_low, bucket_high = low, high
         our_prob_yes = sum(p for b, p in dist.probabilities.items() if low <= b <= high)
+        # Layer 3 — single-bucket overconfidence cap. Floor YES so the NO
+        # side can't exceed SINGLE_BUCKET_MAX_NO_PROB. Far from peak the
+        # Gaussian collapses P(a single ~2°F window) → ~0 and manufactures
+        # full-confidence NO; this caps that tail (the -$164 / 179-trade
+        # `model_prob ≥ 0.999` band) independent of lead time.
+        our_prob_yes = max(our_prob_yes, 1.0 - settings.SINGLE_BUCKET_MAX_NO_PROB)
     else:
         return None
 
@@ -238,22 +267,61 @@ def binary_market_edge(
         depth=side_depth,
     )
 
-    # Bracket-like (exactly/range/bracket) max-lead gate. Far from peak the
-    # Gaussian collapses P(a single ~2°F bucket) → ~0, manufacturing NO edge
-    # that empirically loses in the 12-24h lead band (-$126 live) while the
-    # 0-12h band is profitable (+$57). Applied after `_check_filters` under
-    # the `reason is None` guard so an edge that already fails (e.g. depth)
-    # keeps its original reason — the lead reason only marks edges that would
-    # otherwise have passed. Threshold ops are never in this tuple.
+    # Layer 1 — bracket-like (exactly/range/bracket) max-lead gate, measured
+    # against the forecast PEAK (not market close). Far from peak the Gaussian
+    # collapses P(a single ~2°F bucket) → ~0, manufacturing NO edge that
+    # empirically reverts. The lead is measured to peak because a market whose
+    # close precedes its peak (e.g. Amsterdam close 12:00 UTC, peak 14:00 UTC)
+    # would otherwise read as "near close" while the day's heating is still
+    # entirely ahead. Falls back to time-to-close when peak is unknown.
+    # Applied after `_check_filters` under the `reason is None` guard so an
+    # edge that already fails (e.g. depth) keeps its original reason — the
+    # lead reason only marks edges that would otherwise have passed. Threshold
+    # ops are never in this tuple.
+    lead_h = (
+        hours_until_peak if hours_until_peak is not None
+        else minutes_to_close / 60.0
+    )
     if (
         reason is None
         and op in ("exactly", "range", "bracket")
-        and minutes_to_close > settings.EXACTLY_MAX_LEAD_HOURS * 60.0
+        and lead_h > settings.EXACTLY_MAX_LEAD_HOURS
     ):
         reason = (
-            f"bracket-like lead {minutes_to_close / 60.0:.1f}h "
-            f"> {settings.EXACTLY_MAX_LEAD_HOURS:.0f}h max"
+            f"bracket-like lead {lead_h:.1f}h "
+            f"> {settings.EXACTLY_MAX_LEAD_HOURS:.0f}h to peak"
         )
+
+    # Layer 2 — plausible-landing-band guard (NO side only). Never bet NO on a
+    # single-bucket window the day could still plausibly land in: the band
+    # spans the observed max up to the forecast peak (collapsing toward the
+    # observed max once past peak, so genuinely out-of-reach NO bets still
+    # fire). Primary fix for the adjacent-NO loss class — e.g. NO on
+    # 27/28/29°C while the forecast was pinned at 30°C. Skipped when the
+    # forecast/observation context isn't supplied (legacy callers / tests).
+    if (
+        reason is None
+        and direction == TradeDirection.BUY_NO
+        and op in ("exactly", "range", "bracket")
+        and bucket_low is not None
+        and bucket_high is not None
+        and forecast_peak_f is not None
+        and current_max_f is not None
+    ):
+        margin = settings.SINGLE_BUCKET_NO_BAND_MARGIN_F
+        upper_anchor = (
+            current_max_f
+            if (hours_until_peak is not None and hours_until_peak <= 0)
+            else max(forecast_peak_f, current_max_f)
+        )
+        band_lo = current_max_f - margin
+        band_hi = upper_anchor + margin
+        # Reject when [bucket_low, bucket_high] overlaps [band_lo, band_hi].
+        if bucket_low <= band_hi and bucket_high >= band_lo:
+            reason = (
+                f"NO inside landing band [{band_lo:.0f},{band_hi:.0f}]°F "
+                f"(bucket [{bucket_low},{bucket_high}]°F)"
+            )
 
     return BucketEdge(
         bucket_value=bucket_value,

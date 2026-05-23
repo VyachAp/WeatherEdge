@@ -261,33 +261,59 @@ probability path) + correctness.
 `src/signals/mapper.py` (`CITY_ICAO` resolver-station mapping),
 `src/signals/state_aggregator.py::_routine_daily_max`.
 
-## [backlog] Tune EXACTLY_MAX_LEAD_HOURS once live data accrues
+## [partly-done] Tune EXACTLY_MAX_LEAD_HOURS once live data accrues
 
 **Why:** Shipped 2026-05-22 at 12.0h based on the historical PnL cliff
-(0-12h lead +$57 / 12-24h -$126 on the probability path). With a few
-weeks of live `evaluation_logs` carrying the new `bracket-like lead …`
-reject reason, re-fit the cutoff (10h vs 12h vs require-past-peak).
-**Success criteria:** updated `EXACTLY_MAX_LEAD_HOURS` backed by ≥3
-weeks of post-gate live data; consider replacing the time proxy with a
-direct `state.hours_until_peak <= 0` (past-peak) gate.
+(0-12h lead +$57 / 12-24h -$126 on the probability path).
+**Done 2026-05-23:** the gate now measures lead to the forecast **peak**
+(`state.hours_until_peak`, falling back to time-to-close), fixing the
+close-vs-peak mismatch that let pre-dawn Amsterdam bets through (close
+12:00 UTC, peak 14:00 UTC). **Still open:** re-fit the 12h cutoff with ≥3
+weeks of post-gate live `evaluation_logs` (10h vs 12h vs require-past-peak).
 **Effort:** 1-2h analysis + `.env` change.
 **Leverage:** revenue (marginal tuning).
 **Files:** `src/config.py` (`EXACTLY_MAX_LEAD_HOURS`),
 `src/signals/edge_calculator.py::binary_market_edge`.
 
-## [backlog] Single-bucket overconfidence cap (defense-in-depth)
+## [done] 2026-05-23 Single-bucket NO guards (landing band + overconfidence cap)
 
 **Why:** The `exactly` probability-path losses concentrate in the
-`model_prob ≥ 0.999` band (-$163.84 / 179 trades): the Gaussian
-collapses P(a single ~2°F bucket) → ~0 and bets NO at full confidence,
-but the bucket hits ~28%. The max-lead gate removes most of this by
-timing, but a probability floor on single-bucket windows would cap the
-overconfidence directly (e.g. floor P(window) so `model_prob_NO` can't
-exceed ~0.92), independent of lead time.
-**Success criteria:** `binary_market_edge` clamps the single-bucket
-`our_prob_yes` to a floor before computing the NO side; the ≥0.999
-band disappears from `evaluation_logs`.
-**Effort:** 2-3h + tests.
-**Leverage:** risk (caps tail overconfidence even inside the 0-12h window).
+`model_prob ≥ 0.999` band (-$163.84 / 179 trades): each single-°C bucket
+is evaluated as an independent binary, so a tight Gaussian centered on an
+over-forecast peak makes every neighbouring bucket look near-impossible →
+NO passes on all of them (Amsterdam 2026-05-23 traced case: NO on
+27/28/29°C while the blend was pinned at 30°C with σ collapsed to ~1.1°C).
+**Shipped:** `binary_market_edge` now takes `forecast_peak_f` /
+`current_max_f` / `hours_until_peak` and applies, NO-side only on
+bracket-like ops: (1) **landing-band** guard — refuse NO on a window
+overlapping `[current_max − margin, max(forecast_peak, current_max) + margin]`
+(`SINGLE_BUCKET_NO_BAND_MARGIN_F=1.0`), collapsing to the observed max once
+past peak; (2) **overconfidence cap** — floor `our_prob_yes` so NO ≤
+`SINGLE_BUCKET_MAX_NO_PROB=0.92`; (3) peak-relative lead gate (above). All
+three Amsterdam bets reject under their historical inputs (verified replay).
+**Still to confirm:** that the ≥0.999 NO band disappears from live
+`evaluation_logs` over the coming weeks.
 **Files:** `src/signals/edge_calculator.py::binary_market_edge`,
+`src/config.py`, `src/scheduler/__init__.py` (call site),
+`tests/test_edge_calculator.py::TestSingleBucketNoGuards`.
+
+## [backlog] Lead-time-aware σ floor (deferred from the 2026-05-23 NO-guards work)
+
+**Why:** Root cause one layer below the single-bucket NO guards. In
+`_compute_sigma`, tight inter-model ensemble agreement collapses σ to the
+global `ENSEMBLE_MIN_SIGMA_F=2.0°F` (the hours-based schedule only applies
+as a ×0.5 *soft* floor). On 2026-05-23 EHAM had σ≈1.1°C **11.5 h before
+peak** because 4 models agreed — but inter-model agreement ≠ accuracy
+(forecast oscillated 28.8–30.7°C tick-to-tick that morning). A σ floor
+that scales with `hours_until_peak` would widen distributions far from
+peak and de-bias overconfident NO/YES across **all** cities and market
+types — including the profitable threshold path, which is why it was
+deferred from the surgical NO-guard fix.
+**Success criteria:** `_compute_sigma` floors σ to the full hours-based
+schedule (not ×0.5) when far from peak; backtest-v2 calibration
+(Brier / per-bucket) on threshold markets does not regress.
+**Effort:** 2-3h + backtest-v2 gate.
+**Leverage:** correctness/risk (global calibration), but must not de-tune
+the working threshold path.
+**Files:** `src/signals/probability_engine.py::_compute_sigma`,
 `src/config.py`.
