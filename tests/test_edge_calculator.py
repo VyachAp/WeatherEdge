@@ -311,13 +311,44 @@ class TestSingleBucketNoGuards:
 
     def test_overconfidence_cap_clamps_no_prob(self):
         # P(window)=0 would manufacture NO=1.0; the cap floors YES to
-        # 1 - 0.92 = 0.08, so the NO side can't exceed 0.92.
+        # 1 - SINGLE_BUCKET_MAX_NO_PROB, so the NO side can't exceed the cap.
+        # Reads the live setting so it tracks the config (cap was 0.92, now 0.85).
+        from src.config import settings
+
         edge = _eval_binary(
             question=self.Q30, threshold_f=86.0, op="exactly",
             our_prob_in_window=0.0, yes_bid=0.45, yes_ask=0.55,
             forecast_peak_f=78.0, current_max_f=73.0, hours_until_peak=2.0,
         )
-        assert edge.our_probability == pytest.approx(0.92)
+        assert edge.our_probability == pytest.approx(settings.SINGLE_BUCKET_MAX_NO_PROB)
+
+    def test_widened_margin_rejects_bucket_that_narrow_band_allowed(self, monkeypatch):
+        from src.config import settings
+        from src.db.models import TradeDirection
+
+        # forecast 25.6°C (78°F), obs 73°F, 2h to peak, bucket 80°F. Under a
+        # 1.0°F margin the band is [72, 79] and 80 squeaks through; under the
+        # tightened 2.5°F margin the band is [70.5, 80.5] and 80 is refused.
+        # Pin the margin so the test is independent of the shipped default.
+        q80 = "Will the highest temperature in Amsterdam be 80°F on May 23"
+
+        monkeypatch.setattr(settings, "SINGLE_BUCKET_NO_BAND_MARGIN_F", 1.0)
+        edge = _eval_binary(
+            question=q80, threshold_f=80.0, op="exactly",
+            our_prob_in_window=0.05, yes_bid=0.45, yes_ask=0.55,
+            forecast_peak_f=78.0, current_max_f=73.0, hours_until_peak=2.0,
+        )
+        assert edge.direction == TradeDirection.BUY_NO
+        assert edge.passes is True
+
+        monkeypatch.setattr(settings, "SINGLE_BUCKET_NO_BAND_MARGIN_F", 2.5)
+        edge = _eval_binary(
+            question=q80, threshold_f=80.0, op="exactly",
+            our_prob_in_window=0.05, yes_bid=0.45, yes_ask=0.55,
+            forecast_peak_f=78.0, current_max_f=73.0, hours_until_peak=2.0,
+        )
+        assert edge.passes is False
+        assert "landing band" in (edge.reject_reason or "")
 
     def test_peak_relative_lead_gate_uses_hours_until_peak(self):
         # Only 2h to CLOSE but 13h to PEAK → rejected. Bucket is clear of the

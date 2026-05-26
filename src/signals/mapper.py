@@ -7,7 +7,7 @@ pipeline and other modules.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from zoneinfo import ZoneInfo
 
 from dateutil import parser as dateutil_parser
@@ -628,38 +628,39 @@ ICAO_TIMEZONE: dict[str, str] = {
 }
 
 
-_DATA_DAY_BACKDATE_HOURS = 12
-
-
 def resolve_target_local_day(
     end_date: datetime | None,
     tz: ZoneInfo,
 ) -> "date | None":
     """Resolve the local calendar day a market is asking about.
 
-    Polymarket weather markets close at a UTC instant (``end_date``) that
-    sits just after the resolved local data day has finished. Wunderground
-    has published the previous-local-day max by then, and Polymarket reads
-    it to settle. Subtracting a half-day from ``end_date`` and projecting
-    into the station's timezone always lands inside the data day:
+    The data day == the question-text day ("May 27") == ``end_date``'s **UTC
+    calendar date**, for *both* eastern and western cities. Polymarket daily
+    temperature markets close at ``end_date`` = the title day at **noon UTC**
+    (verified empirically: 29,940/30,060 markets close at 12:00 UTC and
+    ``end_date::date`` in UTC equals ``parsed_target_date`` exactly). That
+    noon-UTC date is the local day whose max the market resolves on:
 
-      * Atlanta (UTC-4), end Apr 26 12:00 UTC, anchor = Apr 26 00:00 UTC
-        → Apr 25 20:00 EDT → **Apr 25** (yesterday for Atlanta — correct;
-        the market is asking about Apr 25 EDT's max).
-      * Tokyo (UTC+9), end Apr 26 12:00 UTC, anchor = Apr 26 00:00 UTC
-        → Apr 26 09:00 JST → **Apr 26** (today for Tokyo — correct; market
-        closes around sunset Tokyo time, after the day's heat).
+      * São Paulo (UTC-3), end May 27 12:00 UTC → **May 27** (SBGR's May 27
+        max; verified against resolved trades vs actual METAR daily maxes).
+      * Seoul (UTC+9), end May 25 12:00 UTC → **May 25** (RKSI's May 25 max).
 
-    Note: the question text's "April 26" is just Polymarket's UTC-based
-    label and does **not** reliably indicate the data day in local time.
-    Trust ``end_date`` instead.
+    The ``tz`` parameter is retained for caller/signature compatibility but is
+    no longer needed — the title day is timezone-independent.
+
+    History: this previously subtracted 12h from ``end_date`` and projected
+    into ``tz``. That was correct for eastern (+UTC) cities by coincidence
+    (noon − 12h = midnight UTC, which stays on the title day after a +9..+13
+    offset) but returned **title day − 1** for negative-UTC cities (the
+    midnight-UTC anchor rolls back to the previous local evening). That bug
+    made the pipeline trade the *next* day's Americas market a day early
+    using today's weather state.
     """
-    from datetime import timedelta as _td
-
     if end_date is None:
         return None
-    anchor = end_date - _td(hours=_DATA_DAY_BACKDATE_HOURS)
-    return anchor.astimezone(tz).date()
+    if end_date.tzinfo is not None:
+        end_date = end_date.astimezone(timezone.utc)
+    return end_date.date()
 
 
 def today_local(tz: ZoneInfo) -> "date":

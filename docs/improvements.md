@@ -362,3 +362,44 @@ schedule (not ×0.5) when far from peak; backtest-v2 calibration
 the working threshold path.
 **Files:** `src/signals/probability_engine.py::_compute_sigma`,
 `src/config.py`.
+---
+
+## [backlog] `exactly` NO: close the °C resolver divergence (deeper than the knobs)
+
+**Date:** 2026-05-26.
+
+**Context.** After the 2026-05-26 data-day fix (negative-UTC cities no longer
+bet the next day's market early) and the single-bucket NO knob retune
+(`SINGLE_BUCKET_NO_BAND_MARGIN_F` 1.0→2.5, `SINGLE_BUCKET_MAX_NO_PROB`
+0.92→0.85), the `exactly` NO class is the residual loss source.
+
+**Key finding from `evals-report --operator bracket-like`.** Scored against
+our **routine-METAR daily max on the corrected target day**, the currently-passing
+bracket-like NO evals win ~81% (+0.072 EV/$1) — but the *real fills* over the
+same window won only ~61%. That ~20pp gap is **resolver divergence**: our
+routine-METAR daily max diverges from Polymarket's resolver (same root cause
+that disabled `range_overshoot`). It means the telemetry validator's ground
+truth is partly circular (the bot's NO conviction is built from the same data
+source it's scored against), so the margin/cap grid can't cleanly separate
+real winners from losers — the candidates mostly just trade volume for a tiny
+EV delta. The 2.5/0.85 retune is therefore a *risk-reduction / volume cut*,
+not a calibration fix.
+
+**Two deeper levers (either could make `exactly` NO genuinely +EV):**
+1. **Resolver-divergence correction.** Quantify, per station (and per °C vs °F),
+   the signed gap between our routine-METAR daily max and the resolved outcome
+   (from settled trades), then shift/penalise single-bucket NO conviction by it.
+   Needs a reliable resolved-max source per market — the cleanest is back-solving
+   from settled trade WON/LOST across all buckets of an event.
+2. **Lead-time-aware σ floor** (already logged separately): a tight ensemble far
+   from peak collapses σ and over-excludes neighbouring buckets. Raising the σ
+   floor as a function of `hours_until_peak` widens single-bucket probs so fewer
+   overconfident NO bets pass. `backtest-v2` *does* exercise `compute_distribution`,
+   so this one is replay-validatable (unlike the `binary_market_edge` guards).
+
+**Effort:** medium; both need a per-station resolved-max ground truth that isn't
+the routine-METAR feed. Until then the knobs are the best available lever.
+**Files:** `src/signals/edge_calculator.py::binary_market_edge`,
+`src/signals/probability_engine.py::_compute_sigma`, `src/cli.py`
+(`_single_bucket_no_band_section` — extend ground truth to settled-trade-derived
+resolved max).

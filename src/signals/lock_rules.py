@@ -80,10 +80,10 @@ def _market_daily_max(
     """Compute max + count of routine METARs for the market's target day.
 
     Target day = ``resolve_target_local_day(market_end_date, station_tz)``,
-    which canonically lands on the LOCAL day whose max the market is
-    asking about (Polymarket's question-text "April 26" is a UTC-based
-    label and does not necessarily mean Apr 26 local). The window is the
-    full local calendar day, capped at ``min(market_end_date, now_utc)``.
+    which is the title day = ``market_end_date``'s UTC date = the LOCAL day
+    whose max the market resolves on (the question-text "May 27" IS that
+    day, for both eastern and western cities). The window is the full local
+    calendar day, capped at ``min(market_end_date, now_utc)``.
 
     Returns (None, 0) when no METARs fall in the window (e.g. market
     hasn't started yet, or station has no recent data).

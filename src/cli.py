@@ -442,6 +442,187 @@ async def _recoverable_band_section(session, rows, op_of) -> None:
     click.echo()
 
 
+async def _single_bucket_no_band_section(session, rows, op_of) -> None:
+    """Tune the single-bucket NO guards against actual outcomes.
+
+    The ``exactly`` (single-°C bucket) ``BUY_NO`` class is the bot's #1 loss
+    source. The 2026-05-23 guards live in :func:`binary_market_edge` as the
+    landing-band margin (``SINGLE_BUCKET_NO_BAND_MARGIN_F``) and the
+    NO-confidence cap (``SINGLE_BUCKET_MAX_NO_PROB``). ``backtest-v2`` does NOT
+    exercise ``binary_market_edge``, so telemetry is the only offline way to
+    pick magnitudes.
+
+    For each candidate ``(margin, cap)`` we recompute both guards over the
+    bracket-like NO evals that CURRENTLY pass, using the forecast/observation
+    context recorded on each row (``forecast_peak_f / current_max_f /
+    hours_until_peak``, migration ``p6q7r8s9t0u1``):
+
+      * Layer 2 — bucket window overlaps ``[current_max−margin,
+        max(forecast_peak,current_max)+margin]`` (collapsing toward
+        current_max past peak).
+      * Layer 3 — ``no_prob`` clamped to ``min(no_prob, cap)``; the NO bet is
+        then blocked if its recomputed edge / prob fall under the bracket-like
+        global floors.
+
+    The blocked set is scored against the actual routine-METAR daily max
+    (NO wins iff the max lands OUTSIDE the bucket window). A good ``(margin,
+    cap)`` blocks a set with a HIGH lost-rate (we kill losers) while leaving
+    survivors whose won% clears break-even (mean NO price). Ground truth is
+    routine-METAR-derived and diverges from Polymarket's resolver for °C
+    cities — advisory, same caveat as the threshold band.
+    """
+    from src.config import settings
+    from src.execution.binary_market import market_range_f
+    from src.signals.mapper import (
+        icao_for_location,
+        icao_timezone,
+        resolve_target_local_day,
+    )
+
+    click.echo("## Single-bucket NO guard tuning (bracket-like ops)")
+    click.echo()
+
+    no_rows = [
+        r for r in rows
+        if _op_class(op_of[r.market_id]) == "bracket-like"
+        and r.signal_kind == "probability"
+        and r.direction.value == "BUY_NO"
+        and r.passes
+        and r.forecast_peak_f is not None
+        and r.current_max_f is not None
+        and r.model_prob is not None
+        and r.market_prob is not None
+    ]
+    if not no_rows:
+        click.echo(
+            "_No currently-passing bracket-like NO evals with forecast context "
+            "(pre-2026-05-23 rows lack it)._"
+        )
+        click.echo()
+        return
+
+    market_map = await _load_market_map(session, (r.market_id for r in no_rows))
+    created = [r.created_at for r in no_rows]
+    win_start = min(created) - timedelta(days=2)
+    win_end = max(created) + timedelta(days=2)
+    icaos = {
+        icao_for_location(m.parsed_location)
+        for m in market_map.values() if m.parsed_location
+    }
+    daily_max = await _daily_max_by_station_day(session, icaos, win_start, win_end)
+
+    def _bucket_window(row) -> tuple[int, int] | None:
+        m = market_map.get(row.market_id)
+        return market_range_f(m) if m is not None else None
+
+    def _no_won(row) -> bool | None:
+        """True if the NO side won (daily max landed OUTSIDE the bucket)."""
+        m = market_map.get(row.market_id)
+        rng = _bucket_window(row)
+        if m is None or rng is None or m.parsed_location is None or m.end_date is None:
+            return None
+        icao = icao_for_location(m.parsed_location)
+        if icao is None:
+            return None
+        target_day = resolve_target_local_day(m.end_date, icao_timezone(icao))
+        if target_day is None:
+            return None
+        amax = daily_max.get((icao, target_day))
+        if amax is None:
+            return None
+        low_f, high_f = rng
+        return not (low_f <= round(amax) <= high_f)
+
+    def _blocked(row, margin: float, cap: float) -> bool:
+        """Would (margin, cap) block this currently-passing NO bet?"""
+        # Layer 2 — landing band.
+        rng = _bucket_window(row)
+        if rng is not None:
+            low_f, high_f = rng
+            past_peak = (
+                row.hours_until_peak is not None and row.hours_until_peak <= 0
+            )
+            upper_anchor = (
+                row.current_max_f if past_peak
+                else max(row.forecast_peak_f, row.current_max_f)
+            )
+            band_lo = row.current_max_f - margin
+            band_hi = upper_anchor + margin
+            if low_f <= band_hi and high_f >= band_lo:
+                return True
+        # Layer 3 — clamp no_prob to the cap, re-check edge/prob floors.
+        capped_no = min(row.model_prob, cap)
+        no_edge = round(capped_no - row.market_prob, 4)
+        if no_edge < settings.MIN_EDGE or capped_no < settings.MIN_PROBABILITY:
+            return True
+        return False
+
+    def _score(subset) -> tuple[int, int, int, float, float]:
+        """(count, resolved, no_won, mean_no_price, mean_ev_per_$1)."""
+        won = resolved = 0
+        prices: list[float] = []
+        evs: list[float] = []
+        for r in subset:
+            gt = _no_won(r)
+            if gt is None:
+                continue
+            resolved += 1
+            prices.append(r.market_prob)
+            if gt:
+                won += 1
+                evs.append((1.0 / r.market_prob - 1.0) if r.market_prob > 0 else 0.0)
+            else:
+                evs.append(-1.0)
+        be = (sum(prices) / len(prices)) if prices else 0.0
+        ev = (sum(evs) / len(evs)) if evs else 0.0
+        return len(subset), resolved, won, be, ev
+
+    cur_margin = settings.SINGLE_BUCKET_NO_BAND_MARGIN_F
+    cur_cap = settings.SINGLE_BUCKET_MAX_NO_PROB
+    click.echo(
+        f"_Currently-passing bracket-like NO evals: {len(no_rows):,}. "
+        f"Current guards: margin={cur_margin}°F, cap={cur_cap}. "
+        f"Ground truth = routine-METAR daily max (advisory for °C cities)._"
+    )
+    click.echo()
+
+    # Baseline — the status quo passing NO set (these fired and bled).
+    n, res, won, be, ev = _score(no_rows)
+    won_pct = f"{won/res*100:5.1f}%" if res else "  n/a"
+    click.echo(
+        "| (margin, cap) | Blocked | Blk resolved | Blk LOST% (saved) | "
+        "Survivors | Surv won% | Surv EV/$1 |"
+    )
+    click.echo("|---|---:|---:|---:|---:|---:|---:|")
+    click.echo(
+        f"| baseline {cur_margin}/{cur_cap} (all passing) | 0 | — | — | "
+        f"{n:,} | {won_pct} | {ev:+.3f} |"
+    )
+
+    candidates: list[tuple[float, float]] = [
+        (1.5, cur_cap), (2.0, cur_cap), (2.5, cur_cap), (3.0, cur_cap),
+        (cur_margin, 0.90), (cur_margin, 0.88), (cur_margin, 0.85), (cur_margin, 0.80),
+        (2.0, 0.88), (2.0, 0.85), (2.5, 0.85),
+    ]
+    seen: set[tuple[float, float]] = set()
+    for margin, cap in candidates:
+        if (margin, cap) in seen or (margin <= cur_margin and cap >= cur_cap):
+            continue
+        seen.add((margin, cap))
+        blocked = [r for r in no_rows if _blocked(r, margin, cap)]
+        survivors = [r for r in no_rows if r not in blocked]
+        bn, bres, bwon, _, _ = _score(blocked)
+        # Of the resolved blocked, the fraction the NO side would have LOST.
+        blk_lost_pct = f"{(bres - bwon)/bres*100:5.1f}%" if bres else "  n/a"
+        sn, sres, swon, _, sev = _score(survivors)
+        surv_won_pct = f"{swon/sres*100:5.1f}%" if sres else "  n/a"
+        click.echo(
+            f"| margin {margin}, cap {cap} | {bn:,} | {bres:,} | {blk_lost_pct} | "
+            f"{sn:,} | {surv_won_pct} | {sev:+.3f} |"
+        )
+    click.echo()
+
+
 @main.command("evals-report")
 @click.option("--days", default=30, show_default=True, help="Look-back window in days.")
 @click.option(
@@ -598,6 +779,15 @@ def evals_report(days: int, signal_kind: str | None, operator_class: str | None)
             #     would-have-won rate clears its break-even (mean price) is +EV
             #     and safe to recover; a coin-flip / -EV band is correctly cut.
             await _recoverable_band_section(session, rows, op_of)
+
+            # --- 1d. Single-bucket NO guard tuning (BRACKET-LIKE ops). The
+            #     mirror of the threshold band for the `exactly` NO loss class:
+            #     recompute the landing-band + NO-cap guards over the passing
+            #     bracket-like NO evals for a grid of (margin, cap) and score
+            #     the blocked set against the actual daily max. Pick the
+            #     (margin, cap) that kills the most losers while leaving
+            #     survivors above break-even.
+            await _single_bucket_no_band_section(session, rows, op_of)
 
             # --- 2. Split by signal_kind so the user can spot if e.g. the
             #     probability path is dominated by rejects while lock fires

@@ -336,12 +336,24 @@ class Settings(BaseSettings):
     # against a bucket the day could still plausibly land in. The band
     # collapses toward the observed max once past peak, so genuinely
     # out-of-reach NO bets still fire.
-    SINGLE_BUCKET_NO_BAND_MARGIN_F: float = 1.0
+    #
+    # Tightened 1.0 → 2.5°F (2026-05-26). The `exactly` NO class was the #1
+    # real-money loss source (61% win vs ~78% breakeven on fills). 2.5°F ≈
+    # 1.4°C, so the band now refuses NO on the forecast/observed bucket AND
+    # its immediate °C neighbours — a hedge against the ±~1°C divergence
+    # between our routine-METAR daily max and Polymarket's resolver (the same
+    # divergence that disabled `range_overshoot`). Validated via `evals-report
+    # --operator bracket-like` (the single-bucket-NO-guard-tuning section):
+    # margin 2.5 / cap 0.85 gave the best survivor EV while cutting ~58% of NO
+    # volume.
+    SINGLE_BUCKET_NO_BAND_MARGIN_F: float = 2.5
     # SINGLE_BUCKET_MAX_NO_PROB — hard ceiling on NO-side confidence for
     # single-bucket windows (floors `our_prob_yes` before the NO side is
     # computed). Caps tail overconfidence independent of lead time so the
-    # ≥0.999 band can't recur.
-    SINGLE_BUCKET_MAX_NO_PROB: float = 0.92
+    # ≥0.999 band can't recur. Tightened 0.92 → 0.85 (2026-05-26): with
+    # MIN_EDGE=0.10 this effectively restricts NO to prices ≤ ~0.75 (better
+    # risk/reward), pruning the marginal near-certain NO bets that bled.
+    SINGLE_BUCKET_MAX_NO_PROB: float = 0.85
 
     # The range_overshoot lock branch (NO when observed max overshoots the
     # range high by 2× margin) lost -$57.61 across 18 trades (56% win) on
