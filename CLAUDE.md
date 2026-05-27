@@ -214,9 +214,11 @@ Bias is recorded against the deterministic single-source peak (not the ensemble 
 3. Total exposure cap: `max(MAX_EXPOSURE_PCT=25% × bankroll, MAX_EXPOSURE_USD_FLOOR=$300)` minus current open exposure. The USD floor binds at small bankroll (< ~$1200) so a few stuck OPEN trades can't pin the cap and silence the bot — added 2026-05-17 after that exact failure mode silenced trading for ~24h
 4. Hard USD cap: `MAX_POSITION_USD=200`
 5. Orderbook depth cap: `DEPTH_POSITION_CAP_PCT=20%` of visible depth
-6. Minimum viable trade: `MIN_TRADE_USD=5` (below returns 0)
+6. Minimum viable trade: `MIN_TRADE_USD=5` (below returns 0, unless `floor_to_usd` is passed — see below)
 
 Drawdown monitor multiplier (`DrawdownMonitor.check`) is applied on top of Kelly stake before the `MIN_STAKE_USD` check. The lock-rule path (`size_locked_position`) uses fixed sizing instead of Kelly: `LOCK_POSITION_PCT=2%`, capped at `MAX_POSITION_USD/2=$100` and 15% of depth — but `MAX_EXPOSURE_PCT`, `MIN_TRADE_USD`, and drawdown multiplier still apply.
+
+**Near-peak floor-up (2026-05-28).** Both sizers take an optional `floor_to_usd`: when the post-cap stake lands in `(0, MIN_TRADE_USD)`, the stake is floored up to `min(floor_to_usd, tightest_cap_ceiling)` via `_apply_floor` *instead of* dropping to 0 — but only if that result is still ≥ `MIN_TRADE_USD` (a thin book / near-full exposure clamps it back below $5 → still drops, so the floor can never breach a cap). Reason becomes `floored to $X (near-peak)`. The floor is **pre-drawdown-multiplier** — CAUTION/RECOVERY 0.5× still applies on top (set the floor to 2× MIN if you want it to survive half-sizing), and a PAUSED multiplier of 0 still zeroes it. Callers gate via `near_peak_floor_eligible` (in `binary_market.py`): **threshold ops only** (`exactly`/`range`/`bracket` excluded — validate-first) AND (recorded prob ≥ `NEAR_PEAK_FLOOR_UP_MIN_PROB` OR `|hours_until_peak| ≤ NEAR_PEAK_FLOOR_UP_MAX_HOURS`). Master switch `NEAR_PEAK_FLOOR_UP_ENABLED` (default False = no behavior change). Motivation: at a small bankroll, Kelly (× `KELLY_PROB_CAP`) sizes high-confidence near-peak threshold bets below $5, dropping ~all of them — the dominant volume throttle once drawdown is healthy (post-fix telemetry: 80 distinct passing past-peak markets, only 2 traded). Success-path `decision_logs` carry `metadata.floored_up` for attribution.
 
 #### Drawdown state machine (`src/risk/drawdown.py`)
 
@@ -230,6 +232,8 @@ Four states. Multipliers in parentheses:
 | `RECOVERY` (0.5) | `dd_pct < CAUTION_THRESHOLD` AND previous was CAUTION/PAUSED/RECOVERY — hysteresis so the bot doesn't snap back to full size on a single up-tick |
 
 Exit `RECOVERY` → `NORMAL` only when `current_bankroll >= peak`.
+
+The `CAUTION_THRESHOLD` / `PAUSE_THRESHOLD` are now **Settings-overridable** (`DRAWDOWN_CAUTION_THRESHOLD=0.10` / `DRAWDOWN_PAUSE_THRESHOLD=0.20`; `check()` reads them live, module constants are the defaults) — widen for a small iteration-mode bankroll that a stale peak would otherwise perma-PAUSE. **Peak is reloaded on a TTL (2026-05-28):** `_get_drawdown_monitor()` re-calls `load_state()` every `_DRAWDOWN_PEAK_RELOAD_TTL=300s`, so `admin reset-drawdown-peak` (a newer `bankroll_log` row with `peak=equity`) takes effect on the running process within ~5 min **without a restart** — previously `_peak` loaded once at boot, so the silencer recurred until manual restart (the May 21 / May 27 stale-peak PAUSE that zeroed ~90 candidates/day). Reloading a *lower* peak is safe: `check()` re-maxes against live equity, so it can only relax an over-tight pause, never under-protect.
 
 #### Bankroll = equity, not wallet liquidity (`src/resolution.py`)
 
@@ -282,6 +286,8 @@ All knobs in `src/config.py` (Pydantic `Settings`, overridable via `.env`):
 - `ORDER_RECONCILE_INTERVAL_MINUTES` (5), `ORDER_RECONCILE_LOOKBACK_HOURS` (24) — supplemented by a 7-day long-tail filter that catches null-fill delayed trades whose market is still recent (fixes the 2026-05-17 drift bug)
 - `RESOLVE_NO_PRICE_GRACE_HOURS` (4) — `resolve_trades` waits this long before marking null-fill trades LOST when the CLOB returns no price (the catch-22 gotcha)
 - `MAX_EXPOSURE_USD_FLOOR` ($300) — absolute USD floor on the exposure cap; binds at small bankroll. Tune higher to increase concurrent-position capacity at the cost of larger drawdown risk per losing streak
+- `DRAWDOWN_CAUTION_THRESHOLD` (0.10) / `DRAWDOWN_PAUSE_THRESHOLD` (0.20, added 2026-05-28) — drawdown-monitor band as a fraction of peak. Read live by `DrawdownMonitor.check()`; defaults match the prior module constants. Widen `PAUSE` (e.g. 0.30) for a small iteration-mode bankroll so a stale daily peak doesn't perma-PAUSE and zero every stake (the May 27 silencer)
+- `NEAR_PEAK_FLOOR_UP_ENABLED` (False), `NEAR_PEAK_FLOOR_STAKE_USD` (5.0), `NEAR_PEAK_FLOOR_UP_MIN_PROB` (0.97), `NEAR_PEAK_FLOOR_UP_MAX_HOURS` (2.0, all added 2026-05-28) — near-peak floor-up (see Kelly sizing). Off by default. When on, a passing **threshold-op** edge that is high-confidence OR near peak gets its sub-$5 stake floored up to `NEAR_PEAK_FLOOR_STAKE_USD` instead of dropped. `exactly`/`range`/`bracket` excluded (validate-first). `NEAR_PEAK_FLOOR_STAKE_USD` doubles as the "bigger stake" knob and is **pre-drawdown-multiplier**. Recovers the dominant `stake_below_min` throttle at small bankroll without loosening any filter
 - `STALE_OPEN_RECONCILE_GRACE_HOURS` (4), `STUCK_ALERT_MIN_COUNT` (5), `STUCK_ALERT_EXPOSURE_FRACTION` (0.50), `STUCK_ALERT_COOLDOWN_HOURS` (4) — stuck-OPEN sweep + heartbeat in `job_reconcile_orders`. Sweep is log-only; heartbeat fires when count OR exposure-fraction threshold trips (cooldown stored in `bot_state` so a restart doesn't drop the timer). Catches the same silent-silencer failure mode as `job_daily_settlement`'s 80%-of-cap alert, but every 5 min instead of once a day
 
 The lock-rule path has its **own** knob set (`LOCK_RULE_*`, `LOCK_MARGIN_F`, `LOCK_POSITION_PCT`, `FAST_LOCK_POLL_*`). The ensemble σ knobs (`ENSEMBLE_*`) only affect Phase 1 σ in the probability engine.

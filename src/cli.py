@@ -3677,8 +3677,9 @@ def reset_drawdown_peak(skip_confirm: bool, dry_run: bool) -> None:
     """Reset DrawdownMonitor's peak to current equity.
 
     Inserts a fresh BankrollLog row with peak = balance = get_current_bankroll().
-    DrawdownMonitor.load_state reads this row at next scheduler startup, so
-    the running process MUST be restarted for the change to take effect.
+    The running scheduler reloads DrawdownMonitor's peak from this row on a TTL
+    (~5 min), so the change takes effect without a restart; restart only if you
+    need it applied immediately.
 
     Use this after a bankroll-equation correction that left an inflated
     `peak` in the latest BankrollLog row, which pins drawdown_pct >
@@ -3733,9 +3734,9 @@ def reset_drawdown_peak(skip_confirm: bool, dry_run: bool) -> None:
             await session.commit()
             click.echo(f"Inserted BankrollLog row #{row.id}.")
             click.echo()
-            click.echo("⚠  RESTART the scheduler for the change to take effect.")
-            click.echo("   DrawdownMonitor._peak is loaded once at startup; the running")
-            click.echo("   process is still holding the inflated peak in memory.")
+            click.echo("✓  The running scheduler reloads the peak on a ~5 min TTL,")
+            click.echo("   so this takes effect automatically. Restart only if you")
+            click.echo("   need the new peak applied immediately.")
 
     asyncio.run(_reset())
 

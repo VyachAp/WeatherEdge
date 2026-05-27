@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
+from src.config import settings
 from src.db.models import BankrollLog
 
 if TYPE_CHECKING:
@@ -16,6 +17,8 @@ if TYPE_CHECKING:
 # Constants
 # ---------------------------------------------------------------------------
 
+# Defaults; ``check()`` reads ``settings.DRAWDOWN_*`` live so a small
+# iteration-mode bankroll can widen the band via .env without a code change.
 CAUTION_THRESHOLD: float = 0.10
 PAUSE_THRESHOLD: float = 0.20
 
@@ -75,12 +78,15 @@ class DrawdownMonitor:
 
     def check(self, current_bankroll: float) -> DrawdownState:
         """Return the drawdown state for *current_bankroll* without mutating."""
+        caution_threshold = settings.DRAWDOWN_CAUTION_THRESHOLD
+        pause_threshold = settings.DRAWDOWN_PAUSE_THRESHOLD
+
         peak = max(self._peak, current_bankroll)
         dd_pct = (peak - current_bankroll) / peak if peak > 0 else 0.0
 
         if current_bankroll >= self._peak:
             level = DrawdownLevel.NORMAL
-        elif dd_pct < CAUTION_THRESHOLD:
+        elif dd_pct < caution_threshold:
             if self._level in (
                 DrawdownLevel.CAUTION,
                 DrawdownLevel.PAUSED,
@@ -89,7 +95,7 @@ class DrawdownMonitor:
                 level = DrawdownLevel.RECOVERY
             else:
                 level = DrawdownLevel.NORMAL
-        elif dd_pct <= PAUSE_THRESHOLD:
+        elif dd_pct <= pause_threshold:
             level = DrawdownLevel.CAUTION
         else:
             level = DrawdownLevel.PAUSED

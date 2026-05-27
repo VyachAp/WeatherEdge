@@ -27,6 +27,20 @@ def _effective_exposure_cap(bankroll: float) -> float:
         settings.MAX_EXPOSURE_USD_FLOOR,
     )
 
+
+def _apply_floor(floor_to_usd: float | None, *, ceiling: float) -> float | None:
+    """Resolve a near-peak floor-up request against the tightest cap ceiling.
+
+    Returns the floored stake (``min(floor_to_usd, ceiling)``) when floor-up is
+    requested and the result is still ≥ ``MIN_TRADE_USD``; otherwise ``None``
+    (the caller drops the trade). Keeping the ``min`` here guarantees the floor
+    never exceeds an exposure / depth / per-trade ceiling.
+    """
+    if floor_to_usd is None:
+        return None
+    floored = min(floor_to_usd, ceiling)
+    return floored if floored >= MIN_TRADE_USD else None
+
 # ---------------------------------------------------------------------------
 # Dataclass
 # ---------------------------------------------------------------------------
@@ -55,6 +69,7 @@ def size_position(
     kelly_fraction: float | None = None,
     max_position_usd: float | None = None,
     orderbook_depth: float | None = None,
+    floor_to_usd: float | None = None,
 ) -> PositionSize:
     """Compute stake using fractional Kelly criterion with hard caps.
 
@@ -74,6 +89,14 @@ def size_position(
         Hard USD cap per position (default from settings.MAX_POSITION_USD).
     orderbook_depth:
         Visible orderbook depth in USD. Position capped at 20% of depth.
+    floor_to_usd:
+        When set and the Kelly-and-caps stake lands below ``MIN_TRADE_USD``,
+        floor the stake up to this value *instead of dropping it* — but never
+        above any cap ceiling (per-trade / exposure / USD / depth), so the
+        floor can't breach a limit. If the tightest ceiling is itself below
+        ``MIN_TRADE_USD`` (e.g. a thin book) the trade still drops. ``None``
+        preserves the original drop-on-sub-min behavior. Caller gates this on
+        the near-peak / high-confidence threshold class.
     """
     if kelly_fraction is None:
         kelly_fraction = settings.KELLY_FRACTION
@@ -139,6 +162,26 @@ def size_position(
 
     # --- Minimum viable trade ---
     if 0 < stake < MIN_TRADE_USD:
+        floored = _apply_floor(
+            floor_to_usd,
+            ceiling=min(
+                max_trade,
+                max_remaining,
+                usd_cap,
+                (
+                    orderbook_depth * settings.DEPTH_POSITION_CAP_PCT
+                    if orderbook_depth is not None and orderbook_depth > 0
+                    else float("inf")
+                ),
+            ),
+        )
+        if floored is not None:
+            return PositionSize(
+                stake_usd=round(floored, 2),
+                kelly_pct=full_kelly * kelly_fraction,
+                capped=True,
+                reason=f"floored to ${floored:.2f} (near-peak)",
+            )
         return PositionSize(
             stake_usd=0,
             kelly_pct=full_kelly * kelly_fraction,
@@ -160,6 +203,7 @@ def size_locked_position(
     price: float,
     current_exposure: float = 0.0,
     orderbook_depth: float | None = None,
+    floor_to_usd: float | None = None,
 ) -> PositionSize:
     """Size a lock-rule trade. No Kelly — no probability to plug in.
 
@@ -168,6 +212,11 @@ def size_locked_position(
     max-position, and depth limits. The payout shape (buying near-resolved at
     high price gives tiny gross margin) means sizing must stay small and
     depth-aware to avoid moving the book.
+
+    ``floor_to_usd`` mirrors :func:`size_position`: when set, a sub-``MIN_TRADE_USD``
+    stake is floored up (respecting every cap ceiling) instead of dropped. At a
+    typical bankroll the fixed 2% already clears the floor, so this is mostly a
+    no-op here — wired for symmetry and the "bigger stake" knob.
     """
     price = max(0.01, min(0.99, price))
 
@@ -201,6 +250,23 @@ def size_locked_position(
             reasons.append(f"depth cap (15% of ${orderbook_depth:.0f})")
 
     if 0 < stake < MIN_TRADE_USD:
+        floored = _apply_floor(
+            floor_to_usd,
+            ceiling=min(
+                max_remaining,
+                usd_cap,
+                (
+                    orderbook_depth * 0.15
+                    if orderbook_depth is not None and orderbook_depth > 0
+                    else float("inf")
+                ),
+            ),
+        )
+        if floored is not None:
+            return PositionSize(
+                stake_usd=round(floored, 2), kelly_pct=0.0, capped=True,
+                reason=f"floored to ${floored:.2f} (near-peak)",
+            )
         return PositionSize(
             stake_usd=0, kelly_pct=0.0, capped=True,
             reason=f"below ${MIN_TRADE_USD:.0f} minimum",

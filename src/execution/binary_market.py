@@ -152,3 +152,39 @@ def is_bracket_like(market) -> bool:
     a single binary outcome, no anti-correlated buckets.
     """
     return market.parsed_operator in ("bracket", "range", "exactly")
+
+
+def near_peak_floor_eligible(
+    market,
+    *,
+    our_probability: float,
+    hours_until_peak: float | None,
+) -> bool:
+    """True if a passing edge may have its sub-min stake floored up.
+
+    Gates the near-peak floor-up (``NEAR_PEAK_FLOOR_UP_ENABLED``). Restricted
+    to **threshold** operators — ``exactly``/``range``/``bracket`` are excluded
+    (validate-first: that single-bucket NO class is historically a net loser;
+    it still trades when Kelly sizes ≥ ``MIN_STAKE_USD`` naturally, we just
+    don't artificially floor it up yet). The trade must also be either
+    high-confidence (recorded prob ≥ ``NEAR_PEAK_FLOOR_UP_MIN_PROB`` — admits
+    an extreme-threshold bet decided by the forecast hours before peak) OR
+    genuinely near the forecast peak (``|hours_until_peak| ≤
+    NEAR_PEAK_FLOOR_UP_MAX_HOURS``). The OR keeps the "close around the peak"
+    principle while still admitting forecast-decisive far-from-peak threshold
+    bets.
+    """
+    # Local import avoids a module-load-time settings dependency in this
+    # otherwise-pure shape-helper module.
+    from src.config import settings
+
+    if not settings.NEAR_PEAK_FLOOR_UP_ENABLED:
+        return False
+    if is_bracket_like(market):
+        return False
+    high_conf = our_probability >= settings.NEAR_PEAK_FLOOR_UP_MIN_PROB
+    near_peak = (
+        hours_until_peak is not None
+        and abs(hours_until_peak) <= settings.NEAR_PEAK_FLOOR_UP_MAX_HOURS
+    )
+    return high_conf or near_peak

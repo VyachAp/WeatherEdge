@@ -6,6 +6,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from src.config import settings
+from src.execution.binary_market import near_peak_floor_eligible
 from src.risk.drawdown import (
     CAUTION_THRESHOLD,
     PAUSE_THRESHOLD,
@@ -13,7 +15,13 @@ from src.risk.drawdown import (
     DrawdownMonitor,
     DrawdownState,
 )
-from src.risk.kelly import MAX_EXPOSURE_PCT, MIN_TRADE_USD, PositionSize, size_position
+from src.risk.kelly import (
+    MAX_EXPOSURE_PCT,
+    MIN_TRADE_USD,
+    PositionSize,
+    size_locked_position,
+    size_position,
+)
 from src.risk.simulate import SimResult, SimSignal, simulate_bankroll
 
 
@@ -172,6 +180,133 @@ class TestSizePosition:
         )
         assert "depth" not in pos.reason
 
+    # -- near-peak floor-up (floor_to_usd) -----------------------------------
+
+    def test_floor_to_usd_lifts_sub_min(self):
+        """Raw Kelly below $5 is floored up to floor_to_usd when caps allow."""
+        # bankroll 316, tiny edge → raw Kelly ≈ $3.16 (< $5), but per-trade cap
+        # = $15.80 and exposure room = $300 both leave headroom for a $5 floor.
+        dropped = size_position(316, model_prob=0.52, market_prob=0.50)
+        assert dropped.stake_usd == 0  # sanity: drops without the floor
+        floored = size_position(
+            316, model_prob=0.52, market_prob=0.50, floor_to_usd=5.0
+        )
+        assert floored.stake_usd == pytest.approx(5.0)
+        assert floored.reason.startswith("floored")
+
+    def test_floor_to_usd_none_preserves_drop(self):
+        """floor_to_usd=None keeps the original sub-min drop (regression)."""
+        pos = size_position(
+            316, model_prob=0.52, market_prob=0.50, floor_to_usd=None
+        )
+        assert pos.stake_usd == 0
+        assert "$5" in pos.reason
+
+    def test_floor_clamped_by_depth(self):
+        """A thin book clamps the floor below $5 → trade still drops."""
+        # depth $20 → depth cap = $4 < $5, so an $8 floor can't be honored.
+        pos = size_position(
+            316,
+            model_prob=0.52,
+            market_prob=0.50,
+            orderbook_depth=20.0,
+            floor_to_usd=8.0,
+        )
+        assert pos.stake_usd == 0
+        assert "$5" in pos.reason
+
+    def test_floor_clamped_by_exposure(self):
+        """Exposure-remaining below $5 clamps the floor → trade drops."""
+        # exposure cap = $300 (USD floor binds at $316), 297 used → $3 room.
+        pos = size_position(
+            316,
+            model_prob=0.60,
+            market_prob=0.50,
+            current_exposure=297.0,
+            floor_to_usd=5.0,
+        )
+        assert pos.stake_usd == 0
+        assert "$5" in pos.reason
+
+    def test_floor_ignored_when_kelly_above_min(self):
+        """floor_to_usd is a no-op when Kelly already sizes ≥ $5."""
+        pos = size_position(
+            1000, model_prob=0.58, market_prob=0.50, floor_to_usd=5.0
+        )
+        assert pos.stake_usd > 5.0
+        assert not pos.reason.startswith("floored")
+
+
+class TestSizeLockedPositionFloor:
+    def test_locked_floor_lifts_sub_min(self):
+        """Fixed 2% below $5 at small bankroll is floored up when caps allow."""
+        # bankroll 150 → 2% = $3 (< $5); exposure/usd/depth caps leave room.
+        dropped = size_locked_position(150, price=0.80)
+        assert dropped.stake_usd == 0
+        floored = size_locked_position(150, price=0.80, floor_to_usd=5.0)
+        assert floored.stake_usd == pytest.approx(5.0)
+        assert floored.reason.startswith("floored")
+
+    def test_locked_floor_none_preserves_drop(self):
+        """floor_to_usd=None keeps the original lock-path drop."""
+        pos = size_locked_position(150, price=0.80, floor_to_usd=None)
+        assert pos.stake_usd == 0
+        assert "$5" in pos.reason
+
+
+# ===================================================================
+# binary_market.py – near-peak floor-up gate
+# ===================================================================
+
+
+class TestNearPeakFloorEligible:
+    @staticmethod
+    def _market(op: str):
+        m = MagicMock()
+        m.parsed_operator = op
+        return m
+
+    def test_disabled_by_default(self):
+        """Master switch off (default) → never eligible."""
+        assert not near_peak_floor_eligible(
+            self._market("at_least"), our_probability=1.0, hours_until_peak=0.0
+        )
+
+    def test_excludes_bracket_like(self, monkeypatch):
+        """`exactly` stays validate-first — never floored even near peak."""
+        monkeypatch.setattr(settings, "NEAR_PEAK_FLOOR_UP_ENABLED", True)
+        assert not near_peak_floor_eligible(
+            self._market("exactly"), our_probability=1.0, hours_until_peak=0.0
+        )
+
+    def test_confidence_arm_admits_far_from_peak(self, monkeypatch):
+        """Karachi archetype: at_least, prob 1.0, ~5.5h pre-peak → eligible."""
+        monkeypatch.setattr(settings, "NEAR_PEAK_FLOOR_UP_ENABLED", True)
+        assert near_peak_floor_eligible(
+            self._market("at_least"), our_probability=1.0, hours_until_peak=5.5
+        )
+
+    def test_near_peak_arm_admits_lower_confidence(self, monkeypatch):
+        """Threshold op near peak with sub-min-prob still eligible via window."""
+        monkeypatch.setattr(settings, "NEAR_PEAK_FLOOR_UP_ENABLED", True)
+        assert near_peak_floor_eligible(
+            self._market("above"), our_probability=0.88, hours_until_peak=1.0
+        )
+
+    def test_neither_arm_rejected(self, monkeypatch):
+        """Low confidence AND far from peak → not eligible."""
+        monkeypatch.setattr(settings, "NEAR_PEAK_FLOOR_UP_ENABLED", True)
+        assert not near_peak_floor_eligible(
+            self._market("at_least"), our_probability=0.88, hours_until_peak=6.0
+        )
+
+    def test_past_peak_uses_abs_window(self, monkeypatch):
+        """Negative hours_until_peak (past peak) counts via abs()."""
+        monkeypatch.setattr(settings, "NEAR_PEAK_FLOOR_UP_ENABLED", True)
+        assert near_peak_floor_eligible(
+            self._market("below"), our_probability=0.50, hours_until_peak=-1.5
+        )
+
 
 # ===================================================================
 # drawdown.py – drawdown monitor
@@ -223,6 +358,26 @@ class TestDrawdownMonitor:
         assert state.level == DrawdownLevel.NORMAL
         assert state.size_multiplier == 1.0
         assert state.peak == 760
+
+    def test_pause_threshold_uses_settings_override(self, monkeypatch):
+        """Widening DRAWDOWN_PAUSE_THRESHOLD demotes a 24% dd from PAUSED to CAUTION."""
+        mon = DrawdownMonitor(417)
+        mon.advance(417)
+        # 316/417 → 24.2% drawdown. Default 0.20 pauses; 0.30 only cautions.
+        assert mon.check(316).level == DrawdownLevel.PAUSED
+        monkeypatch.setattr(settings, "DRAWDOWN_PAUSE_THRESHOLD", 0.30)
+        assert mon.check(316).level == DrawdownLevel.CAUTION
+
+    def test_reload_to_lower_peak_cannot_underprotect(self):
+        """A peak reloaded down to current equity still pauses on a real drop.
+
+        Models `admin reset-drawdown-peak` lowering the peak to $316: equity at
+        $316 is NORMAL, but a genuine fall to $250 (21% off the reset baseline)
+        still PAUSES because check() re-maxes against live equity.
+        """
+        mon = DrawdownMonitor(316)  # peak reloaded to current equity
+        assert mon.check(316).level == DrawdownLevel.NORMAL
+        assert mon.check(250).level == DrawdownLevel.PAUSED
 
     @pytest.mark.asyncio
     async def test_update_persists_bankroll_log(self):

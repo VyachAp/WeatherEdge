@@ -41,6 +41,7 @@ from src.execution.binary_market import (
     display_bucket,
     market_range_f,
     market_unit,
+    near_peak_floor_eligible,
 )
 from src.execution.polymarket_client import get_orderbook_depth, place_order
 from src.persistence import cache_rollover
@@ -232,14 +233,28 @@ async def try_lock_rule_trade(
     # outcomes via market_id+direction+created_at.
     await _log_lock_eval(True, None, buy_depth or None)
 
+    # Near-peak floor-up: lock decisions are deterministic (prob ≡ 1.0), so the
+    # confidence arm of the gate always passes for threshold lock markets;
+    # bracket-like lock branches (range_*) are excluded (validate-first).
+    floor_to_usd = (
+        settings.NEAR_PEAK_FLOOR_STAKE_USD
+        if near_peak_floor_eligible(
+            market,
+            our_probability=1.0,
+            hours_until_peak=state.hours_until_peak,
+        )
+        else None
+    )
     pos = size_locked_position(
         bankroll=bankroll,
         price=effective_price,
         current_exposure=exposure,
         orderbook_depth=buy_depth or None,
+        floor_to_usd=floor_to_usd,
     )
     dd_state = monitor.check(bankroll)
     stake = pos.stake_usd * dd_state.size_multiplier
+    floored_up = (pos.reason or "").startswith("floored")
 
     logger.info(
         "[%s] LOCK %s %s: margin=%.1f°F, price=%.2f, stake=$%.2f "
@@ -408,6 +423,7 @@ async def try_lock_rule_trade(
                 "branch": decision.branch,
                 "margin_f": decision.margin_f,
                 "is_dry_run": True,
+                "floored_up": floored_up,
             },
         )
     else:
@@ -458,6 +474,7 @@ async def try_lock_rule_trade(
                 "branch": decision.branch,
                 "margin_f": decision.margin_f,
                 "fill_price": indicative_price,
+                "floored_up": floored_up,
             },
         )
 

@@ -63,6 +63,22 @@ class Settings(BaseSettings):
     DAILY_SPEND_CAP_USD: float = 200.0  # Max total spend per 24h
     MIN_STAKE_USD: float = 5.0  # Skip orders below this amount
 
+    # Near-peak floor-up (2026-05-28). At a small bankroll, fractional Kelly
+    # (further capped by KELLY_PROB_CAP) sizes high-confidence near-peak bets
+    # below MIN_STAKE_USD, so they're dropped despite passing every filter —
+    # the dominant volume throttle once drawdown is healthy. When enabled, a
+    # passing edge that is (a) a threshold operator (NOT exactly/range/bracket
+    # — those stay validate-first) and (b) high-confidence OR near the forecast
+    # peak gets its stake floored up instead of dropped. The floor is applied
+    # *inside* the sizer (after every exposure/USD/depth cap) so it can never
+    # breach a cap, and it is *pre-drawdown-multiplier* (CAUTION/RECOVERY 0.5×
+    # still applies on top — set the floor to 2× MIN_STAKE_USD if you want it
+    # to survive half-sizing). Default disabled = no behavior change.
+    NEAR_PEAK_FLOOR_UP_ENABLED: bool = False
+    NEAR_PEAK_FLOOR_STAKE_USD: float = 5.0  # floor target; doubles as the "bigger stake" knob
+    NEAR_PEAK_FLOOR_UP_MIN_PROB: float = 0.97  # confidence arm (recorded prob, not Kelly-capped)
+    NEAR_PEAK_FLOOR_UP_MAX_HOURS: float = 2.0  # near-peak arm: |hours_until_peak| ≤ this
+
     # Unified pipeline
     UNIFIED_PIPELINE_INTERVAL_MINUTES: int = 5
 
@@ -143,6 +159,13 @@ class Settings(BaseSettings):
     DAILY_LOSS_STOP_USD: float = 200.0
     CONSECUTIVE_LOSS_PAUSE_COUNT: int = 3
     CONSECUTIVE_LOSS_PAUSE_HOURS: int = 2
+
+    # Drawdown monitor thresholds (fraction of peak). Overridable so a small
+    # iteration-mode bankroll isn't perma-PAUSED by a stale daily peak. Defaults
+    # match the long-standing module constants in src/risk/drawdown.py — leave
+    # unset for identical behavior. CAUTION → 0.5× size, PAUSE → 0.0× (no trades).
+    DRAWDOWN_CAUTION_THRESHOLD: float = 0.10
+    DRAWDOWN_PAUSE_THRESHOLD: float = 0.20
 
     # Submission-failure circuit breaker (2026-05-20). When the CLOB
     # rejects ``N`` orders in a row within the recent window, pause new

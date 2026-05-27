@@ -26,6 +26,7 @@ from src.execution.binary_market import (
     make_binary_buckets as _make_binary_buckets,
     market_range_f,
     market_unit as _market_unit,
+    near_peak_floor_eligible as _near_peak_floor_eligible,
     should_skip_future_day as _should_skip_future_day,
 )
 from src.execution.lock_rule_executor import (
@@ -87,6 +88,11 @@ logger = logging.getLogger(__name__)
 
 _scheduler: AsyncIOScheduler | None = None
 _drawdown_monitor: DrawdownMonitor | None = None
+# Last time the monitor's persisted peak was reloaded from bankroll_log.
+# Reloaded on a TTL so `admin reset-drawdown-peak` takes effect on the running
+# process without a restart (the peak was previously loaded once at boot only).
+_drawdown_peak_loaded_at: datetime | None = None
+_DRAWDOWN_PEAK_RELOAD_TTL = timedelta(seconds=300)
 _shutdown_event: asyncio.Event | None = None
 
 # Per-station rollover dicts live in ``persistence.cache_rollover`` — both
@@ -118,11 +124,25 @@ async def start_health_server(port: int = 8080) -> asyncio.Server:
 
 
 async def _get_drawdown_monitor() -> DrawdownMonitor:
-    global _drawdown_monitor  # noqa: PLW0603
+    global _drawdown_monitor, _drawdown_peak_loaded_at  # noqa: PLW0603
+    now = datetime.now(timezone.utc)
     if _drawdown_monitor is None:
         _drawdown_monitor = DrawdownMonitor(settings.INITIAL_BANKROLL)
         async with async_session() as session:
             await _drawdown_monitor.load_state(session)
+        _drawdown_peak_loaded_at = now
+    elif (
+        _drawdown_peak_loaded_at is None
+        or now - _drawdown_peak_loaded_at > _DRAWDOWN_PEAK_RELOAD_TTL
+    ):
+        # Re-read the persisted peak so an operator's `admin
+        # reset-drawdown-peak` (a newer bankroll_log row with peak=equity)
+        # takes effect within the TTL — no scheduler restart needed. Safe to
+        # pull in a *lower* peak: ``check()`` re-maxes with live equity, so a
+        # reload can only relax an over-tight pause, never under-protect.
+        async with async_session() as session:
+            await _drawdown_monitor.load_state(session)
+        _drawdown_peak_loaded_at = now
     return _drawdown_monitor
 
 
@@ -521,6 +541,18 @@ async def job_unified_pipeline() -> None:
                             if edge.direction.value == "BUY_YES"
                             else _no_depth_for_market()
                         )
+                        # Near-peak floor-up: threshold-class, high-confidence
+                        # OR near-peak passers get their sub-min stake floored
+                        # up instead of dropped (gated off by default).
+                        floor_to_usd = (
+                            settings.NEAR_PEAK_FLOOR_STAKE_USD
+                            if _near_peak_floor_eligible(
+                                market,
+                                our_probability=edge.our_probability,
+                                hours_until_peak=state.hours_until_peak,
+                            )
+                            else None
+                        )
                         pos = size_position(
                             bankroll=bankroll,
                             model_prob=edge.our_probability,
@@ -528,7 +560,9 @@ async def job_unified_pipeline() -> None:
                             current_exposure=exposure,
                             max_position_usd=settings.MAX_POSITION_USD,
                             orderbook_depth=side_depth or None,
+                            floor_to_usd=floor_to_usd,
                         )
+                        floored_up = (pos.reason or "").startswith("floored")
 
                         adjusted_stake = pos.stake_usd * dd_state.size_multiplier
                         logger.info(
@@ -717,6 +751,7 @@ async def job_unified_pipeline() -> None:
                                     "bucket": edge.bucket_value,
                                     "edge": edge.edge,
                                     "is_dry_run": True,
+                                    "floored_up": floored_up,
                                 },
                             )
                         elif order_ok and (trade.stake_usd or 0.0) > 0:
@@ -747,6 +782,7 @@ async def job_unified_pipeline() -> None:
                                     "bucket": edge.bucket_value,
                                     "edge": edge.edge,
                                     "fill_price": fill,
+                                    "floored_up": floored_up,
                                 },
                             )
                         elif order_ok:

@@ -505,3 +505,27 @@ async def test_signal_row_records_lock_branch_and_observed_max():
     assert kwargs["model_prob"] == 1.0
     # confidence = margin_f so the Telegram detail view shows "how locked".
     assert kwargs["confidence"] == 5.0
+
+
+# ---------------------------------------------------------------------------
+# Near-peak floor-up wiring — the gate result flows into size_locked_position
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_floor_up_passed_to_sizer_for_threshold_lock(monkeypatch):
+    """Enabled + threshold op + near peak → floor_to_usd flows to the sizer."""
+    monkeypatch.setattr(lre.settings, "NEAR_PEAK_FLOOR_UP_ENABLED", True)
+    monkeypatch.setattr(lre.settings, "NEAR_PEAK_FLOOR_STAKE_USD", 6.0)
+    # _market() default operator="above" (threshold), _state() hours_until_peak=2.0.
+    _, c = await _invoke(decision=_yes_decision())
+    assert c["size_locked_position"].call_args.kwargs["floor_to_usd"] == 6.0
+
+
+@pytest.mark.asyncio
+async def test_floor_up_excluded_for_bracket_like_lock(monkeypatch):
+    """Enabled but bracket-like op (range) stays validate-first → no floor."""
+    monkeypatch.setattr(lre.settings, "NEAR_PEAK_FLOOR_UP_ENABLED", True)
+    market = _market(operator="range")
+    _, c = await _invoke(decision=_no_decision(branch="range_in_window"), market=market)
+    assert c["size_locked_position"].call_args.kwargs["floor_to_usd"] is None
