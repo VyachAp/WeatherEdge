@@ -374,6 +374,15 @@ class TestBinaryMarketEdgeLeadGate:
     rejects edges evaluated earlier than the cutoff; threshold ops are exempt.
     """
 
+    @pytest.fixture(autouse=True)
+    def _disable_master_switch(self, monkeypatch):
+        """Pin the bracket-like-NO master switch OFF — this class tests the
+        lead gate in isolation, not the master switch that overrides it.
+        Needed because the live `.env` ships with the switch flipped on.
+        """
+        from src.config import settings
+        monkeypatch.setattr(settings, "BRACKET_LIKE_NO_DISABLED", False)
+
     @staticmethod
     def _eval(*, hours_to_close, op="exactly", our_prob_yes=0.10,
               yes_bid=0.45, yes_ask=0.55, threshold=82):

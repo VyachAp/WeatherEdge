@@ -386,5 +386,35 @@ class Settings(BaseSettings):
     # range_undershoot (+$8, 100%) and range_in_window branches are kept.
     RANGE_OVERSHOOT_LOCK_ENABLED: bool = False
 
+    # Master switch for bracket-like NO (`exactly`/`range`/`bracket` BUY_NO)
+    # in the PROBABILITY path. When True, `binary_market_edge` rejects any
+    # otherwise-passing bracket-like NO edge with reason
+    # ``"bracket-like NO disabled (sigma recalibration pending)"``.
+    #
+    # Why: live data (2026-05-30) all-time -$260 / -7.4% ROI on 383 trades,
+    # last 14d -$346 / -14.3% ROI on 263 trades. The model is structurally
+    # overconfident on single-bucket NO (each °C bucket evaluated as an
+    # independent binary; tight ensemble agreement collapses σ far from
+    # peak; landing-band/cap/lead guards block specific failure modes but
+    # the surviving NO evals still score -0.023 EV/$1 per the live
+    # ``evals-report --operator bracket-like`` single-bucket-NO tuning
+    # grid). The proper fix is the lead-time-aware σ floor backlogged in
+    # ``docs/improvements.md`` (deferred from the 2026-05-23 NO-guards work
+    # because it would also retune the working threshold path). Until that
+    # ships, every additional bracket-like-NO fill is paid-for lab data we
+    # already have.
+    #
+    # Scope: probability path only. The lock path (`evaluate_lock` →
+    # `_evaluate_range_lock`) does NOT go through `binary_market_edge`, so
+    # `range_in_window`/`range_undershoot` YES locks keep firing.
+    # `range_overshoot` NO is independently gated by
+    # `RANGE_OVERSHOOT_LOCK_ENABLED`. Threshold ops
+    # (above/at_least/below/at_most) are unaffected on both sides.
+    #
+    # Default False = no behavior change. Flip True in `.env` to stop the
+    # bleed; flip back when the σ-recalibration backlog item lands and the
+    # evals-report tuner shows survivors at +EV.
+    BRACKET_LIKE_NO_DISABLED: bool = False
+
 
 settings = Settings()

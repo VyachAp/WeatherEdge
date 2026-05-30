@@ -280,6 +280,15 @@ class TestSingleBucketNoGuards:
     Q28 = "Will the highest temperature in Amsterdam be 28°C on May 23"
     Q30 = "Will the highest temperature in Amsterdam be 30°C on May 23"
 
+    @pytest.fixture(autouse=True)
+    def _disable_master_switch(self, monkeypatch):
+        """Pin the bracket-like-NO master switch OFF for this class — these
+        tests cover the Layer 1-3 guards, not the master switch on top.
+        Needed because the live `.env` ships with the switch flipped on.
+        """
+        from src.config import settings
+        monkeypatch.setattr(settings, "BRACKET_LIKE_NO_DISABLED", False)
+
     def test_no_inside_landing_band_rejected(self):
         from src.db.models import TradeDirection
 
@@ -496,3 +505,99 @@ class TestBinaryMarketEdgeThresholdFloors:
         assert edge.direction == TradeDirection.BUY_YES
         assert edge.passes is False
         assert "probability" in (edge.reject_reason or "")
+
+
+class TestBracketLikeNoMasterSwitch:
+    """`BRACKET_LIKE_NO_DISABLED=True` rejects any otherwise-passing
+    bracket-like NO edge while σ recalibration is pending. Threshold ops,
+    `exactly` YES, and the off-by-default state are all unaffected.
+    """
+
+    Q30 = "Will the highest temperature in Amsterdam be 30°C on May 23"
+
+    def test_off_by_default_passes_exactly_no(self, monkeypatch):
+        from src.config import settings
+        from src.db.models import TradeDirection
+
+        # Pin OFF so the assertion is independent of any future default flip.
+        monkeypatch.setattr(settings, "BRACKET_LIKE_NO_DISABLED", False)
+        # forecast 25.6°C (78°F), obs 73°F, 2h to peak, NO on the 30°C window
+        # (86°F) — clear of the landing band, passes Layers 1-3.
+        edge = _eval_binary(
+            question=self.Q30, threshold_f=86.0, op="exactly",
+            our_prob_in_window=0.10, yes_bid=0.45, yes_ask=0.55,
+            forecast_peak_f=78.0, current_max_f=73.0, hours_until_peak=2.0,
+        )
+        assert edge.direction == TradeDirection.BUY_NO
+        assert edge.passes is True
+        assert edge.reject_reason is None
+
+    def test_master_switch_blocks_exactly_no(self, monkeypatch):
+        from src.config import settings
+        from src.db.models import TradeDirection
+
+        monkeypatch.setattr(settings, "BRACKET_LIKE_NO_DISABLED", True)
+        # Same NO edge as above — would pass every layer, but the master
+        # switch rejects with its own reason.
+        edge = _eval_binary(
+            question=self.Q30, threshold_f=86.0, op="exactly",
+            our_prob_in_window=0.10, yes_bid=0.45, yes_ask=0.55,
+            forecast_peak_f=78.0, current_max_f=73.0, hours_until_peak=2.0,
+        )
+        assert edge.direction == TradeDirection.BUY_NO
+        assert edge.passes is False
+        assert "bracket-like NO disabled" in (edge.reject_reason or "")
+
+    def test_master_switch_preserves_specific_reject_reason(self, monkeypatch):
+        from src.config import settings
+
+        # Master switch ON, but the edge is already rejected by Layer 2
+        # (landing band): bucket 82°F sits inside [72, 87.5]°F. The original
+        # landing-band reason must win — the master switch only marks
+        # *otherwise-passing* residual NO evals.
+        monkeypatch.setattr(settings, "BRACKET_LIKE_NO_DISABLED", True)
+        edge = _eval_binary(
+            question="Will the highest temperature in Amsterdam be 28°C on May 23",
+            threshold_f=82.4, op="exactly",
+            our_prob_in_window=0.05, yes_bid=0.45, yes_ask=0.55,
+            forecast_peak_f=86.5, current_max_f=73.0, hours_until_peak=6.6,
+        )
+        assert edge.passes is False
+        assert "landing band" in (edge.reject_reason or "")
+        assert "sigma recalibration" not in (edge.reject_reason or "")
+
+    def test_master_switch_passes_exactly_yes(self, monkeypatch):
+        from src.config import settings
+        from src.db.models import TradeDirection
+
+        # Master switch ON, but YES on an `exactly` window at high prob with
+        # YES underpriced. The switch must NOT block YES — only NO is killed.
+        monkeypatch.setattr(settings, "BRACKET_LIKE_NO_DISABLED", True)
+        edge = _eval_binary(
+            question=self.Q30, threshold_f=86.0, op="exactly",
+            our_prob_in_window=0.90, yes_bid=0.55, yes_ask=0.60,
+            forecast_peak_f=86.0, current_max_f=85.0, hours_until_peak=1.0,
+        )
+        assert edge.direction == TradeDirection.BUY_YES
+        assert edge.passes is True
+        assert edge.reject_reason is None
+
+    def test_master_switch_passes_threshold_no(self, monkeypatch):
+        from src.config import settings
+        from src.db.models import TradeDirection
+
+        # Master switch ON, but `at_least` NO is a threshold op — must pass.
+        # forecast 70°F, obs 65°F, peak passed → NO on at_least 85°F is the
+        # +EV class the switch is designed to preserve. yes_bid=0.20 puts
+        # NO buy price at 0.80 with NO edge 0.15 (clears the 0.10 global
+        # MIN_EDGE the live .env sets).
+        monkeypatch.setattr(settings, "BRACKET_LIKE_NO_DISABLED", True)
+        edge = _eval_binary(
+            question="Will the highest temperature in Amsterdam be 85F or higher",
+            threshold_f=85.0, op="at_least",
+            our_prob_in_window=0.05, yes_bid=0.20, yes_ask=0.25,
+            forecast_peak_f=70.0, current_max_f=65.0, hours_until_peak=-1.0,
+        )
+        assert edge.direction == TradeDirection.BUY_NO
+        assert edge.passes is True
+        assert edge.reject_reason is None

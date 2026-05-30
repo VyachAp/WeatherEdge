@@ -354,9 +354,20 @@ that scales with `hours_until_peak` would widen distributions far from
 peak and de-bias overconfident NO/YES across **all** cities and market
 types — including the profitable threshold path, which is why it was
 deferred from the surgical NO-guard fix.
+**Status note (2026-05-30):** while this entry is pending,
+`BRACKET_LIKE_NO_DISABLED=True` is the operational stop-loss in the live
+`.env`. Reactivating bracket-like NO is part of this entry's exit
+criteria: after the σ-floor change ships, run `evals-report --operator
+bracket-like` and flip the flag back to False only when the tuner's
+baseline (all-passing) row shows +EV. Until then, every bracket-like-NO
+fill the bot would have placed is reachable as a rejected row in
+`evaluation_logs` with the master-switch reason — the learning signal
+continues, only the cash bleed stops.
 **Success criteria:** `_compute_sigma` floors σ to the full hours-based
 schedule (not ×0.5) when far from peak; backtest-v2 calibration
-(Brier / per-bucket) on threshold markets does not regress.
+(Brier / per-bucket) on threshold markets does not regress; `evals-report
+--operator bracket-like` baseline row flips to +EV; `BRACKET_LIKE_NO_DISABLED`
+flipped back to False.
 **Effort:** 2-3h + backtest-v2 gate.
 **Leverage:** correctness/risk (global calibration), but must not de-tune
 the working threshold path.

@@ -165,6 +165,13 @@ def binary_market_edge(
     When the context kwargs are ``None`` (legacy callers / tests) Layer 2 is
     skipped and Layer 1 falls back to time-to-close.
 
+    On top of those guards, ``BRACKET_LIKE_NO_DISABLED`` (default False) is a
+    **master switch** that rejects any otherwise-passing bracket-like NO
+    edge. Fires after Layers 1–3 under the ``reason is None`` guard, so an
+    edge that already failed a more specific guard keeps its original
+    reason in ``evaluation_logs``. Operational kill for the structurally
+    -EV class while σ recalibration is pending.
+
     Returns the passing-side ``BucketEdge`` if one passes; otherwise the
     higher-edge candidate (with ``passes=False`` and a reject reason),
     so callers can still log what was attempted.
@@ -326,6 +333,21 @@ def binary_market_edge(
                 f"NO inside landing band [{band_lo:.0f},{band_hi:.0f}]°F "
                 f"(bucket [{bucket_low},{bucket_high}]°F)"
             )
+
+    # Master switch — bracket-like NO is structurally -EV until lead-time-aware
+    # σ recalibration ships (see docs/improvements.md). Live data 2026-05-30:
+    # all-time -$260 / -7.4% ROI, last 14d -$346 / -14.3%. Layers 1-3 block
+    # specific failure modes but the surviving NO evals still score -0.023
+    # EV/$1 in the live tuner. Applied after Layers 1-2 under the `reason is
+    # None` guard so a more specific reject reason wins in `evaluation_logs`
+    # — this label only marks the otherwise-passing residual.
+    if (
+        reason is None
+        and settings.BRACKET_LIKE_NO_DISABLED
+        and direction == TradeDirection.BUY_NO
+        and op in ("exactly", "range", "bracket")
+    ):
+        reason = "bracket-like NO disabled (sigma recalibration pending)"
 
     return BucketEdge(
         bucket_value=bucket_value,
