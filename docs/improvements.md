@@ -465,3 +465,67 @@ the routine-METAR feed. Until then the knobs are the best available lever.
 `src/signals/probability_engine.py::_compute_sigma`, `src/cli.py`
 (`_single_bucket_no_band_section` — extend ground truth to settled-trade-derived
 resolved max).
+
+## [analysis backlog] Wire `forecast_archive` corpus into backtests + discovery
+
+**Why:** every successful `aggregate_state` tick writes one `ForecastArchive`
+row (~17k/day at 60 stations) capturing the blended Open-Meteo forecast,
+intentionally accumulated as a research substrate. **No live reader yet** —
+`simulate_distribution_pipeline` still uses the `forecast_peak_f = mid_max + 2.0`
+placeholder (`src/risk/simulate.py:251`) instead of replaying real forecasts.
+
+The corpus is the asset: every passing tick captures (a) what the blended
+forecast looked like at that time-to-peak, (b) how it evolved across the
+heating cycle, (c) per-station inter-model spread (`peak_temp_std_c`,
+`hourly_temps_std_c`). Joined to `MetarObservation` actual daily maxes and
+to `Signal`/`Trade` outcomes, this is enough surface for several distinct
+investigations:
+
+1. **Replay-capable backtest** — feed real archived forecasts into
+   `compute_distribution`, score the resulting bucket distribution against
+   the realised METAR daily max. Replaces the synthetic placeholder in
+   `simulate.py`. Validates probability-engine changes against ground truth
+   without rerunning live ticks.
+2. **Forecast-evolution post-mortems** — when a market mis-resolves (lock
+   fires NO and the day later overshoots, or a high-confidence YES loses),
+   replay the forecast trajectory through the day to see which signal
+   collapsed. Currently the only available trace is the per-tick log file.
+3. **Calibration of `_compute_sigma`** — compare archived `peak_temp_std_c`
+   to realised forecast error per station and lead-time bucket. Directly
+   feeds the deferred lead-time-aware σ-floor work (separate backlog entry).
+4. **Per-station model-source attribution** — `peak_temp_std_c` +
+   `model_count` together let us estimate which station/lead-time bins
+   benefit from ensemble vs deterministic-only blends. Could drive a
+   per-station model-weight policy.
+5. **Same-day update edge** — within a day, forecast updates often
+   precede METAR moves by 30–60 min. The corpus lets us measure that
+   lead consistently per station and decide whether to treat forecast
+   deltas as a tradable signal in their own right.
+
+**Success criteria (any subset):** at least one of the above produces a
+report or a code path that meaningfully reads from `ForecastArchive`,
+justifying the per-tick write cost from results rather than from intent.
+
+**Effort:** medium-to-large. Each investigation is its own ~1-day exercise;
+the shared infra (a JSONB → `OpenMeteoForecast` adapter + a query helper
+that returns the latest-as-of-T archived snapshot per (station, target-day))
+is a few hours and unlocks all five.
+
+**Leverage:** signal-quality (replay validation), observability (post-mortems),
+research (calibration / model-source / forecast-delta).
+
+**Files:** `src/risk/simulate.py::simulate_distribution_pipeline`,
+new `src/signals/forecast_archive_replay.py` (suggested home for the
+adapter + query helpers), `src/cli.py` (new `backtest-replay` or extended
+`backtest-v2`), `src/ingestion/forecast_archive.py` (docstring update if
+the replay path materialises).
+
+**Notes (audit pointer):** flagged 2026-05-30 during the per-module audit
+pass (Module 4). The audit initially treated this as cruft because all
+three of (CLAUDE.md, the model docstring, the module docstring) claimed
+the data was "consumed by `simulate_distribution_pipeline`" — which was
+not true. Documentation has been corrected to frame the writer as
+forward-looking telemetry; this entry exists so a future audit pass
+does not re-flag it. Drop the corpus only if a future analysis pass
+concludes the dimensions captured are insufficient to deliver any of
+the above.

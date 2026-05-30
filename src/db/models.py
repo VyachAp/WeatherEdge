@@ -474,10 +474,14 @@ class ForecastArchive(Base):
 
     One row per (station, target-local-day, fetched_at) — multiple per
     station-day are expected (forecast evolves through the heating cycle).
-    Used by the replay-capable backtest in ``src/risk/simulate.py`` to
-    score the probability/projection paths against realised daily max.
     Hourly arrays match the ``OpenMeteoForecast`` shape (24 entries each
     by convention).
+
+    **Forward-looking** — written every tick as a research substrate for
+    replay-capable backtests, calibration analysis, and forecast-evolution
+    post-mortems. No live reader yet; see ``docs/improvements.md``
+    [analysis backlog] for the reader-hookup work. The value is in the
+    accumulating corpus, not in current call sites — do not flag as cruft.
     """
 
     __tablename__ = "forecast_archive"

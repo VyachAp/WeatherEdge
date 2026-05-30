@@ -1,16 +1,23 @@
 """Persistence layer for the per-tick Open-Meteo forecast snapshots.
 
 Each successful ``aggregate_state`` invocation writes one row capturing
-the blended forecast it just used. Replays in
-``simulate_distribution_pipeline`` then read these back instead of
-synthesising a flat ``forecast_peak_f = mid_max + 2.0`` placeholder.
+the blended forecast it just used. Intentionally written as a
+**forward-looking research substrate** — replay-capable backtests,
+calibration analysis, forecast-evolution post-mortems. No live reader
+yet (``simulate_distribution_pipeline`` currently uses a flat
+``forecast_peak_f = mid_max + 2.0`` placeholder; wiring it through is
+backlogged in ``docs/improvements.md``).
 
 Cheap and best-effort: the unified pipeline runs every 5 min and the
-table is partitioned by (station, target-local-day, fetched_at), so even
+table is indexed by (station, target-local-day, fetched_at), so even
 60 active stations only generate ~17k rows/day — well within the budget
-of an unindexed JSONB-heavy table for the kind of horizons we replay
+of a JSONB-heavy table for the kind of horizons we expect to replay
 over (≤90 days). Retention can be added later if rows accumulate
-faster than backtests consume them.
+faster than analysis consumes them.
+
+**Audit note:** the value of this module is in the accumulating corpus,
+not in current call sites. Do NOT treat the lack of readers as cruft;
+see ``docs/improvements.md`` for the reader-hookup work.
 """
 
 from __future__ import annotations
