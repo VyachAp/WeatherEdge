@@ -275,6 +275,68 @@ week confirms the flag is right.
 after a Polymarket-side change).
 **Files:** `.env` (`POLYMARKET_USE_NEW_EXCHANGES`).
 
+## [backlog] PolyApiException "not enough balance / allowance" — wallet pre-flight check
+
+**Date:** 2026-05-30.
+
+**Why:** 140 `exchange_status LIKE 'exception:%'` rows in the last 14 days
+(7-25/day, peaked 35 on 2026-05-28). All 96 with captured `exchange_error`
+text are the same class — `not enough balance / allowance: balance: X,
+order amount: Y`, where balance ∈ {2.5, 0.6, 0.7, 8.2, 9.3} pUSD and order
+amount ∈ {$5, $9, $15, $17, $20}.
+
+**Root cause: transient wallet depletion during burst placement, not
+allowance.** Confirmed by three signals: (a) the CLOB-reported balance is
+*constant* across each burst (e.g., May 28 19:26-19:28 had 13 consecutive
+failures, all reporting `balance: 2502932`) — a static allowance cap
+wouldn't vary day-to-day, and a depleting wallet would show monotonic
+decrement. Both rule out allowance and rule in "the wallet has $X free
+when the burst begins, the burst tries to spend more than $X, the CLOB
+rejects the orders past the limit"; (b) at the May 28 19:26 burst start
+the bot's DB view had 568 OPEN/PENDING positions totalling $6,655 stake
+on a $300 bankroll — the real subset of those reserving wallet pUSD
+explains the gap; (c) `get_wallet_balance()` is defined in
+`polymarket_client.py:196` but has **zero callers** — the bot never
+pre-checks wallet spendable before placing an order.
+
+**Fix path:**
+1. **Pre-flight check in `place_order`**: call `get_wallet_balance()`
+   before submitting; if `spendable < stake_usd`, skip with new
+   `decision_log` outcome `OUTCOME_INSUFFICIENT_BALANCE`. The orders that
+   would have failed now don't fire and the +EV signal moves to a
+   smaller-stake fallback or the next tick.
+2. **Drop `_WALLET_BALANCE_TTL_SEC`** from 300s → ~30s (or invalidate
+   the cache after every successful placement so the next placement sees
+   the post-reservation reality).
+3. **Optional next iteration**: in-process `_reserved_balance` counter
+   that decrements at submit, increments on fill/cancel — eliminates the
+   TTL race entirely.
+
+**Success criteria:** `exception:PolyApiException` count drops to ≈0 in
+the 24h after deploy. The `decision_logs.outcome` distribution gains
+some `insufficient_balance` rows (expected and informative — replaces
+silent failures with visible skips). Submission-failure circuit breaker
+(`SUBMIT_FAIL_PAUSE_COUNT=5/10min`) stops firing.
+
+**Effort:** 2-4h including tests.
+
+**Leverage:** ~$100/14d of foregone profit recovered indirectly (the
+losing orders weren't truly "wasted" — they were burst-overcommit; the
+real win is stopping the silent silencer pattern and freeing
+investigation cycles).
+
+**Files:** `src/execution/polymarket_client.py::place_order`,
+`src/execution/polymarket_client.py::get_wallet_balance` (add caller,
+shorten TTL), `src/signals/decision_log.py` (new outcome const),
+`tests/test_polymarket_client.py` (new test class).
+
+**Companion bug worth a separate entry:** the 568 OPEN/PENDING tracked
+positions at burst time vs $300 bankroll suggests phantom-OPEN trades
+(local DB out of sync with on-chain). Same class as
+[[project-phantom-losses-2026-05-20]] but for the OPEN status. The
+balance-pre-flight fix sidesteps the symptom; the phantom-OPEN cleanup
+is a separate accounting hygiene task.
+
 ## [backlog] °C resolver/observation divergence on `exactly` markets
 
 **Why:** Root cause behind the `exactly`-market bleed fixed surgically

@@ -54,6 +54,7 @@ from src.signals.decision_log import (
     OUTCOME_DRAWDOWN_PAUSED,
     OUTCOME_DUP_DB,
     OUTCOME_DUP_INPROC,
+    OUTCOME_INSUFFICIENT_BALANCE,
     OUTCOME_NO_FILL,
     OUTCOME_ORDER_FAILED,
     OUTCOME_STAKE_BELOW_MIN,
@@ -369,15 +370,24 @@ async def try_lock_rule_trade(
         submit_depth_usd=buy_depth or None,
     )
     if not order_ok:
+        # Distinguish wallet pre-flight skips from real submission failures
+        # so dashboards can separate "held back intentionally" from "tried
+        # and lost". See decision_log.OUTCOME_INSUFFICIENT_BALANCE.
+        failed_outcome = (
+            OUTCOME_INSUFFICIENT_BALANCE
+            if trade.exchange_status == "insufficient_balance"
+            else OUTCOME_ORDER_FAILED
+        )
         logger.warning(
-            "[%s] LOCK %s %s: order placement failed",
-            icao, decision.side, market.id[:12],
+            "[%s] LOCK %s %s: order placement failed (%s)",
+            icao, decision.side, market.id[:12], trade.exchange_status,
             extra={
                 "event": "lock_order_failed",
                 "icao": icao,
                 "market_id": market.id,
                 "side": decision.side,
                 "stake_usd": stake,
+                "exchange_status": trade.exchange_status,
             },
         )
         await log_decision(
@@ -385,7 +395,7 @@ async def try_lock_rule_trade(
             market_id=market.id,
             direction=decision.direction,
             signal_kind="lock",
-            outcome=OUTCOME_ORDER_FAILED,
+            outcome=failed_outcome,
             requested_stake_usd=stake,
             dd_multiplier=dd_state.size_multiplier,
             dd_level=dd_state.level.value,

@@ -380,6 +380,39 @@ async def place_order(
         trade.exchange_status = "cap_exceeded"
         return False
 
+    # --- Wallet balance pre-flight ---
+    # The local exposure cap (`get_current_exposure`) is fed by the DB view
+    # of OPEN/PENDING trades, which can lag the on-chain reality (phantom-
+    # OPEN rows from the same class as project_phantom_losses_2026-05-20).
+    # Bursts of placements within a single tick also race the CLOB's
+    # per-order spendable check: each successful place_order reserves USDC
+    # on-chain instantly, but the bot's local view only updates after the
+    # SQL commit + next exposure recalc. Result: we submit orders we can't
+    # afford and the CLOB rejects them with
+    # `not enough balance / allowance: balance: X, order amount: Y` (140
+    # such rows over 14d on 2026-05-30).
+    #
+    # `force_refresh=True` bypasses the cache so we see the post-burst
+    # remainder, not the pre-tick value. Cost is one extra CLOB call per
+    # placement attempt — well inside the 10 rps limit even on bursts.
+    # Skip the check (return None) preserves prior behavior for dry-run /
+    # missing-key paths so tests and bootstrap stay clean.
+    spendable = get_wallet_usdc_balance(force_refresh=True)
+    if spendable is not None and spendable < trade.stake_usd:
+        logger.warning(
+            "Wallet pre-flight: $%.2f spendable < $%.2f stake (market=%s side=%s); skipping",
+            spendable, trade.stake_usd, trade.market_id, trade.direction.value,
+            extra={
+                "event": "insufficient_balance",
+                "market_id": trade.market_id,
+                "side": trade.direction.value,
+                "spendable_usd": spendable,
+                "requested_stake_usd": trade.stake_usd,
+            },
+        )
+        trade.exchange_status = "insufficient_balance"
+        return False
+
     # --- Resolve token IDs ---
     token_ids = await get_token_ids(trade.market_id)
     if token_ids is None:

@@ -141,3 +141,144 @@ async def test_check_order_status_matched_skips_fill_when_already_filled(
 
     assert result == "matched"
     update_mock.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# place_order wallet pre-flight balance check
+# ---------------------------------------------------------------------------
+#
+# Added 2026-05-30 after 140 PolyApiException "not enough balance / allowance"
+# rows in 14d. Root cause was burst-time wallet depletion: the bot has a
+# local exposure cap fed by DB-view OPEN/PENDING trades (which lag on-chain
+# reality), so it kept submitting orders the wallet couldn't fund. The
+# pre-flight reads the live CLOB-visible spendable balance with
+# `force_refresh=True` and short-circuits with `exchange_status =
+# "insufficient_balance"` when stake exceeds it. Tests cover: (1) pre-flight
+# blocks when spendable < stake; (2) pre-flight passes when spendable >=
+# stake; (3) pre-flight is a no-op for dry-run (no private key); (4) pre-
+# flight forces a fresh fetch (doesn't trust a stale 5-min cache).
+
+
+@pytest.fixture
+def trade_for_place_order():
+    """Trade-like row used to drive place_order. PENDING with $20 stake."""
+    from src.db.models import TradeDirection, TradeStatus
+
+    return SimpleNamespace(
+        market_id="mkt-abc",
+        direction=TradeDirection.BUY_NO,
+        stake_usd=20.0,
+        entry_price=0.50,
+        status=TradeStatus.PENDING,
+        order_id=None,
+        exchange_status=None,
+        exchange_error=None,
+        fill_price=None,
+        filled_size=0.0,
+        token_id=None,
+        submit_yes_bid=None,
+        submit_yes_ask=None,
+        submit_depth_usd=None,
+        submit_at=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_place_order_preflight_blocks_when_spendable_below_stake(trade_for_place_order):
+    """Spendable $5 vs $20 stake → skip with insufficient_balance, no order posted."""
+    from src.execution import polymarket_client as pc
+
+    session = AsyncMock()
+    with patch.object(pc, "is_live", return_value=True), \
+         patch.object(pc, "get_daily_spend", new=AsyncMock(return_value=0.0)), \
+         patch.object(pc, "get_wallet_usdc_balance", return_value=5.0) as bal_mock, \
+         patch.object(pc, "get_token_ids", new=AsyncMock(return_value=("yes-tok", "no-tok"))) as token_mock, \
+         patch.object(pc, "_get_client") as client_mock:
+        ok = await pc.place_order(trade_for_place_order, session)
+
+    assert ok is False
+    assert trade_for_place_order.exchange_status == "insufficient_balance"
+    # The pre-flight must short-circuit BEFORE token IDs / client are touched
+    # — they're more expensive (Gamma call + SDK init).
+    bal_mock.assert_called_once_with(force_refresh=True)
+    token_mock.assert_not_awaited()
+    client_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_place_order_preflight_passes_when_spendable_above_stake(trade_for_place_order):
+    """Spendable $50 vs $20 stake → fall through to token/client resolution."""
+    from src.execution import polymarket_client as pc
+
+    session = AsyncMock()
+    # Force a downstream failure (no_client) so we don't have to mock the
+    # whole order-posting path — just prove the pre-flight didn't block.
+    with patch.object(pc, "is_live", return_value=True), \
+         patch.object(pc, "get_daily_spend", new=AsyncMock(return_value=0.0)), \
+         patch.object(pc, "get_wallet_usdc_balance", return_value=50.0), \
+         patch.object(pc, "get_token_ids", new=AsyncMock(return_value=("yes-tok", "no-tok"))), \
+         patch.object(pc, "_get_client", return_value=None):
+        ok = await pc.place_order(trade_for_place_order, session)
+
+    assert ok is False
+    assert trade_for_place_order.exchange_status == "no_client"
+    # NOT insufficient_balance — proves we passed the pre-flight.
+
+
+@pytest.mark.asyncio
+async def test_place_order_preflight_skipped_in_dry_run(trade_for_place_order):
+    """Dry-run takes its own branch BEFORE the pre-flight runs — wallet
+    fetch must never be called (no private key in dry-run; would return None
+    anyway but the test asserts the cleaner "not even attempted" contract).
+    """
+    from src.execution import polymarket_client as pc
+
+    session = AsyncMock()
+    with patch.object(pc, "is_live", return_value=False), \
+         patch.object(pc, "get_wallet_usdc_balance") as bal_mock:
+        ok = await pc.place_order(trade_for_place_order, session)
+
+    assert ok is True
+    assert trade_for_place_order.exchange_status == "dry_run"
+    bal_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_place_order_preflight_noop_when_balance_unavailable(trade_for_place_order):
+    """When `get_wallet_usdc_balance` returns None (no private key OR CLOB
+    fetch failed), the pre-flight must NOT block — preserves existing
+    behavior on bootstrap / transient CLOB outages. The order continues to
+    the next stage (here, no_client because we mock the client to None)."""
+    from src.execution import polymarket_client as pc
+
+    session = AsyncMock()
+    with patch.object(pc, "is_live", return_value=True), \
+         patch.object(pc, "get_daily_spend", new=AsyncMock(return_value=0.0)), \
+         patch.object(pc, "get_wallet_usdc_balance", return_value=None), \
+         patch.object(pc, "get_token_ids", new=AsyncMock(return_value=("yes-tok", "no-tok"))), \
+         patch.object(pc, "_get_client", return_value=None):
+        ok = await pc.place_order(trade_for_place_order, session)
+
+    assert ok is False
+    assert trade_for_place_order.exchange_status == "no_client"
+    # Insufficient_balance NOT set → pre-flight correctly degraded to no-op.
+
+
+@pytest.mark.asyncio
+async def test_place_order_preflight_runs_after_daily_cap(trade_for_place_order):
+    """Daily-spend cap is checked first (it's a free DB query); pre-flight
+    is second (one CLOB call). When the daily cap trips, the balance fetch
+    must not run — saves the call on the cheaper rejection path."""
+    from src.execution import polymarket_client as pc
+    from src.config import settings
+
+    session = AsyncMock()
+    # Make daily spend already exceed the cap.
+    with patch.object(pc, "is_live", return_value=True), \
+         patch.object(pc, "get_daily_spend", new=AsyncMock(return_value=settings.DAILY_SPEND_CAP_USD)), \
+         patch.object(pc, "get_wallet_usdc_balance") as bal_mock:
+        ok = await pc.place_order(trade_for_place_order, session)
+
+    assert ok is False
+    assert trade_for_place_order.exchange_status == "cap_exceeded"
+    bal_mock.assert_not_called()

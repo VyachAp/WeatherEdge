@@ -66,6 +66,7 @@ from src.signals.decision_log import (
     OUTCOME_DRAWDOWN_PAUSED,
     OUTCOME_DUP_DB,
     OUTCOME_DUP_INPROC,
+    OUTCOME_INSUFFICIENT_BALANCE,
     OUTCOME_NO_FILL,
     OUTCOME_ORDER_FAILED,
     OUTCOME_STAKE_BELOW_MIN,
@@ -805,15 +806,23 @@ async def job_unified_pipeline() -> None:
                             )
                         else:
                             # place_order returned False — the FAK never
-                            # posted (no token IDs, no client, raised). Trade
-                            # row stays PENDING. Log so dashboards distinguish
-                            # this from no_fill (which IS posted, just unmatched).
+                            # posted (no token IDs, no client, raised, or
+                            # wallet pre-flight tripped). Trade row stays
+                            # PENDING. Distinguish `insufficient_balance` —
+                            # an intentional pre-flight skip — from real
+                            # `order_failed` so dashboards can separate
+                            # "we held back" from "we tried and lost".
+                            failed_outcome = (
+                                OUTCOME_INSUFFICIENT_BALANCE
+                                if trade.exchange_status == "insufficient_balance"
+                                else OUTCOME_ORDER_FAILED
+                            )
                             await log_decision(
                                 session,
                                 market_id=market.id,
                                 direction=edge.direction,
                                 signal_kind="probability",
-                                outcome=OUTCOME_ORDER_FAILED,
+                                outcome=failed_outcome,
                                 requested_stake_usd=adjusted_stake,
                                 metadata={
                                     "bucket": edge.bucket_value,

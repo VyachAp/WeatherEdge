@@ -46,6 +46,7 @@ OUTCOME_STAKE_BELOW_MIN = "stake_below_min"    # Kelly × dd_mult < MIN_STAKE_US
 OUTCOME_DRAWDOWN_PAUSED = "drawdown_paused"    # dd_mult == 0 (PAUSED state)
 OUTCOME_CLUSTER_CAP = "cluster_cap_hit"        # CLUSTER_STAKE_CAP_USD would be exceeded
 OUTCOME_CAP_EXCEEDED = "cap_exceeded"          # MAX_EXPOSURE_PCT / DAILY_SPEND_CAP_USD
+OUTCOME_INSUFFICIENT_BALANCE = "insufficient_balance"  # CLOB-spendable pUSD < stake
 OUTCOME_NO_TOKEN_IDS = "no_token_ids"          # Gamma had no clob token pair for market
 OUTCOME_NO_CLIENT = "no_client"                # CLOB client unavailable / no_private_key
 OUTCOME_NO_FILL = "no_fill"                    # FAK posted but engine returned 0 size
