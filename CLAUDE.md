@@ -45,7 +45,7 @@ circuit_breakers ─► get_active_weather_markets ─► group by ICAO (skip _E
       │   ensemble σ at peak hour)               │   filter, place_order, continue
       ├─ get_bias(session, icao)                 ├─ skip if price ≥ 0.99 or ≤ 0.01
       ├─ check_and_record_daily_max_alert        ├─ compute_distribution(state, buckets)
-      └─ returns WeatherState                    ├─ _binary_market_edge / compute_edges
+      └─ returns WeatherState                    ├─ _binary_market_edge
                                                  ├─ size_position (fractional Kelly × dd_mult)
                                                  └─ place_order
 
@@ -173,7 +173,7 @@ Optional Polymarket-discovery line via `projected_market_lookup.lookup_projected
 
 ### Edge calculator (`src/signals/edge_calculator.py`)
 
-`compute_edges()` (brackets) and `binary_market_edge()` (binary thresholds) — both in `signals/edge_calculator.py` — delegate filter checks to `_check_filters()`.
+`binary_market_edge()` in `signals/edge_calculator.py` is the single edge entry point for both threshold ops (`above`/`at_least`/`below`/`at_most`) and bracket-like ops (`exactly`/`range`/`bracket`, evaluated as a single-bucket window). Filter checks delegate to `_check_filters()`. (The older multi-bucket `compute_edges` path was retired 2026-05-30 — see `docs/graveyard.md`.)
 
 All filters must pass:
 
@@ -186,7 +186,7 @@ All filters must pass:
 | `minutes_to_close >= MARKET_CLOSE_BUFFER_MINUTES` | 30 | `settings` |
 | `depth >= MIN_DEPTH_USD` | 10 | `settings` |
 
-**Operator-aware edge/probability floors (added 2026-05-23).** `_check_filters` takes optional `min_edge` / `min_probability` overrides (same pattern as `min_routine_count`). `binary_market_edge` passes `settings.THRESHOLD_MIN_EDGE` / `THRESHOLD_MIN_PROBABILITY` for **threshold ops only** (`above`/`at_least`/`below`/`at_most`); bracket-like ops keep the strict global floors + the three single-bucket NO guards. Both Settings default `None` (= use global, no behavior change) and take effect only when set via `.env`. Rationale: the global `MIN_PROBABILITY` was tightened to 0.85 for the 2026-05-08 *bracket* crisis (`MIN_EDGE` default is 0.05; the live `.env` overrides it to 0.10), but threshold markets were never the problem — the 7-day prod telemetry recoverable-band analysis (`evals-report --operator threshold`) showed the `prob∈[0.78,0.85)` threshold band wins ~91% at +0.57 EV/$1. `compute_edges` (multi-bucket bracket path) and the lock path stay on the global floors.
+**Operator-aware edge/probability floors (added 2026-05-23).** `_check_filters` takes optional `min_edge` / `min_probability` overrides (same pattern as `min_routine_count`). `binary_market_edge` passes `settings.THRESHOLD_MIN_EDGE` / `THRESHOLD_MIN_PROBABILITY` for **threshold ops only** (`above`/`at_least`/`below`/`at_most`); bracket-like ops keep the strict global floors + the three single-bucket NO guards. Both Settings default `None` (= use global, no behavior change) and take effect only when set via `.env`. Rationale: the global `MIN_PROBABILITY` was tightened to 0.85 for the 2026-05-08 *bracket* crisis (`MIN_EDGE` default is 0.05; the live `.env` overrides it to 0.10), but threshold markets were never the problem — the 7-day prod telemetry recoverable-band analysis (`evals-report --operator threshold`) showed the `prob∈[0.78,0.85)` threshold band wins ~91% at +0.57 EV/$1. The lock path stays on the global floors.
 
 ### Binary vs bracket markets
 
@@ -325,7 +325,7 @@ Tests in `tests/test_<module>.py`. Mock external APIs at the module boundary (e.
 | `src/monitoring/health.py` | stdlib asyncio health-check server. Closes over a scheduler-status callable to avoid circular import. | `start_health_server` |
 | `src/signals/state_aggregator.py` | Per-ICAO weather state + det/ensemble blend + residual-slope fit + fast-poll input cache | `WeatherState`, `aggregate_state`, `build_state_from_metars`, `_blend_forecasts`, `_compute_residual_slope`, `get_cached_aggregation_inputs`, `clear_state_cache` |
 | `src/signals/probability_engine.py` | Signal-based bucket distribution. `_effective_sigma_floor` picks per-station (rolling RMSE, ≥14 sample days) vs global `ENSEMBLE_MIN_SIGMA_F` floor for the Gaussian σ. | `BucketDistribution`, `compute_distribution`, `_effective_sigma_floor` |
-| `src/signals/edge_calculator.py` | Per-bucket edge + filter checks + binary-market YES/NO side selection (was `scheduler._binary_market_edge`). | `BucketEdge`, `compute_edges`, `binary_market_edge`, `_check_filters`, `MIN_EDGE` |
+| `src/signals/edge_calculator.py` | Edge + filter checks + binary-market YES/NO side selection (was `scheduler._binary_market_edge`). | `BucketEdge`, `binary_market_edge`, `_check_filters` |
 | `src/signals/lock_rules.py` | Deterministic physical-lock decisions | `LockDecision`, `evaluate_lock`, `RANGE_LOCK_MIN_ROUTINES`, `RANGE_LOCK_MARGIN_MULTIPLIER` |
 | `src/signals/projection.py` | Pure daily-max projection math (v1 halflife + v2 residual-slope). Split out of `forecast_exceedance` so backtest / replay code can import without DB or Telegram coupling. | `project_daily_max`, `project_with_residual`, `legacy_project_daily_max`, `peak_passed`, `effective_trend`, `pick_latest_routine`, `closest_hour_index`, `c_to_f` |
 | `src/signals/forecast_exceedance.py` | Side-effect wrapper: DB row write + Telegram push trigger. Imports pure math from `signals.projection`. | `check_and_record_daily_max_alert` |

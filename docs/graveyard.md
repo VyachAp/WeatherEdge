@@ -130,3 +130,66 @@ lock-path values regardless.
    `model_prob`; the lock-path value was the only one carrying
    information not stored elsewhere. The migration discards the duplicate
    and preserves the unique data.
+
+---
+
+## 2026-05-30 — `edge_calculator.compute_edges` (multi-bucket bracket path)
+
+**Removed in:** _(pending commit — Module 3 of the audit pass)_
+**Files:** `src/signals/edge_calculator.py` (function deleted, ~60 LOC),
+`src/scheduler/__init__.py` (dead import at the top of
+`job_unified_pipeline` removed, 1 line), `tests/test_edge_calculator.py`
+(7 test classes deleted: `TestEdgeComputation`, `TestMinProbabilityFilter`,
+`TestPriceFilter`, `TestRoutineCountFilter`, `TestMarketCloseFilter`,
+`TestDepthFilter`, `TestMultipleBuckets` — ~140 LOC), CLAUDE.md (4
+references corrected: pipeline ASCII art, Edge-calculator section
+description, threshold-floor note, File Index row including the
+nonexistent `MIN_EDGE` re-export that the Gotcha section had already
+flagged as removed).
+
+**Why originally added:** the original bracket-evaluation design. A
+bracket market (e.g. "Temp 80-84 / 85-89 / 90-94 °F") has multiple
+outcome buckets, each its own YES/NO binary. `compute_edges` produced
+one `BucketEdge` per bucket so the scheduler could pick the highest-edge
+one. Tested in isolation; the filter set (`MIN_EDGE` / `MIN_PROBABILITY`
+/ price band / depth / close-buffer) lived inside it.
+
+**Why removed:** superseded by `binary_market_edge`'s bracket-like
+branch (lines ~205-218: `op in ("exactly", "range", "bracket")` →
+`market_range_f(market)` returns a single `(low, high)` window; the
+function collapses the multi-bucket evaluation into one side-pick with
+the new single-bucket NO guards). When `BRACKET_MARKETS_ENABLED=False`
+went live on 2026-05-08, the scheduler's import of `compute_edges`
+became orphaned (`scheduler/__init__.py:222` imported it but never
+called it — the only call sites were in the test file). For 3+ weeks
+the function has been a dead `def` reachable only from its own tests,
+while CLAUDE.md's File Index still listed it as part of the live
+exports. Dropping it closes a real cruft surface; if bracket markets
+ever reactivate the existing `binary_market_edge` path serves them via
+the single-bucket window. The multi-bucket-per-outcome variant lives in
+git history if ever needed.
+
+**What we learned:**
+
+1. **An orphaned import is a signal that the live caller drifted.**
+   When a module-level `from X import Y` is the only reference and Y is
+   never invoked, the audit verdict is usually "Y is also dead, not
+   just the import" — the import was the last thread tying Y to the
+   call graph. Don't just drop the `import` line; drop Y too. Module 3
+   would have left ~60 LOC of `compute_edges` standing if we'd only
+   fixed the cosmetic import.
+2. **Kill-switched features fork into "operational kill switch with
+   reactivation criterion" vs "superseded design with no reactivation
+   path".** `BRACKET_MARKETS_ENABLED=False` is the former (criterion
+   documented in `docs/improvements.md`). `compute_edges` was the
+   latter — even if brackets get re-enabled, the replacement
+   (`binary_market_edge`'s bracket-like branch) is what will run. Audit
+   should distinguish these and drop the latter; the operational
+   switches stay.
+3. **CLAUDE.md drift compounds when one section is updated without
+   another.** The Gotcha section already documented "the
+   `edge_calculator.MIN_EDGE` re-export was removed; `_check_filters`
+   reads `settings.MIN_EDGE` directly", but the File Index row for the
+   same file still listed `MIN_EDGE` as an export. Two contradictory
+   claims in the same file. The lesson: when removing a symbol, grep
+   CLAUDE.md for the symbol name and fix every mention in one pass.

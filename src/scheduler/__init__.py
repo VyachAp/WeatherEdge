@@ -219,7 +219,6 @@ async def job_unified_pipeline() -> None:
         from src.risk.circuit_breakers import check_circuit_breakers
         from src.signals.state_aggregator import WeatherState, aggregate_state
         from src.signals.probability_engine import compute_distribution
-        from src.signals.edge_calculator import compute_edges
         from src.signals.mapper import icao_for_location, geocode
         from src.execution.polymarket_client import get_best_bid_ask, get_orderbook_depth, get_token_ids
 

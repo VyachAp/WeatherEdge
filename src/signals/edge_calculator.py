@@ -49,67 +49,6 @@ class BucketEdge:
     calibrated: bool = False
 
 
-def compute_edges(
-    distribution: BucketDistribution,
-    market_prices: dict[int, float],
-    routine_count: int,
-    market_end_time: datetime,
-    orderbook_depths: dict[int, float] | None = None,
-) -> list[BucketEdge]:
-    """Compute edge for each bucket and apply all trade filters.
-
-    Filters (from redesign doc):
-      - edge >= 0.05
-      - our_probability >= 0.60
-      - 0.40 <= market_price <= 0.97
-      - orderbook_depth >= $50
-      - routine_count >= 3
-      - market not closing within 30 minutes
-    """
-    if orderbook_depths is None:
-        orderbook_depths = {}
-
-    now = datetime.now(timezone.utc)
-    minutes_to_close = (market_end_time - now).total_seconds() / 60.0
-
-    edges: list[BucketEdge] = []
-
-    for bucket, prob in distribution.probabilities.items():
-        price = market_prices.get(bucket)
-        if price is None:
-            continue
-
-        edge = prob - price
-
-        # Apply filters
-        reason = _check_filters(
-            edge=edge,
-            prob=prob,
-            price=price,
-            routine_count=routine_count,
-            minutes_to_close=minutes_to_close,
-            depth=orderbook_depths.get(bucket, 0.0),
-        )
-
-        edges.append(BucketEdge(
-            bucket_value=bucket,
-            our_probability=round(prob, 4),
-            market_price=price,
-            edge=round(edge, 4),
-            passes=reason is None,
-            reject_reason=reason,
-        ))
-
-    if edges:
-        parts = []
-        for e in edges:
-            tag = "PASS" if e.passes else (e.reject_reason or "FAIL")
-            parts.append(f"{e.bucket_value}→{e.edge:+.3f}(ours={e.our_probability:.2f},mkt={e.market_price:.2f},{tag})")
-        logger.info("edges: %s", " | ".join(parts))
-
-    return edges
-
-
 def binary_market_edge(
     dist: BucketDistribution,
     market,
@@ -396,7 +335,7 @@ def _check_filters(
     ``settings.MIN_PROBABILITY`` for callers that gate a specific operator
     class (``binary_market_edge`` passes the threshold-only
     ``THRESHOLD_MIN_*`` overrides). ``None`` = use the global setting, so
-    existing callers (``compute_edges``, the lock path) are unchanged.
+    legacy callers (lock path) are unchanged.
     """
     eff_min_edge = settings.MIN_EDGE if min_edge is None else min_edge
     eff_min_prob = (
