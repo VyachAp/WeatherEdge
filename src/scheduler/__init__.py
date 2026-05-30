@@ -96,13 +96,34 @@ _drawdown_peak_loaded_at: datetime | None = None
 _DRAWDOWN_PEAK_RELOAD_TTL = timedelta(seconds=300)
 _shutdown_event: asyncio.Event | None = None
 
-# Per-station rollover dicts live in ``persistence.cache_rollover`` — both
-# the unified pipeline and the fast-lock-poll job mutate them. They're
-# re-exported above as ``_locked_markets_fired_today`` /
-# ``_unified_fired_today`` / ``_last_routine_seen`` / ``_market_to_icao``
-# / ``_local_day_seen`` (and the rollover sweep helper
-# ``_maybe_clear_per_station_caches``) so existing callers in this module
-# keep their identifiers.
+# A note on the ``_X`` aliases in the import block above.
+#
+# Many of those imports use ``from X import name as _name``. The
+# underscore prefix is **historical**: these symbols were once defined
+# locally in this file as private helpers (with underscore prefix), then
+# refactored out into focused submodules (``execution.binary_market``,
+# ``execution.lock_rule_executor``, ``persistence.cache_rollover``,
+# ``persistence.dedup``, ``signals.edge_calculator``,
+# ``signals.evaluation_log``, ``risk.cluster_cap``, ``monitoring.health``).
+# The aliases preserve the in-file callsites that already read ``_name``
+# AND keep the small set of tests that import via the underscore form
+# working (see ``tests/test_scheduler.py``: ``_binary_market_edge``,
+# ``_has_active_trade``, ``_log_evaluation``, ``_minimal_state_for_easy_lock``,
+# ``_should_skip_future_day``, ``_upsert_signal``).
+#
+# These are NOT private to the scheduler — they're public functions of
+# their canonical home modules. New code should prefer importing from
+# the canonical home (``from src.signals.edge_calculator import
+# binary_market_edge`` etc.) rather than via the scheduler's alias.
+# The aliases are not the scheduler's public API surface; only
+# ``run_scheduler``, ``configure_logging``, ``backfill_markets``, and
+# ``start_health_server`` are.
+#
+# ``_load_stuck_alert_cooldown`` / ``_persist_stuck_alert_cooldown`` are
+# different — those are genuinely scheduler-local helpers (defined below
+# in this file) that tests import for unit coverage of the reconcile
+# heartbeat. The underscore there means "private to scheduler", and that
+# meaning is correct.
 
 # ---------------------------------------------------------------------------
 # Health server — module-local thin wrapper that closes over `_scheduler`
