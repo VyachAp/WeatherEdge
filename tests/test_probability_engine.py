@@ -2,10 +2,25 @@
 
 from __future__ import annotations
 
+import re
+
 import pytest
 
+from src.config import settings
 from src.signals.probability_engine import BucketDistribution, compute_distribution
 from src.signals.state_aggregator import WeatherState
+
+
+_SIGMA_RE = re.compile(r"sigma=([\d.]+)°F")
+
+
+def _sigma_from_reasoning(dist: BucketDistribution) -> float:
+    """Extract the chosen σ from the reasoning trail (first match)."""
+    for line in dist.reasoning:
+        m = _SIGMA_RE.search(line)
+        if m:
+            return float(m.group(1))
+    raise AssertionError(f"no sigma= token in reasoning: {dist.reasoning}")
 
 
 def _make_state(**overrides) -> WeatherState:
@@ -370,6 +385,111 @@ class TestEnsembleSigma:
         peak_narrow = max(dist_narrow.probabilities.values())
         peak_wide = max(dist_wide.probabilities.values())
         assert peak_narrow > peak_wide
+
+
+class TestLeadTimeAwareSigmaFloor:
+    """Lead-time-aware σ floor (added 2026-05-30).
+
+    Concrete failure motivating the change: Amsterdam 2026-05-23,
+    σ ≈ 1.1°C at h=11.5 pre-peak because 4 ensemble models agreed
+    tightly → adjacent single-°C buckets (27/28/29) all looked
+    near-impossible → NO triggered on all three. The additive arm
+    enforces ``floor ≥ slope × hours_until_peak`` so a confident
+    ensemble at long lead can't pin σ below physical forecast-error
+    variance. The hours-based multiplier exposes the previously-
+    hardcoded 0.5× soft floor so the moderate-lead band can be
+    tightened independently.
+
+    Defaults preserve pre-2026-05-30 behavior bit-for-bit.
+    """
+
+    def test_flag_off_preserves_current_behavior(self, monkeypatch):
+        """Defaults (flag off, mult 0.5) → identical σ to historical code."""
+        monkeypatch.setattr(settings, "SIGMA_FLOOR_LEAD_TIME_ENABLED", False)
+        monkeypatch.setattr(settings, "SIGMA_HOURS_FLOOR_MULTIPLIER", 0.5)
+        state = _make_state(
+            forecast_sigma_f=0.5,        # × 1.3 = 0.65 → floor binds
+            ensemble_model_count=4,
+            hours_until_peak=12.0,
+            current_max_f=60.0,
+        )
+        dist = compute_distribution(state, BUCKETS)
+        sigma = _sigma_from_reasoning(dist)
+        # Lead arm zeroed; combined_floor = max(2.0 global, 0) = 2.0;
+        # clipped = max(2.0, 0.65) = 2.0; hours_floor=3.5 × 0.5 = 1.75;
+        # sigma = max(2.0, 1.75) = 2.0 (historical behavior).
+        assert sigma == pytest.approx(2.0, abs=0.01)
+
+    def test_long_lead_widens_floor_when_flag_on(self, monkeypatch):
+        """Flag on at h=12 with default slope 0.3 → σ ≥ 3.6."""
+        monkeypatch.setattr(settings, "SIGMA_FLOOR_LEAD_TIME_ENABLED", True)
+        monkeypatch.setattr(settings, "SIGMA_LEAD_TIME_SLOPE_F_PER_HR", 0.3)
+        monkeypatch.setattr(settings, "SIGMA_HOURS_FLOOR_MULTIPLIER", 0.5)
+        state = _make_state(
+            forecast_sigma_f=0.5,        # × 1.3 = 0.65 (ensemble tight)
+            ensemble_model_count=4,
+            hours_until_peak=12.0,
+            current_max_f=60.0,
+        )
+        dist = compute_distribution(state, BUCKETS)
+        sigma = _sigma_from_reasoning(dist)
+        # lead_floor = 0.3 × 12 = 3.6; combined_floor = max(2.0, 3.6) = 3.6;
+        # clipped = max(3.6, 0.65) = 3.6; sigma = max(3.6, 1.75) = 3.6.
+        assert sigma == pytest.approx(3.6, abs=0.01)
+        # Reasoning must surface lead_floor for operator forensics.
+        assert any("lead_floor=3.60°F" in r for r in dist.reasoning)
+
+    def test_near_peak_unchanged_when_flag_on(self, monkeypatch):
+        """At h=0.5 the additive arm contributes ~0.15 — sub-floor → no σ shift."""
+        monkeypatch.setattr(settings, "SIGMA_FLOOR_LEAD_TIME_ENABLED", True)
+        monkeypatch.setattr(settings, "SIGMA_LEAD_TIME_SLOPE_F_PER_HR", 0.3)
+        monkeypatch.setattr(settings, "SIGMA_HOURS_FLOOR_MULTIPLIER", 0.5)
+        state = _make_state(
+            forecast_sigma_f=0.5,
+            ensemble_model_count=4,
+            hours_until_peak=0.5,
+            current_max_f=60.0,
+        )
+        dist = compute_distribution(state, BUCKETS)
+        sigma = _sigma_from_reasoning(dist)
+        # lead_floor = 0.15; combined_floor = max(2.0, 0.15) = 2.0;
+        # clipped = max(2.0, 0.65) = 2.0; hours_floor=1.5 × 0.5 = 0.75;
+        # sigma = max(2.0, 0.75) = 2.0 — identical to baseline.
+        assert sigma == pytest.approx(2.0, abs=0.01)
+
+    def test_max_sigma_clip_still_applies(self, monkeypatch):
+        """Extreme slope at long lead must clip to ENSEMBLE_MAX_SIGMA_F."""
+        monkeypatch.setattr(settings, "SIGMA_FLOOR_LEAD_TIME_ENABLED", True)
+        monkeypatch.setattr(settings, "SIGMA_LEAD_TIME_SLOPE_F_PER_HR", 2.0)
+        monkeypatch.setattr(settings, "SIGMA_HOURS_FLOOR_MULTIPLIER", 0.5)
+        state = _make_state(
+            forecast_sigma_f=0.5,
+            ensemble_model_count=4,
+            hours_until_peak=10.0,        # 2.0 × 10 = 20 → must clip
+            current_max_f=60.0,
+        )
+        dist = compute_distribution(state, BUCKETS)
+        sigma = _sigma_from_reasoning(dist)
+        assert sigma == pytest.approx(settings.ENSEMBLE_MAX_SIGMA_F, abs=0.01)
+
+    def test_hours_based_multiplier_tunable_independently(self, monkeypatch):
+        """Multiplier change alone widens σ even with the lead arm off."""
+        # Without RMSE override the global ENSEMBLE_MIN_SIGMA_F=2.0 binds
+        # at h=4 with the old 0.5× mult. Bumping mult to 1.0 lifts σ to the
+        # full hours_floor of 2.5.
+        monkeypatch.setattr(settings, "SIGMA_FLOOR_LEAD_TIME_ENABLED", False)
+        monkeypatch.setattr(settings, "SIGMA_HOURS_FLOOR_MULTIPLIER", 1.0)
+        state = _make_state(
+            forecast_sigma_f=0.5,         # × 1.3 = 0.65 (sub-floor)
+            ensemble_model_count=4,
+            hours_until_peak=4.0,
+            current_max_f=60.0,
+        )
+        dist = compute_distribution(state, BUCKETS)
+        sigma = _sigma_from_reasoning(dist)
+        # combined_floor=2.0; clipped=2.0; hours_floor=2.5 × 1.0 = 2.5;
+        # sigma = max(2.0, 2.5) = 2.5.
+        assert sigma == pytest.approx(2.5, abs=0.01)
 
 
 class TestReasoning:

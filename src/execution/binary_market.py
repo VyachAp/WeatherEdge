@@ -144,6 +144,10 @@ def make_binary_buckets(market, state) -> list[int]:
     return list(range(low, upper + 11))
 
 
+_THRESHOLD_OPS: frozenset[str] = frozenset({"above", "at_least", "below", "at_most"})
+_BRACKET_LIKE_OPS: frozenset[str] = frozenset({"bracket", "range", "exactly"})
+
+
 def is_bracket_like(market) -> bool:
     """True for multi-bucket window markets (bracket / range / exactly).
 
@@ -151,7 +155,29 @@ def is_bracket_like(market) -> bool:
     markets (above/at_least/below/at_most) are NOT bracket-like — they're
     a single binary outcome, no anti-correlated buckets.
     """
-    return market.parsed_operator in ("bracket", "range", "exactly")
+    return market.parsed_operator in _BRACKET_LIKE_OPS
+
+
+def operator_class(market_or_op) -> str | None:
+    """Canonical operator-class label for filter/calibration routing.
+
+    Returns ``"threshold"`` for one-sided binary thresholds, ``"bracket-like"``
+    for the single-bucket window family, and ``None`` for unparsed / unknown
+    operators. Accepts either a ``Market`` row (reads ``parsed_operator``) or
+    a raw operator string. Single source-of-truth so the same split is shared
+    by ``cli.py`` (telemetry reports), ``calibration.py`` (per-class fit
+    selection), and ``edge_calculator.py`` (per-class filter floors).
+    """
+    op = (
+        getattr(market_or_op, "parsed_operator", None)
+        if not isinstance(market_or_op, str)
+        else market_or_op
+    )
+    if op in _THRESHOLD_OPS:
+        return "threshold"
+    if op in _BRACKET_LIKE_OPS:
+        return "bracket-like"
+    return None
 
 
 def near_peak_floor_eligible(

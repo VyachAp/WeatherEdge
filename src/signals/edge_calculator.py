@@ -179,7 +179,7 @@ def binary_market_edge(
     # Local imports avoid a startup-time cycle on `binary_market`
     # (which lives in src.execution and pulls in this module's parent
     # package indirectly via the polymarket question parser).
-    from src.execution.binary_market import market_range_f
+    from src.execution.binary_market import market_range_f, operator_class
     from src.signals.calibration import apply_calibration
 
     op = market.parsed_operator
@@ -253,7 +253,13 @@ def binary_market_edge(
     # resolved signals exist, or when the cache is stale (refresh happens
     # at the top of each tick).
     side_prob_raw = side_prob
-    side_prob, calibrated = apply_calibration(side_prob_raw)
+    # Forward the canonical operator class so per-class calibration (when
+    # ``PER_OPERATOR_CALIBRATION_ENABLED=True``) can pick the right fit.
+    # When the flag is off the helper falls back to the pooled fit, so
+    # this is a no-op for legacy behavior.
+    side_prob, calibrated = apply_calibration(
+        side_prob_raw, operator_class=operator_class(market),
+    )
     if calibrated:
         side_edge = round(side_prob - side_price, 4)
         logger.debug(

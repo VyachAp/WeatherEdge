@@ -176,11 +176,24 @@ def _compute_sigma(state: WeatherState, reasoning: list[str]) -> float:
     When `state.forecast_sigma_f` is populated (multi-model fetch succeeded),
     it is inflated by `ENSEMBLE_SPREAD_MULTIPLIER` to correct for documented
     NWP under-dispersion, then clipped to [floor, ENSEMBLE_MAX_SIGMA_F]
-    where ``floor`` is the per-station rolling-RMSE floor when available
-    (replaces the global ENSEMBLE_MIN_SIGMA_F — the global value over-pads
-    low-variance stations like RJTT and under-pads high-variance stations
-    like KAUS/KLAX). A soft floor at half the hours-based σ prevents
-    runaway overconfidence on stable days.
+    where ``floor`` composes three arms:
+
+    1. per-station rolling-RMSE floor when available (replaces the global
+       ENSEMBLE_MIN_SIGMA_F — the global value over-pads low-variance
+       stations like RJTT and under-pads high-variance stations like
+       KAUS/KLAX);
+    2. an additive lead-time arm
+       (``SIGMA_LEAD_TIME_SLOPE_F_PER_HR × max(0, hours_until_peak)``)
+       gated by ``SIGMA_FLOOR_LEAD_TIME_ENABLED`` — keeps a confident
+       ensemble from collapsing σ below physical forecast-error variance
+       at long lead (see EHAM 2026-05-23 case in the config docstring);
+    3. a soft hours-based floor scaled by ``SIGMA_HOURS_FLOOR_MULTIPLIER``
+       (default 0.5 — historical constant; bump to 1.0 in `.env` for
+       moderate-lead bite).
+
+    All three are no-ops at ``hours_until_peak ≤ 0`` (past peak): arm 2's
+    factor zeroes, arm 3's hours_floor is 1.0°F at h≤0 — small relative
+    to the floor.
     """
     hours_floor = _hours_based_sigma(state.hours_until_peak)
 
@@ -192,13 +205,22 @@ def _compute_sigma(state: WeatherState, reasoning: list[str]) -> float:
         return hours_floor
 
     floor, floor_source = _effective_sigma_floor(state)
+    lead = max(0.0, state.hours_until_peak)
+    lead_floor = (
+        settings.SIGMA_LEAD_TIME_SLOPE_F_PER_HR * lead
+        if settings.SIGMA_FLOOR_LEAD_TIME_ENABLED
+        else 0.0
+    )
+    combined_floor = min(settings.ENSEMBLE_MAX_SIGMA_F, max(floor, lead_floor))
     raw = state.forecast_sigma_f * settings.ENSEMBLE_SPREAD_MULTIPLIER
-    clipped = max(floor, min(settings.ENSEMBLE_MAX_SIGMA_F, raw))
-    sigma = max(clipped, hours_floor * 0.5)
+    clipped = max(combined_floor, min(settings.ENSEMBLE_MAX_SIGMA_F, raw))
+    hours_mult = settings.SIGMA_HOURS_FLOOR_MULTIPLIER
+    sigma = max(clipped, hours_floor * hours_mult)
     reasoning.append(
         f"sigma={sigma:.2f}°F (ensemble spread {state.forecast_sigma_f:.2f}°F "
         f"× {settings.ENSEMBLE_SPREAD_MULTIPLIER} from {state.ensemble_model_count} models, "
-        f"floor={floor:.2f}°F [{floor_source}], hours_floor={hours_floor:.2f}°F)"
+        f"floor={combined_floor:.2f}°F [{floor_source}, lead_floor={lead_floor:.2f}°F], "
+        f"hours_floor={hours_floor:.2f}°F×{hours_mult})"
     )
     return sigma
 

@@ -154,6 +154,21 @@ class Settings(BaseSettings):
     # `MIN_CALIBRATION_SAMPLES=50` resolved trades; below that, callers
     # see the raw probability unchanged. See `src/signals/calibration.py`.
     APPLY_CALIBRATION: bool = True
+    # Per-operator-class calibration split (added 2026-05-30). When True,
+    # ``apply_calibration`` looks up class-specific (slope, intercept) for
+    # ``"threshold"`` vs ``"bracket-like"`` ops, falling back to the pooled
+    # fit when the class lacks ``MIN_CALIBRATION_SAMPLES`` resolved trades
+    # of its own. When False (default), all calls use the pooled fit —
+    # bit-for-bit identical to pre-2026-05-30 behavior.
+    #
+    # Motivation: the global pooled fit is dominated by 0.95+-confidence
+    # threshold rows, so the linear slope pulls 0.78-0.85 raw predictions
+    # toward ≥0.85 — directly squashing the loosened
+    # ``THRESHOLD_MIN_PROBABILITY=0.78`` band (0 fills observed in
+    # ``signals.model_prob ∈ [0.78, 0.85)`` over the last 7+ days). Per-
+    # class fitting lets the threshold band train on its own win-rate curve
+    # without bracket-like's 0.99-dominated tail distorting it.
+    PER_OPERATOR_CALIBRATION_ENABLED: bool = False
 
     # Circuit breakers
     DAILY_LOSS_STOP_USD: float = 200.0
@@ -266,6 +281,23 @@ class Settings(BaseSettings):
     # If fewer than this many models returned usable peak-hour data, fall back
     # to the deterministic single-source endpoint.
     ENSEMBLE_MIN_MODELS: int = 3
+
+    # Lead-time-aware σ floor (2026-05-30). Concrete failure motivating
+    # this knob: Amsterdam 2026-05-23, σ collapsed to ~1.1°C at h=11.5
+    # pre-peak because 4 ensemble models agreed tightly. Adjacent
+    # single-°C buckets (27/28/29) all looked near-impossible → NO
+    # triggered on all three; -$215 / 14d on `exactly` BUY_NO. The
+    # additive arm enforces ``floor ≥ slope × hours_until_peak`` so a
+    # confident ensemble at long lead can't pin σ below physical
+    # forecast-error variance. ``SIGMA_HOURS_FLOOR_MULTIPLIER`` exposes
+    # the previously-hardcoded 0.5× soft floor on ``_hours_based_sigma``
+    # so the moderate-lead band (2-4h) can be tightened independently of
+    # the additive arm. Defaults preserve pre-2026-05-30 behavior
+    # bit-for-bit: master flag off zeros the additive arm and the 0.5
+    # multiplier matches the prior constant.
+    SIGMA_FLOOR_LEAD_TIME_ENABLED: bool = False
+    SIGMA_LEAD_TIME_SLOPE_F_PER_HR: float = 0.3
+    SIGMA_HOURS_FLOOR_MULTIPLIER: float = 0.5
 
     # Climate-normal prior. Multi-year per-station per-DOY climatology
     # acts as the Bayesian prior for the daily-max distribution before the

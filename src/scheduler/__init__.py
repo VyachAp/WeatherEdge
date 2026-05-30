@@ -966,11 +966,15 @@ async def job_daily_settlement() -> None:
             if datetime.now(timezone.utc).weekday() == 6:
                 coeffs = await get_calibration_coefficients(session)
                 if coeffs is not None:
-                    logger.info(
-                        "Calibration active: slope=%.4f intercept=%.4f",
-                        coeffs[0],
-                        coeffs[1],
-                    )
+                    # Always log the pooled fit; surface per-class fits
+                    # only when they were actually fit (≥ MIN_CALIBRATION_SAMPLES
+                    # in that class). Helps the weekly review attribute
+                    # any drift to a specific operator class.
+                    for cls, (slope, intercept) in coeffs.items():
+                        logger.info(
+                            "Calibration active [%s]: slope=%.4f intercept=%.4f",
+                            cls, slope, intercept,
+                        )
                 else:
                     logger.info("Calibration: insufficient data (<50 resolved signals)")
 

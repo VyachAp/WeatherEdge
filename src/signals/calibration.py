@@ -5,6 +5,14 @@ plus an in-process cache + sync `apply_calibration` helper used by the
 edge evaluator. Calibration is gated by ``settings.APPLY_CALIBRATION`` so
 it can be A/B-toggled without code changes while we validate that the
 fitted slope/intercept actually improve Brier on a held-out window.
+
+Per-operator split (2026-05-30): when
+``settings.PER_OPERATOR_CALIBRATION_ENABLED`` is True, the cache holds
+separate fits keyed by ``"threshold"`` / ``"bracket-like"`` (plus a
+``"pooled"`` fallback). The threshold-class pool is no longer dragged up
+by bracket-like's 0.99-dominated tail, which was the documented reason
+``THRESHOLD_MIN_PROBABILITY=0.78`` produced zero fills in the
+[0.78, 0.85) band.
 """
 
 from __future__ import annotations
@@ -19,6 +27,7 @@ from sqlalchemy.orm import joinedload
 
 from src.config import settings
 from src.db.models import Signal, Trade, TradeStatus
+from src.execution.binary_market import operator_class as _operator_class
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -27,23 +36,42 @@ logger = logging.getLogger(__name__)
 
 MIN_CALIBRATION_SAMPLES: int = 50
 
+# Cache keys. ``"pooled"`` is the always-fitted global regression that
+# preserves legacy single-fit behavior; the per-class keys are populated
+# only when each class has ≥ ``MIN_CALIBRATION_SAMPLES`` of its own.
+POOLED_KEY: str = "pooled"
+_OP_CLASS_KEYS: tuple[str, ...] = ("threshold", "bracket-like")
+
 # In-process cache for fitted (slope, intercept) — refreshed by
 # ``refresh_calibration`` (called from the scheduler tick) and read
-# synchronously by ``apply_calibration`` from the edge evaluator.
+# synchronously by ``apply_calibration`` from the edge evaluator. The
+# value is a dict keyed by operator class (plus the ``POOLED_KEY``
+# fallback) so the same cache backs single- and multi-fit modes.
 _CACHE_TTL_SEC: float = 1800.0
-_cached_coeffs: tuple[float, float] | None = None
+_cached_coeffs: dict[str, tuple[float, float]] | None = None
 _cached_at: float | None = None
+
+
+def _fit_linear(predicted: list[float], actual: list[float]) -> tuple[float, float]:
+    """Fit ``actual ≈ slope * predicted + intercept`` and return floats."""
+    slope, intercept = np.polyfit(np.array(predicted), np.array(actual), 1)
+    return float(slope), float(intercept)
 
 
 async def get_calibration_coefficients(
     session: AsyncSession,
-) -> tuple[float, float] | None:
+) -> dict[str, tuple[float, float]] | None:
     """Compute linear recalibration coefficients from resolved signals.
 
     Queries signals that have associated trades with status WON or LOST,
-    fits ``actual = slope * predicted + intercept``, and returns
-    ``(slope, intercept)``.  Returns ``None`` when fewer than
-    :data:`MIN_CALIBRATION_SAMPLES` resolved signals exist.
+    partitions rows by operator class (``"threshold"`` vs
+    ``"bracket-like"``), fits ``actual = slope * predicted + intercept``
+    per class with ≥ :data:`MIN_CALIBRATION_SAMPLES` rows, and always
+    additionally fits a pooled regression over the union. Returns a dict
+    of ``{class_key: (slope, intercept)}`` — always includes
+    ``POOLED_KEY`` when the pooled fit met the minimum, plus any
+    per-class key that met it independently. Returns ``None`` when the
+    pooled fit itself can't be made.
 
     Convention: probabilities are stored in the **side-effective frame**
     — i.e. the model's probability of the side the trade actually bet on
@@ -62,7 +90,7 @@ async def get_calibration_coefficients(
     """
     stmt = (
         select(Signal)
-        .options(joinedload(Signal.trades))
+        .options(joinedload(Signal.trades), joinedload(Signal.market))
         .join(Trade, Trade.signal_id == Signal.id)
         .where(Trade.status.in_([TradeStatus.WON, TradeStatus.LOST]))
     )
@@ -72,33 +100,63 @@ async def get_calibration_coefficients(
     if len(signals) < MIN_CALIBRATION_SAMPLES:
         return None
 
-    # Fit from raw_model_prob — the engine output *before* this regression
-    # was applied. Fitting from model_prob (the calibrated value) created
-    # a feedback loop: the regression learns a correction on top of its
-    # own correction. Legacy rows have raw_model_prob=NULL; fall back to
-    # model_prob there so they still contribute (with the documented
-    # caveat that those rows are already-calibrated values).
-    predicted = []
-    actual = []
+    # Bucket rows into per-class pools + the global pool. The signed
+    # rows-without-a-class case (parsed_operator NULL or unknown) is
+    # benign: they still contribute to the pooled fit but not to any
+    # class-specific fit.
+    per_class: dict[str, tuple[list[float], list[float]]] = {
+        key: ([], []) for key in _OP_CLASS_KEYS
+    }
+    pooled_pred: list[float] = []
+    pooled_actual: list[float] = []
     for sig in signals:
-        raw = sig.raw_model_prob if sig.raw_model_prob is not None else sig.model_prob
-        predicted.append(raw)
+        # Cast through ``float()`` so mypy narrows past the SQLAlchemy
+        # ``Column[float]`` type (the same pattern that the legacy
+        # single-fit code used implicitly via ``np.array``).
+        raw = float(
+            sig.raw_model_prob
+            if sig.raw_model_prob is not None
+            else sig.model_prob
+        )
         won = any(t.status == TradeStatus.WON for t in sig.trades)
-        actual.append(1.0 if won else 0.0)
+        actual_val = 1.0 if won else 0.0
 
-    predicted_arr = np.array(predicted)
-    actual_arr = np.array(actual)
-    slope, intercept = np.polyfit(predicted_arr, actual_arr, 1)
+        pooled_pred.append(raw)
+        pooled_actual.append(actual_val)
+
+        cls = _operator_class(sig.market) if sig.market is not None else None
+        if cls in per_class:
+            per_class[cls][0].append(raw)
+            per_class[cls][1].append(actual_val)
+
+    coeffs: dict[str, tuple[float, float]] = {}
+
+    pooled = _fit_linear(pooled_pred, pooled_actual)
+    coeffs[POOLED_KEY] = pooled
     logger.info(
-        "Calibration fitted on %d signals: slope=%.4f intercept=%.4f",
-        len(signals),
-        slope,
-        intercept,
+        "Calibration fitted (pooled) on %d signals: slope=%.4f intercept=%.4f",
+        len(pooled_pred), pooled[0], pooled[1],
     )
-    return (float(slope), float(intercept))
+
+    for cls, (pred, actual) in per_class.items():
+        if len(pred) >= MIN_CALIBRATION_SAMPLES:
+            coeffs[cls] = _fit_linear(pred, actual)
+            logger.info(
+                "Calibration fitted (%s) on %d signals: slope=%.4f intercept=%.4f",
+                cls, len(pred), coeffs[cls][0], coeffs[cls][1],
+            )
+        else:
+            logger.info(
+                "Calibration: %s class has %d signals (< %d) — using pooled",
+                cls, len(pred), MIN_CALIBRATION_SAMPLES,
+            )
+
+    return coeffs
 
 
-async def refresh_calibration(session: AsyncSession) -> tuple[float, float] | None:
+async def refresh_calibration(
+    session: AsyncSession,
+) -> dict[str, tuple[float, float]] | None:
     """Refresh the in-process calibration cache.
 
     Called from the unified pipeline tick. Cheap when called more often
@@ -116,36 +174,63 @@ async def refresh_calibration(session: AsyncSession) -> tuple[float, float] | No
     return coeffs
 
 
-def get_cached_calibration() -> tuple[float, float] | None:
+def get_cached_calibration(
+    operator_class: str | None = None,
+) -> tuple[float, float] | None:
     """Sync read of the in-process calibration cache.
+
+    Lookup order:
+      1. ``operator_class`` key when ``PER_OPERATOR_CALIBRATION_ENABLED``
+         is True and the class has its own cached fit;
+      2. the ``POOLED_KEY`` fallback (used whenever the class lookup is
+         disabled, missing, or the caller didn't supply a class);
+      3. ``None`` when the cache is empty, stale, or no fit exists.
 
     Returns ``None`` when no fit has succeeded yet, when the cache has
     aged out, or when too few resolved signals exist (the underlying fit
     needs ``MIN_CALIBRATION_SAMPLES`` resolved trades).
     """
-    if _cached_at is None:
+    if _cached_at is None or _cached_coeffs is None:
         return None
     if (time.time() - _cached_at) > _CACHE_TTL_SEC:
         return None
-    return _cached_coeffs
+
+    if (
+        operator_class is not None
+        and getattr(settings, "PER_OPERATOR_CALIBRATION_ENABLED", False)
+        and operator_class in _cached_coeffs
+    ):
+        return _cached_coeffs[operator_class]
+    return _cached_coeffs.get(POOLED_KEY)
 
 
-def apply_calibration(prob: float) -> tuple[float, bool]:
+def apply_calibration(
+    prob: float,
+    operator_class: str | None = None,
+) -> tuple[float, bool]:
     """Apply the cached linear calibration to a side-effective probability.
 
     Returns ``(corrected_prob, applied)``. When the
     ``APPLY_CALIBRATION`` setting is False or no coefficients are
     cached, returns ``(prob, False)`` so the caller can log/branch.
 
-    The regression is fit on ``Signal.model_prob`` (= side-effective
-    probability), so this helper expects the same frame: the model's
-    confidence on the side a trade actually bet on. Applying it to a
-    raw P(YES) for a NO trade would mix two distributions; callers
-    must apply it after side selection.
+    ``operator_class`` is forwarded to :func:`get_cached_calibration` so
+    the caller can opt into the per-class fit when the
+    ``PER_OPERATOR_CALIBRATION_ENABLED`` flag is set. The flag-off path
+    always uses the pooled fit — bit-for-bit identical to pre-split
+    behavior.
+
+    The regression is fit on ``Signal.raw_model_prob`` (the engine output
+    *before* this regression was applied — see
+    :func:`get_calibration_coefficients` for the feedback-loop reasoning),
+    in the side-effective frame: the model's confidence on the side a
+    trade actually bet on. Applying it to a raw P(YES) for a NO trade
+    would mix two distributions; callers must apply it after side
+    selection.
     """
     if not getattr(settings, "APPLY_CALIBRATION", False):
         return prob, False
-    coeffs = get_cached_calibration()
+    coeffs = get_cached_calibration(operator_class)
     if coeffs is None:
         return prob, False
     slope, intercept = coeffs
