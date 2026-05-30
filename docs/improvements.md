@@ -154,17 +154,6 @@ entirely (saves ~100 API calls per scan).
 **Leverage:** maintenance.
 **Files:** `src/ingestion/polymarket.py`, `src/config.py`.
 
-## [backlog] Drop dead Signal columns
-
-**Why:** `Signal.gfs_prob` / `ecmwf_prob` / `aviation_prob` / `wx_prob`
-are always NULL per CLAUDE.md gotcha — no live readers. Schema bloat
-hurts nothing today but Adds Confusion to anyone reading the model.
-**Success criteria:** alembic migration drops the four columns; tests
-still pass.
-**Effort:** 30 min.
-**Leverage:** code clarity (low priority).
-**Files:** new alembic migration, `src/db/models.py::Signal`.
-
 ## [code shipped 2026-05-23, awaiting .env enable] Operator-aware MIN_PROBABILITY / MIN_EDGE (threshold-only)
 
 **Why:** `MIN_PROBABILITY=0.85` / `MIN_EDGE=0.10` were tightened for the

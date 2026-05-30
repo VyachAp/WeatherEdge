@@ -109,13 +109,6 @@ class Signal(Base):
     lock_branch = Column(String)  # 'easy_super' | 'easy_standard' | 'hard' | 'range_overshoot' | 'range_undershoot' | 'range_in_window'
     lock_routine_count = Column(Integer)
     lock_observed_max_f = Column(Float)
-    # Legacy per-model probability columns — always NULL in the unified
-    # pipeline. Kept for schema compatibility (no live readers); drop via
-    # migration once we're comfortable with the column-removal path.
-    gfs_prob = Column(Float)
-    ecmwf_prob = Column(Float)
-    aviation_prob = Column(Float)
-    wx_prob = Column(Float)
     created_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
 
     market = relationship("Market", back_populates="signals")
