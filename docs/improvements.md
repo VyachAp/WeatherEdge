@@ -529,3 +529,73 @@ forward-looking telemetry; this entry exists so a future audit pass
 does not re-flag it. Drop the corpus only if a future analysis pass
 concludes the dimensions captured are insufficient to deliver any of
 the above.
+
+## [climate-prior backlog] Write `scripts/backfill_station_normals.py` to bootstrap the Bayesian prior
+
+**Why:** the climate-prior path through `probability_engine._apply_climate_prior`
+is fully wired end-to-end (model, persistence, in-process cache, leap-day DOY
+mapping, state-aggregator gate, full Bayesian posterior math with σ-floor
+protection, 6+ tests in `test_probability_engine.py` and 7 in
+`test_station_normals.py`). The ONE missing piece is the backfill loader that
+populates `station_normals` — without it, `get_normal()` always returns `None`,
+`state.climate_prior_mean_f/_std_f` stay `None`, and `_apply_climate_prior`
+short-circuits on the `prior_mean is None` guard. `CLIMATE_PRIOR_ENABLED=False`
+as a result.
+
+**What it would do:** a one-shot script that, for each ICAO in `CITY_ICAO`
+(plus optional --stations override), pulls multi-decade daily-max temperature
+from an archival reanalysis source (Open-Meteo Archive `era5_seamless` is the
+intended default per the model docstring), aggregates by DOY (leap-day mapping
+is already handled by `_doy_for_lookup`), and writes one row per (icao, doy)
+via `upsert_normal()`. ~50-100 LOC.
+
+**Sketch of the call:**
+```
+GET https://archive-api.open-meteo.com/v1/archive
+    ?latitude=<lat>&longitude=<lon>
+    &start_date=1995-01-01&end_date=<today minus 1y>
+    &daily=temperature_2m_max&timezone=auto
+```
+Then group by DOY → `mean()`, `std()`, `count` → upsert. For ~60 stations and
+30 years of data that is ~60 API calls and ~22k rows total. Throttle to stay
+inside Open-Meteo Archive rate limits (probably one call per station, all years
+in one window).
+
+**Sanity checks (run inline before upsert):** mean within `[-40, 50]°C`; std
+within `[0.5, 15]°C`; sample_years >= 20 per DOY. Reject rows that fail; log
+the ICAO so it can be excluded from the prior path.
+
+**Success criteria:**
+- `station_normals` has ≥ `0.95 * 60 * 365` rows after the script runs once.
+- A spot-check: `python -m src.cli ...` (or a one-off REPL) calls
+  `get_normal(session, "KAUS", date.today())` and returns a non-None value
+  with `sample_years ≥ 25`, `mean_max_c` within ±5°C of the climatology
+  documented externally (e.g. NOAA station normals page).
+- After flipping `CLIMATE_PRIOR_ENABLED=true` in `.env` and restarting, the
+  probability-engine reasoning trail (visible via `python debug_pipeline.py`)
+  contains the line emitted by `_apply_climate_prior` showing prior_mean,
+  prior_std, and posterior_mean/posterior_std.
+- One week of live data: `evals-report --operator threshold` shows the
+  recoverable-band `prob∈[0.78,0.85)` win rate has not degraded (the prior
+  should tighten or shift conviction, not blow it up).
+
+**Effort:** half a day for the script + a few hours of monitoring after the
+first live week.
+
+**Leverage:** signal-quality. Direct fix for the `exactly` NO σ-collapse
+failure class — a tight ensemble far from peak should be anchored by the
+climate prior, which is exactly what this blend does. Pair with the
+`[backlog] Lead-time-aware σ floor` work for a more complete fix.
+
+**Files:** new `scripts/backfill_station_normals.py`,
+`src/ingestion/station_normals.py` (no changes — the upsert helper is
+ready), `.env` (flip the flag after first successful run).
+
+**Notes:** flagged 2026-05-30 during the per-module audit pass (Module 5).
+The audit initially treated the unpopulated table as cruft because three
+places (`station_normals.py` docstring, `StationNormal` model docstring,
+`CLIMATE_PRIOR_ENABLED` Settings comment) all carried a stub TODO
+referencing the missing script. Docs have been corrected to frame this
+as a planned bootstrap step pointing here; this entry exists so a future
+audit pass does not re-flag it. The wiring is the asset; only the data is
+missing.

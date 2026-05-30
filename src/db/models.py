@@ -441,11 +441,16 @@ class StationNormal(Base):
     """Climatological prior — multi-year mean & std of daily-max
     temperature for one (station, day-of-year) combination.
 
-    Source defaults to the Open-Meteo Archive ERA5 reanalysis. Intended to be
-    backfilled once via a ``scripts/backfill_station_normals.py`` loader (TODO:
-    does not exist yet) and read on every pipeline tick by
-    ``ingestion.station_normals.get_normal`` to seed the Bayesian prior before
-    forecast/observation likelihoods update it.
+    Source defaults to the Open-Meteo Archive ERA5 reanalysis. Read on
+    every pipeline tick by ``ingestion.station_normals.get_normal`` to
+    seed the Bayesian prior consumed by
+    ``probability_engine._apply_climate_prior`` before the
+    forecast/observation likelihood updates it.
+
+    **Status:** infrastructure complete; table is **unpopulated** pending
+    a one-shot backfill loader (``scripts/backfill_station_normals.py``).
+    ``CLIMATE_PRIOR_ENABLED`` stays False until that loader runs against
+    prod once. See ``docs/improvements.md`` [climate-prior backlog].
     """
 
     __tablename__ = "station_normals"

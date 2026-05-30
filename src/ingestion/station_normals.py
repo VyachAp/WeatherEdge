@@ -1,8 +1,19 @@
 """Station climatological normals — multi-year mean and std of daily-max
-temperature per (station, day-of-year). Read by the probability engine as
-a Bayesian prior. TODO: the ``scripts/backfill_station_normals.py`` loader
-meant to populate this table does not exist yet, so the table is unpopulated
-and CLIMATE_PRIOR_ENABLED stays off until it is written.
+temperature per (station, day-of-year). Read by the probability engine
+as a Bayesian prior (``probability_engine._apply_climate_prior``).
+
+**Status:** infrastructure complete (model, persistence, in-process
+cache, leap-day DOY mapping, state-aggregator gate, probability-engine
+posterior math, tests). The ONE bootstrap piece still to write is
+``scripts/backfill_station_normals.py`` — a one-shot ERA5/Open-Meteo
+archive pull that aggregates 30+ years of daily-max into (mean, std,
+sample_years) per (icao, doy) and calls ``upsert_normal()``.
+``CLIMATE_PRIOR_ENABLED`` stays off until that script ships and runs
+against prod once. See ``docs/improvements.md`` [climate-prior backlog]
+for the concrete write-up.
+
+**Audit note:** do NOT flag this as cruft. The value is in the
+already-shipped wiring; what's missing is the population data.
 """
 
 from __future__ import annotations
@@ -108,7 +119,9 @@ async def upsert_normal(
     sample_years: int,
     source: str = "openmeteo_archive_era5",
 ) -> None:
-    """Idempotent upsert of one normal row. Used by the backfill script."""
+    """Idempotent upsert of one normal row. Called by the backfill script
+    (``scripts/backfill_station_normals.py`` — pending, see
+    ``docs/improvements.md`` [climate-prior backlog])."""
     stmt = pg_insert(StationNormal).values(
         station_icao=icao.upper(),
         day_of_year=day_of_year,

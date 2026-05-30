@@ -303,9 +303,9 @@ class Settings(BaseSettings):
     # acts as the Bayesian prior for the daily-max distribution before the
     # forecast Gaussian (likelihood) and METAR observations update it.
     # Ships disabled. Enabling requires backfilling the `station_normals`
-    # table, sanity-checking the values, then flipping this to true. NOTE:
-    # the `scripts/backfill_station_normals.py` loader does not exist yet —
-    # the feature cannot be bootstrapped as documented until it is written.
+    # table, sanity-checking the values, then flipping this to true. The
+    # `scripts/backfill_station_normals.py` loader does not exist yet — see
+    # `docs/improvements.md` [climate-prior backlog] for the concrete spec.
     CLIMATE_PRIOR_ENABLED: bool = False
     # Floor on posterior σ after the Bayesian blend — prevents tropical
     # / oceanic stations (low climatological σ) from collapsing the
