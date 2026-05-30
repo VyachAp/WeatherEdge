@@ -80,7 +80,6 @@ circuit_breakers ─► get_active_weather_markets ─► group by ICAO (skip _E
 | Polymarket CLOB | `src/execution/polymarket_client.py` | Live best bid/ask, orderbook depth, order placement |
 | Aviation METAR (6 providers) | `src/ingestion/aviation/` | Routine METAR history, daily max, trend, cycle detection. Failover: AWC → IEM → OGIMET → NOAA → CheckWX/AVWX |
 | Open-Meteo | `src/ingestion/openmeteo.py` | Hourly temp/cloud/solar/dewpoint. Two endpoints fetched concurrently: `fetch_deterministic_forecast` (central peak — bias reference frame) + `fetch_ensemble_forecast` (`ENSEMBLE_MODELS=ecmwf_ifs025,gfs_seamless,icon_seamless,gem_seamless`, inter-model spread). `_blend_forecasts` combines them. Either alone is acceptable; ensemble σ falls back to hours-based schedule when fewer than `ENSEMBLE_MIN_MODELS=3` models return data |
-| Weather.com v3 | `src/ingestion/wx.py` | Optional auxiliary station observations (`WX_API_KEY` gated) |
 
 ### Database (`src/db/models.py`)
 
@@ -92,7 +91,6 @@ Forward-looking telemetry: `ForecastArchive` — one row per (station, target-lo
 Telemetry: `EvaluationLog` — append-only, one row per per-side edge evaluation (PASSING and REJECTED). Source of truth for filter-tuning backtests, since `signals` is de-duplicated per (market, side) and only carries passing edges
 Telemetry: `DecisionLog` — append-only, one row per per-side **post-filter** decision (added 2026-05-16). Captures the funnel between "passed `_check_filters`" and "Trade row persisted": outcomes are `signal_written`/`trade_pending`/`trade_filled`/`dup_blocked_inproc`/`dup_blocked_db`/`stake_below_min`/`drawdown_paused`/`cluster_cap_hit`/`cap_exceeded`/`no_token_ids`/`no_client`/`no_fill`/`order_failed`. Use this when investigating "evals passed but no trades fired" — the 2026-05-16 drawdown-stuck-at-PAUSED debug took 4h because this gap was invisible
 Runtime state: `BotState(key, value, updated_at)` — generic key/value table (JSONB value) for runtime values that must survive a process restart. Consumers: `circuit_breakers.paused_until` (consecutive-loss pause window), `reconcile.stuck_alert_last_pushed_at` (stuck-OPEN heartbeat cooldown — added 2026-05-18). Add new keys without a migration per key; dotted-string namespace convention.
-Auxiliary: `WxObservation`
 
 `Signal.signal_kind` ('probability' | 'lock') splits realised P&L by path. When `signal_kind='lock'`, `lock_branch`/`lock_routine_count`/`lock_observed_max_f`/`lock_margin_f` carry the structured `LockDecision` context (`lock_margin_f` = °F margin from threshold — "how locked"; replaces the dual-semantics `Signal.confidence` column retired 2026-05-30).
 
@@ -342,7 +340,6 @@ Tests in `tests/test_<module>.py`. Mock external APIs at the module boundary (e.
 | `src/ingestion/aviation/` | Multi-provider METAR/TAF/PIREP/SIGMET | `fetch_metar_history`, `fetch_latest_metars`, `get_routine_daily_max`, `detect_metar_cycle`, `get_temp_trend` |
 | `src/ingestion/station_bias.py` | Per-station forecast bias tracking (anchored to deterministic peak) + rolling forecast-error RMSE feeding the probability-engine σ floor | `get_bias`, `record_daily_outcome`, `is_bias_runaway`, `get_station_rmse`, `clear_station_rmse_cache` |
 | `src/ingestion/station_normals.py` | Multi-year climatological normals (per-station, per-DOY mean & std of daily-max) feeding the probability engine's Bayesian climate-prior blend. **Infra complete; table unpopulated** pending the `scripts/backfill_station_normals.py` loader — `CLIMATE_PRIOR_ENABLED=False` until it ships. See `docs/improvements.md` [climate-prior backlog]. Do NOT flag as cruft. | `get_normal`, `upsert_normal`, `NormalForDay`, `clear_cache` |
-| `src/ingestion/wx.py` | Weather.com v3 observations (optional, `WX_API_KEY` gated) | — |
 | `src/execution/polymarket_client.py` | CLOB client, orderbook, orders. `place_order` is FAK BUY; `sell_position(token_id, size)` is FAK SELL `MarketOrderArgsV2` for `bet sell`. `place_order` pre-flight (2026-05-30): daily cap → **wallet spendable** (`get_wallet_usdc_balance(force_refresh=True)`; sets `exchange_status="insufficient_balance"` on shortfall) → token IDs → client → submit | `is_live`, `get_token_ids`, `place_order`, `sell_position`, `check_order_status`, `cancel_order`, `get_best_bid_ask`, `get_orderbook_depth`, `get_daily_spend`, `get_wallet_usdc_balance` |
 | `src/execution/alerter.py` | Telegram queue + inline buttons (exec/skip/detail) + discovery alerts + daily redeem nudge | `Alerter`, `AlertType`, `get_alerter`, `_escape_md2` |
 | `src/risk/kelly.py` | Fractional Kelly + lock-rule fixed sizing | `PositionSize`, `size_position`, `size_locked_position`, `MIN_TRADE_USD`, `MAX_EXPOSURE_PCT` |

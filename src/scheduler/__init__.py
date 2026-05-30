@@ -874,24 +874,8 @@ async def job_daily_settlement() -> None:
             if settings.POLYMARKET_PRIVATE_KEY:
                 await alerter.send_redeem_nudge(session)
 
-            # 3. WX observation retention cleanup
-            if settings.WX_API_KEY:
-                from sqlalchemy import delete
-
-                from src.db.models import WxObservation as WxObservationModel
-
-                wx_cutoff = datetime.now(timezone.utc) - timedelta(
-                    hours=settings.WX_RETENTION_HOURS,
-                )
-                result = await session.execute(
-                    delete(WxObservationModel).where(
-                        WxObservationModel.valid_time_utc < wx_cutoff,
-                    )
-                )
-                if result.rowcount:
-                    logger.info("WX cleanup: deleted %d old observations", result.rowcount)
-
-            # 4. Station bias recording
+            # 3. Station bias recording (WX pipeline + its cleanup were
+            # retired 2026-05-30 — see docs/graveyard.md)
             try:
                 from src.ingestion.station_bias import record_daily_outcome
                 from src.ingestion.aviation import get_routine_daily_max

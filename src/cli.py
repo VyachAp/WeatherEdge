@@ -1973,39 +1973,16 @@ def bet_find(city: str | None, station: str | None, date_str: str | None, variab
 
         async with async_session() as session:
             if station:
-                from src.ingestion.wx import get_buffer_history
                 from src.signals.mapper import cities_for_icao
 
                 city_names = cities_for_icao(station)
                 click.echo(f"Station {station} -> cities: {', '.join(c.title() for c in city_names) or 'none'}")
 
-                # Try observation-enriched lookup
-                buf = get_buffer_history(station, count=1)
-                if buf:
-                    obs = buf[-1]
-                    current_f = obs.temp_f
-                    click.echo(f"Current observation: {current_f:.1f}F")
-                    matches = await find_markets_for_observation(
-                        session, station, current_f, hours_ahead=hours,
-                    )
-                    if not matches:
-                        click.echo("No markets found.")
-                        return
-
-                    click.echo(f"\n{'#':<4} {'Question':<52} {'YES':>5} {'Thresh':>7} {'Dist':>6} {'Dir':>11} {'Liq':>10}")
-                    click.echo("-" * 100)
-
-                    for i, mm in enumerate(matches, 1):
-                        m = mm.market
-                        q = (m.question or "")[:50]
-                        yes_str = f"{m.current_yes_price:.0%}" if m.current_yes_price else "?"
-                        thresh = f"{m.parsed_threshold:.0f}F" if m.parsed_threshold is not None else "?"
-                        dist = f"{mm.distance_to_threshold:+.1f}" if mm.distance_to_threshold is not None else "?"
-                        liq = f"${m.liquidity:,.0f}" if m.liquidity else "?"
-                        click.echo(f"{i:<4} {q:<52} {yes_str:>5} {thresh:>7} {dist:>6} {mm.direction:>11} {liq:>10}")
-                    return
-
-                # No observation buffer — plain station lookup
+                # Plain station lookup. (The observation-enriched path
+                # was removed with the WX pipeline 2026-05-30 — see
+                # docs/graveyard.md. `find_markets_for_observation` is
+                # still available for callers that have an out-of-band
+                # observation source.)
                 markets = await find_markets_for_station(
                     session, station, variable=variable, hours_ahead=hours,
                 )

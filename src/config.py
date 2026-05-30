@@ -40,13 +40,6 @@ class Settings(BaseSettings):
     CHECKWX_API_KEY: str = ""
     AVWX_API_KEY: str = ""
 
-    # Weather Company v3 observations (airport ICAO stations)
-    WX_API_KEY: str = ""  # Empty = WX pipeline disabled
-    WX_RATE_LIMIT_RPS: float = 1.5  # ~90/min conservative
-    WX_DAILY_BUDGET: int = 10000
-    WX_RETENTION_HOURS: int = 48
-    WX_PEAK_CONFIRM_MINUTES: int = 15  # Minutes of decline before declaring peak done
-
     # Polymarket execution
     POLYMARKET_PRIVATE_KEY: str = ""  # Polygon wallet private key; empty = dry-run
     POLYMARKET_HOST: str = "https://clob.polymarket.com"

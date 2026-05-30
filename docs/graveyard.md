@@ -193,3 +193,82 @@ git history if ever needed.
    same file still listed `MIN_EDGE` as an export. Two contradictory
    claims in the same file. The lesson: when removing a symbol, grep
    CLAUDE.md for the symbol name and fix every mention in one pass.
+
+---
+
+## 2026-05-30 — WX (Weather Company v3) pipeline
+
+**Removed in:** _(pending commit — Module 6 of the audit pass)_
+**Files:** `src/ingestion/wx.py` (620 LOC, full module deleted),
+`tests/test_wx.py` (8 test classes deleted), `src/db/models.py`
+(`WxObservation` ORM class deleted), `src/config.py` (5 `WX_*` Settings
+deleted), `src/scheduler/__init__.py` (WX retention-cleanup block in
+`job_daily_settlement` deleted), `src/cli.py` (`bet find --station`
+observation-enriched branch removed; falls straight through to
+`find_markets_for_station`), CLAUDE.md (3 references: Data-sources row,
+Auxiliary models line, File Index row), Alembic migration
+`s9t0u1v2w3x4_drop_wx_observations.py` (defensive `DROP TABLE IF EXISTS
+wx_observations`).
+
+**Why originally added:** Weather Company v3 (`api.weather.com`)
+publishes per-station current observations on a ~5-minute cadence —
+roughly 10× the routine-METAR rate — with a richer field set (temp,
+dewpoint, humidity, wind, wind gust, wind direction, pressure +
+tendency, 1/6/24h precip + snow, `temperatureMaxSince7Am`,
+`temperatureMax24Hour`, cloud cover, visibility, UV index). The intent
+was to supplement the once-an-hour METAR feed with fresh observations
+for last-mile peak detection. The module shipped a full ingestion +
+trend-analysis + threshold-event-detection pipeline (HTTP fetch with
+retry, daily-budget rate limiter, 60s response cache, in-process
+rolling buffer for ~10h of obs, linear-regression rate fit, multi-
+indicator peak-likely-passed detection, threshold-crossed / peak-
+likely-done event types). Tests passed in isolation.
+
+**Why removed:** the writer was never (or no longer) scheduled in
+production. No code in `src/` ever calls `poll_stations` /
+`poll_and_store` / `fetch_wx_current`. The `wx_observations` table
+therefore accumulated zero rows; the nightly cleanup at
+`job_daily_settlement` (gated on `WX_API_KEY`) deleted zero rows
+every night; the `bet find --station` CLI hook called
+`get_buffer_history` against an always-empty in-process buffer and
+silently fell through behind `if buf:`. Two clear tombstones — the
+cleanup job and the CLI hook — both presupposed a writer that no
+longer exists.
+
+When asked "was this shipped intentionally for future use, like
+`forecast_archive` and `station_normals`?" the answer was: no, an
+early experiment that didn't survive. Unlike the climate-prior
+infra (a known bootstrap step away from working) or the forecast
+archive (writing every tick and waiting for a reader), the WX
+pipeline needs a new scheduler job + ICAO-selection logic + error-
+budget plumbing + monitoring to ever run again — heavier than the
+"just add the missing piece" pattern of Modules 4-5, and not
+justified by a concrete signal-quality theory beyond "more frequent
+obs sounds useful".
+
+**What we learned:**
+
+1. **A cleanup job for a table no one writes is a tombstone.** When
+   `job_daily_settlement` carries an `if settings.X_API_KEY: DELETE
+   FROM x WHERE created_at < cutoff` block but no scheduler job
+   anywhere writes to `x`, the cleanup is documentation that the
+   pipeline once ran and got de-scheduled. Audits should treat both
+   the cleanup AND the data path as suspect.
+2. **A silently-degrading CLI hook is the other tombstone shape.**
+   The `bet find --station` flow's `if buf:` guard against an always-
+   empty buffer never alerted the operator that the underlying
+   pipeline was dead — it just rendered a less-rich output. The
+   lesson: when a feature degrades silently because its dependency
+   isn't wired, prefer a clear log line ("WX poller not running;
+   falling back to plain station lookup") so future-me debugs the
+   dependency, not the consumer. Or — as in this commit — remove
+   the dependent path entirely.
+3. **Distinguish "forward-looking infra waiting for one missing
+   piece" from "abandoned mid-design".** Modules 4 and 5 fit the
+   former pattern (the missing piece is small, the value is concrete,
+   the writer or reader is already running). Module 6 fit the latter
+   (re-wiring needs a new scheduler job + a non-trivial set of
+   policy decisions, and no current signal-quality investigation
+   names 5-min WX obs as the lever). The two patterns have opposite
+   audit verdicts. Ask the user; their answer determines which is
+   which.

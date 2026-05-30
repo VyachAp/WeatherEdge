@@ -235,7 +235,7 @@ src/
     openmeteo.py               Deterministic + ensemble forecast
     aviation/                  6-provider METAR/TAF/SIGMET stack (AWC, IEM, OGIMET, NOAA, CheckWX, AVWX)
     station_bias.py            Per-ICAO rolling bias correction
-    wx.py                      Optional Weather.com v3 observations
+    station_normals.py         Multi-year climate normals (feeds Bayesian prior)
   signals/
     state_aggregator.py        WeatherState builder + forecast blender
     probability_engine.py      Signal-based bucket distribution
