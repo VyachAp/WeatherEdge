@@ -65,11 +65,11 @@ async def upsert_signal(
     model_prob: float,
     market_prob: float,
     edge: float,
-    confidence: float | None,
     signal_kind: str = "probability",
     lock_branch: str | None = None,
     lock_routine_count: int | None = None,
     lock_observed_max_f: float | None = None,
+    lock_margin_f: float | None = None,
     raw_model_prob: float | None = None,
     calibrated: bool = False,
 ) -> Signal:
@@ -101,11 +101,11 @@ async def upsert_signal(
             calibrated=calibrated,
             market_prob=market_prob,
             edge=edge,
-            confidence=confidence,
             signal_kind=signal_kind,
             lock_branch=lock_branch,
             lock_routine_count=lock_routine_count,
             lock_observed_max_f=lock_observed_max_f,
+            lock_margin_f=lock_margin_f,
             created_at=now,
         )
         .on_conflict_do_update(
@@ -116,11 +116,11 @@ async def upsert_signal(
                 "calibrated": calibrated,
                 "market_prob": market_prob,
                 "edge": edge,
-                "confidence": confidence,
                 "signal_kind": signal_kind,
                 "lock_branch": lock_branch,
                 "lock_routine_count": lock_routine_count,
                 "lock_observed_max_f": lock_observed_max_f,
+                "lock_margin_f": lock_margin_f,
                 "created_at": now,
             },
         )

@@ -119,9 +119,15 @@ def status() -> None:
                     else s.created_at
                 )
                 ago = f"{age.total_seconds() / 3600:.0f}h ago"
+                # Path-aware tail: prob signals show model_prob; lock
+                # signals show the °F margin from threshold instead.
+                if s.signal_kind == "lock" and s.lock_margin_f is not None:
+                    tail = f"margin={s.lock_margin_f:.1f}°F"
+                else:
+                    tail = f"prob={s.model_prob:.2f}"
                 click.echo(
                     f"  {s.market_id[:12]}…  edge={s.edge:+.3f}  "
-                    f"{s.direction.value:<8}  conf={s.confidence:.2f}  {ago}"
+                    f"{s.direction.value:<8}  {tail}  {ago}"
                 )
 
     asyncio.run(_status())

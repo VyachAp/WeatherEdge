@@ -101,7 +101,6 @@ class Signal(Base):
     market_prob = Column(Float, nullable=False)
     edge = Column(Float, nullable=False)
     direction = Column(Enum(TradeDirection), nullable=False)
-    confidence = Column(Float)
     # Path that produced this signal — 'probability' or 'lock'. Lets
     # post-mortems split realised P&L by path without re-deriving from logs.
     signal_kind = Column(String, nullable=False, default="probability")
@@ -109,6 +108,7 @@ class Signal(Base):
     lock_branch = Column(String)  # 'easy_super' | 'easy_standard' | 'hard' | 'range_overshoot' | 'range_undershoot' | 'range_in_window'
     lock_routine_count = Column(Integer)
     lock_observed_max_f = Column(Float)
+    lock_margin_f = Column(Float)  # °F margin from threshold; "how locked" — supersedes the overloaded `confidence` column dropped 2026-05-30
     created_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
 
     market = relationship("Market", back_populates="signals")

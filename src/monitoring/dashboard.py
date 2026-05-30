@@ -124,7 +124,7 @@ def fetch_open_positions() -> pd.DataFrame:
 def fetch_todays_signals() -> pd.DataFrame:
     df = pd.read_sql(
         text(
-            "SELECT s.id, s.market_id, s.edge, s.confidence, s.model_prob, "
+            "SELECT s.id, s.market_id, s.edge, s.lock_margin_f, s.model_prob, "
             "       s.market_prob, s.direction, s.created_at, m.question, "
             "       EXISTS(SELECT 1 FROM trades t WHERE t.signal_id = s.id) AS has_trade "
             "FROM signals s JOIN markets m ON s.market_id = m.id "
@@ -177,7 +177,7 @@ def fetch_all_signals(
     date_from: date, date_to: date, min_edge: float, variable_type: str | None
 ) -> pd.DataFrame:
     query = (
-        "SELECT s.id, s.market_id, s.edge, s.confidence, s.model_prob, "
+        "SELECT s.id, s.market_id, s.edge, s.lock_margin_f, s.model_prob, "
         "       s.market_prob, s.direction, "
         "       s.created_at, m.question, m.parsed_variable, m.parsed_location, "
         "       m.current_yes_price, m.end_date, "
@@ -238,7 +238,7 @@ def fetch_active_markets() -> pd.DataFrame:
         text(
             "SELECT m.id, m.question, m.current_yes_price, m.volume, m.liquidity, "
             "       m.end_date, m.parsed_variable, m.parsed_location, "
-            "       s.model_prob, s.edge, s.confidence, s.direction "
+            "       s.model_prob, s.edge, s.lock_margin_f, s.direction "
             "FROM markets m "
             "LEFT JOIN LATERAL ( "
             "  SELECT * FROM signals WHERE market_id = m.id "
@@ -366,11 +366,12 @@ def page_overview():
         st.info("No signals generated today.")
     else:
         display = signals[
-            ["question", "edge", "confidence", "suggested_stake", "status"]
+            ["question", "edge", "model_prob", "lock_margin_f", "suggested_stake", "status"]
         ].copy()
-        display.columns = ["Market", "Edge", "Confidence", "Suggested Stake ($)", "Status"]
+        display.columns = ["Market", "Edge", "Model Prob", "Lock Margin (°F)", "Suggested Stake ($)", "Status"]
         display["Edge"] = display["Edge"].map("{:+.1%}".format)
-        display["Confidence"] = display["Confidence"].map("{:.1%}".format)
+        display["Model Prob"] = display["Model Prob"].map(lambda v: "{:.1%}".format(v) if pd.notna(v) else "")
+        display["Lock Margin (°F)"] = display["Lock Margin (°F)"].map(lambda v: "{:.1f}".format(v) if pd.notna(v) else "")
         st.dataframe(display, use_container_width=True, hide_index=True)
 
     # --- Open positions ---
@@ -425,14 +426,18 @@ def page_signal_explorer():
 
     # Scatter plot
     color_map = {"won": "#2ca02c", "lost": "#d62728", "pending": "#7f7f7f"}
+    # Calibration scatter: edge vs model probability. (Prior versions
+    # plotted vs the overloaded `confidence` column, which the
+    # 2026-05-30 audit retired — lock signals now have their own
+    # `lock_margin_f` and the probability dimension is just `model_prob`.)
     fig = px.scatter(
         df,
         x="edge",
-        y="confidence",
+        y="model_prob",
         color="outcome",
         color_discrete_map=color_map,
         hover_data=["question"],
-        labels={"edge": "Edge", "confidence": "Confidence", "outcome": "Outcome"},
+        labels={"edge": "Edge", "model_prob": "Model Probability", "outcome": "Outcome"},
     )
     fig.update_layout(template="plotly_dark", height=450)
     st.plotly_chart(fig, use_container_width=True)

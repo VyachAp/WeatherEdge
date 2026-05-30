@@ -503,8 +503,9 @@ async def test_signal_row_records_lock_branch_and_observed_max():
     assert kwargs["lock_observed_max_f"] == 88.0
     # model_prob=1.0 is the lock-rule convention (deterministic decision).
     assert kwargs["model_prob"] == 1.0
-    # confidence = margin_f so the Telegram detail view shows "how locked".
-    assert kwargs["confidence"] == 5.0
+    # lock_margin_f = °F margin from threshold ("how locked"); supersedes
+    # the overloaded `confidence` column retired 2026-05-30.
+    assert kwargs["lock_margin_f"] == 5.0
 
 
 # ---------------------------------------------------------------------------

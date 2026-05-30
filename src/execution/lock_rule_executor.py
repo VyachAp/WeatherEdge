@@ -334,10 +334,10 @@ async def try_lock_rule_trade(
             return 0.0
 
     # model_prob=1.0 because the lock rule is deterministic (no probability
-    # estimate to record). confidence carries the lock margin in °F so the
-    # detail view can show "how locked was this". Lock fields tag the
-    # branch + observation context so post-mortems can split realised P&L
-    # by which lock path produced the signal.
+    # estimate to record). lock_margin_f carries the °F margin from
+    # threshold ("how locked was this") so the detail view can surface it.
+    # Lock fields tag the branch + observation context so post-mortems can
+    # split realised P&L by which lock path produced the signal.
     sig_row = await upsert_signal(
         session,
         market_id=market.id,
@@ -345,11 +345,11 @@ async def try_lock_rule_trade(
         model_prob=1.0,
         market_prob=effective_price,
         edge=1.0 - effective_price,
-        confidence=decision.margin_f,
         signal_kind="lock",
         lock_branch=decision.branch,
         lock_routine_count=decision.routine_count,
         lock_observed_max_f=decision.observed_max_f,
+        lock_margin_f=decision.margin_f,
     )
 
     trade = Trade(

@@ -40,16 +40,6 @@ def _escape_md2(text: object) -> str:
     return _MD2_SPECIAL.sub(r"\\\1", str(text))
 
 
-def _confidence_label(confidence: float) -> str:
-    if confidence >= 0.75:
-        return "HIGH"
-    if confidence >= 0.55:
-        return "MEDIUM"
-    return "LOW"
-
-
-
-
 # ---------------------------------------------------------------------------
 # AlertType enum
 # ---------------------------------------------------------------------------
@@ -550,6 +540,14 @@ class Alerter:
         model_p = f"{signal_row.model_prob * 100:.1f}%"
         market_p = f"{signal_row.market_prob * 100:.1f}%"
 
+        # Path-aware tail: lock signals carry a °F margin from threshold
+        # ("how locked"); probability signals don't have a separate
+        # confidence dimension beyond model_prob (already shown above).
+        if signal_row.signal_kind == "lock" and signal_row.lock_margin_f is not None:
+            tail = f"\nLock margin: {e(f'{signal_row.lock_margin_f:.1f}°F')}"
+        else:
+            tail = ""
+
         return (
             f"\U0001f4ca *Signal Detail*\n"
             f"\n"
@@ -558,8 +556,8 @@ class Alerter:
             f"Model: {e(model_p)}\n"
             f"Market: {e(market_p)}\n"
             f"Edge: {e(f'{signal_row.edge * 100:+.1f}%')}\n"
-            f"Direction: {e(signal_row.direction.value)}\n"
-            f"Confidence: {e(f'{signal_row.confidence:.2f}')}"
+            f"Direction: {e(signal_row.direction.value)}"
+            f"{tail}"
         )
 
 

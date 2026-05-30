@@ -93,7 +93,7 @@ Telemetry: `DecisionLog` — append-only, one row per per-side **post-filter** d
 Runtime state: `BotState(key, value, updated_at)` — generic key/value table (JSONB value) for runtime values that must survive a process restart. Consumers: `circuit_breakers.paused_until` (consecutive-loss pause window), `reconcile.stuck_alert_last_pushed_at` (stuck-OPEN heartbeat cooldown — added 2026-05-18). Add new keys without a migration per key; dotted-string namespace convention.
 Auxiliary: `WxObservation`
 
-`Signal.signal_kind` ('probability' | 'lock') splits realised P&L by path. When `signal_kind='lock'`, `lock_branch`/`lock_routine_count`/`lock_observed_max_f` carry the structured `LockDecision` context.
+`Signal.signal_kind` ('probability' | 'lock') splits realised P&L by path. When `signal_kind='lock'`, `lock_branch`/`lock_routine_count`/`lock_observed_max_f`/`lock_margin_f` carry the structured `LockDecision` context (`lock_margin_f` = °F margin from threshold — "how locked"; replaces the dual-semantics `Signal.confidence` column retired 2026-05-30).
 
 `Trade.submit_yes_bid`/`submit_yes_ask`/`submit_depth_usd`/`submit_at` — snapshot at `place_order` time. Lets slippage post-mortems decompose `fill_price - entry_price` into spread vs depth-walked. NULL on pre-migration rows and backtest paths.
 

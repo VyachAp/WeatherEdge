@@ -600,7 +600,6 @@ class TestUpsertSignal:
             model_prob=0.7,
             market_prob=0.4,
             edge=0.3,
-            confidence=0.7,
         )
         session, captured = self._capture_session(returned)
 
@@ -611,7 +610,6 @@ class TestUpsertSignal:
             model_prob=0.7,
             market_prob=0.4,
             edge=0.3,
-            confidence=0.7,
         )
 
         # Helper passes the RETURNING row straight through.
@@ -625,7 +623,8 @@ class TestUpsertSignal:
         assert values["model_prob"] == 0.7
         assert values["market_prob"] == 0.4
         assert values["edge"] == 0.3
-        assert values["confidence"] == 0.7
+        # Probability path leaves the lock-specific column NULL.
+        assert values["lock_margin_f"] is None
         # Probability is the default path when kind is unspecified.
         assert values["signal_kind"] == "probability"
         # created_at is set by the helper, not the DB default — so refresh
@@ -642,7 +641,6 @@ class TestUpsertSignal:
             model_prob=0.8,
             market_prob=0.45,
             edge=0.35,
-            confidence=0.8,
         )
         session, captured = self._capture_session(returned)
 
@@ -653,18 +651,18 @@ class TestUpsertSignal:
             model_prob=0.8,
             market_prob=0.45,
             edge=0.35,
-            confidence=0.8,
         )
 
         _, set_dict = self._on_conflict_clauses(captured["stmt"])
         # Every mutable field is refreshed on conflict so a repeat tick
         # overwrites the previous evaluation rather than silently retaining
-        # stale values.
+        # stale values. (Overloaded `confidence` column retired 2026-05-30;
+        # the lock-path °F margin now lives in `lock_margin_f`.)
         for field in (
             "model_prob", "raw_model_prob", "calibrated",
-            "market_prob", "edge", "confidence",
+            "market_prob", "edge",
             "signal_kind", "lock_branch", "lock_routine_count",
-            "lock_observed_max_f", "created_at",
+            "lock_observed_max_f", "lock_margin_f", "created_at",
         ):
             assert field in set_dict, f"{field} missing from ON CONFLICT set_"
 
@@ -678,11 +676,11 @@ class TestUpsertSignal:
             model_prob=1.0,
             market_prob=0.92,
             edge=0.08,
-            confidence=4.5,
             signal_kind="lock",
             lock_branch="easy_super",
             lock_routine_count=2,
             lock_observed_max_f=85.0,
+            lock_margin_f=4.5,
         )
         session, captured = self._capture_session(returned)
 
@@ -693,11 +691,11 @@ class TestUpsertSignal:
             model_prob=1.0,
             market_prob=0.92,
             edge=0.08,
-            confidence=4.5,
             signal_kind="lock",
             lock_branch="easy_super",
             lock_routine_count=2,
             lock_observed_max_f=85.0,
+            lock_margin_f=4.5,
         )
 
         # Returned row carries the lock context — same object semantics as
@@ -706,6 +704,7 @@ class TestUpsertSignal:
         assert sig.lock_branch == "easy_super"
         assert sig.lock_routine_count == 2
         assert sig.lock_observed_max_f == 85.0
+        assert sig.lock_margin_f == 4.5
         # And the lock fields appear in BOTH the values AND the set_ so the
         # UPDATE branch also persists them (a market that flips
         # probability→lock between ticks must overwrite, not keep stale).

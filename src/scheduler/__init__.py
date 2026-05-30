@@ -696,7 +696,6 @@ async def job_unified_pipeline() -> None:
                             model_prob=edge.our_probability,
                             market_prob=edge.market_price,
                             edge=edge.edge,
-                            confidence=edge.our_probability,
                             raw_model_prob=edge.raw_probability,
                             calibrated=edge.calibrated,
                         )

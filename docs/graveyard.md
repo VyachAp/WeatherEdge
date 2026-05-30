@@ -61,3 +61,72 @@ drift). The drop migration therefore uses `DROP COLUMN IF EXISTS`.
    want to split telemetry by model source again, do it via a side table
    keyed to `signal_id` — that way deprecation is a single `DROP TABLE`, not
    a schema-bloat decision per column.
+
+---
+
+## 2026-05-30 — `Signal.confidence` column overload + `alerter._confidence_label`
+
+**Removed in:** _(pending commit — Module 2 of the audit pass)_
+**Files:** `src/db/models.py` (column dropped), `src/persistence/dedup.py`
+(`upsert_signal` signature: `confidence` removed, `lock_margin_f` added),
+`src/scheduler/__init__.py` (probability-path duplicate `confidence=`
+kwarg removed), `src/execution/lock_rule_executor.py` (`confidence=margin_f`
+→ `lock_margin_f=margin_f`), `src/execution/alerter.py` (dead
+`_confidence_label` helper deleted; Detail view became path-aware),
+`src/cli.py` (`bet info`/`status` display became path-aware),
+`src/monitoring/dashboard.py` (3 SELECT queries + Signals table column
++ Calibration scatter Y-axis switched to `model_prob`), tests updated,
+CLAUDE.md Database section updated, Alembic migration
+`r8s9t0u1v2w3_signal_confidence_to_lock_margin.py`.
+
+**Why originally added:** `Signal.confidence` predates the audit pass.
+The probability path wrote `confidence = our_probability` (a duplicate
+of the value also stored as `model_prob` on the same row); the lock
+path repurposed the same column to carry `decision.margin_f` (a °F
+margin from threshold), so the Detail view could show "how locked was
+this" via the same Telegram formatter. The shared formatter never
+branched on `signal_kind`, and the dashboard treated the column
+throughout as a probability (`{:.1%}` table format, calibration scatter
+`y="confidence"`).
+
+**Why removed:** the column had two incompatible meanings (probability
+0–1 vs °F margin 0–10+) written by two different paths through the same
+helper, and three readers (Telegram detail view, `bet info`, Streamlit
+dashboard) that all treated it as one dimension. Lock-path alerts
+shipped `Confidence: 5.00` to the operator (looks like 500% probability,
+not a 5°F margin) and dashboard lock rows displayed `450.0%`. Cleaner
+to split: `lock_margin_f` slots into the existing
+`lock_branch`/`lock_routine_count`/`lock_observed_max_f` cluster and is
+NULL for the probability path; probability-path callers stop passing the
+duplicate `confidence=` kwarg entirely (the dimension they cared about
+is already `model_prob`). The migration backfills
+`lock_margin_f = confidence WHERE signal_kind = 'lock'` before dropping,
+so no lock-path data is lost. `alerter._confidence_label` had zero
+callers anywhere in `src/` or `tests/` — its 0.75/0.55 thresholds
+assumed probability semantics and would have produced nonsense for
+lock-path values regardless.
+
+**What we learned:**
+
+1. **Don't overload columns across paths.** A column written with two
+   different units by two paths through the same upsert helper is a
+   semantic bug that will surface as a UX bug at the first read site
+   that doesn't `signal_kind`-branch — and most read sites don't.
+2. **Keyword-arg writes are easy to miss in audits.** The Explore agent
+   pass that produced the original plan reported `Signal.confidence` as
+   "orphaned (never written)" because it only grepped for
+   `signal.confidence = ...` attribute assignments. The actual writes
+   were `upsert_signal(..., confidence=X)` (keyword arg through a helper
+   into `pg_insert(...).values(...)`) — invisible to the grep pattern.
+   Future audits: when checking "is column X written?", grep for
+   `X=<value>` as a kwarg, not just `.X = <value>` attribute assignment.
+3. **The plan's claim that this was a "latent crash" was wrong.** The
+   column was always populated, so the f-string `:.2f` formatter never
+   hit None. The real bug was unit confusion in the read path, not a
+   null-pointer crash. Worth flagging audit findings as "verify writers
+   exist by reading actual call sites, not by grep-pattern alone".
+4. **When splitting an overloaded column, preserve only the meaningful
+   side via backfill.** The probability-path value was a duplicate of
+   `model_prob`; the lock-path value was the only one carrying
+   information not stored elsewhere. The migration discards the duplicate
+   and preserves the unique data.
