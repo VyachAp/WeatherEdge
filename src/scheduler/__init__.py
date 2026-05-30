@@ -855,6 +855,16 @@ async def job_unified_pipeline() -> None:
                 logger.warning("Unified pipeline: error evaluating %s, skipping", icao, exc_info=True)
                 continue
 
+            # M4: per-tick capital/headroom snapshot (best-effort telemetry).
+            # Uses the top-of-tick equity/exposure the sizer actually saw.
+            try:
+                from src.signals.exposure_snapshot import record_exposure_snapshot
+                await record_exposure_snapshot(
+                    session, equity=bankroll, exposure=exposure,
+                )
+            except Exception:
+                logger.warning("exposure snapshot failed (non-fatal)", exc_info=True)
+
             await session.commit()
             if skipped_cities:
                 logger.warning("Unified pipeline: %d/%d cities skipped due to errors", skipped_cities, len(city_markets))
@@ -1029,6 +1039,16 @@ async def job_startup() -> None:
     try:
         async with async_session() as session:
             bankroll = await get_current_bankroll(session)
+            # M2: stamp a config epoch so telemetry can be bucketed into
+            # before/after-flip windows. Best-effort, only inserts on change.
+            try:
+                from src.signals.config_epoch import record_config_epoch
+                epoch_id = await record_config_epoch(session)
+                await session.commit()
+                if epoch_id is not None:
+                    logger.info("Config epoch active: id=%s", epoch_id)
+            except Exception:
+                logger.warning("config epoch record failed (non-fatal)", exc_info=True)
         await alerter._enqueue(
             f"\U0001f680 *WeatherEdge started*\n"
             f"Bankroll: ${bankroll:,.2f}\n"

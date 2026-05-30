@@ -207,6 +207,13 @@ class EvaluationLog(Base):
     current_max_f = Column(Float)
     hours_until_peak = Column(Float)
     forecast_sigma_f = Column(Float)
+    # Counterfactual / shadow telemetry (M1, 2026-05-30). Flexible JSONB
+    # so each experiment can stash the would-be value of a not-yet-live
+    # feature (e.g. ``cal.pooled`` vs ``cal.class``, ``sigma.live_f`` vs
+    # ``sigma.leadtime_floor_f``) under dotted keys — enabling
+    # "measure before flip" without a migration per experiment. NULL by
+    # default; populated only by experiments that opt in.
+    shadow_json = Column(JSONB)
     created_at = Column(
         DateTime(timezone=True),
         nullable=False,
@@ -265,6 +272,126 @@ class BankrollLog(Base):
     peak = Column(Float, nullable=False)
     drawdown_pct = Column(Float, nullable=False)
     timestamp = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
+
+
+# ---------------------------------------------------------------------------
+# Measurement layer (Phase 0, 2026-05-30) — see docs/improvements.md and the
+# profitability roadmap. These make every later feature flip data-proven:
+# config epochs (M2) bucket telemetry into before/after-flip windows, exposure
+# snapshots (M4) chart the capital headroom that gates Phase 1, and market
+# resolutions (M3) are the de-circularised ground truth Phase 3 reads.
+# ---------------------------------------------------------------------------
+
+
+class ConfigEpoch(Base):
+    """One row per distinct trading-config snapshot (M2).
+
+    Written at scheduler startup, but only when the experiment-relevant
+    settings differ from the latest stored epoch — so each row marks a
+    real config change. Telemetry rows (evaluation_logs / decision_logs /
+    exposure_snapshots) are bucketed into an epoch at *read* time by
+    ``created_at >= started_at`` of the latest epoch at or before them,
+    giving clean before/after-flip A/B without stamping a foreign key on
+    the hot-path tables. ``flags_json`` captures the dark-feature flags +
+    sizing thresholds whose flips this roadmap gates.
+    """
+
+    __tablename__ = "config_epochs"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    started_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+    flags_json = Column(JSONB, nullable=False)
+    note = Column(String)  # optional human label for the change
+
+
+class ExposureSnapshot(Base):
+    """Per-tick capital / headroom snapshot (M4).
+
+    One row per ``job_unified_pipeline`` tick (~288/day). Turns the
+    one-off 2026-05-23 "exposure cap saturated, ~$25-32 room" diagnosis
+    into a standing timeseries so the Phase-0 capital gate — does raising
+    ``MAX_EXPOSURE_USD_FLOOR`` actually open per-tick headroom? — is
+    measured, not guessed. ``n_open_by_class`` is a
+    ``{operator_class: count}`` dict. ``n_candidates`` / ``n_sized_to_zero``
+    are per-tick funnel counters (nullable when not accumulated).
+    """
+
+    __tablename__ = "exposure_snapshots"
+    __table_args__ = (
+        Index("ix_exposure_snapshots_created", "created_at"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    equity = Column(Float, nullable=False)
+    exposure = Column(Float, nullable=False)
+    effective_cap = Column(Float, nullable=False)
+    headroom = Column(Float, nullable=False)
+    n_open = Column(Integer, nullable=False, default=0)
+    n_open_by_class = Column(JSONB)
+    dd_level = Column(String)
+    dd_mult = Column(Float)
+    n_candidates = Column(Integer)
+    n_sized_to_zero = Column(Integer)
+    created_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+
+class MarketResolution(Base):
+    """Ground-truth resolution + resolver-divergence record (M3).
+
+    One row per settled market we held. De-circularises filter tuning:
+    ``evals-report`` today scores against our own routine-METAR daily max,
+    the same source that feeds our conviction (circular for °C cities).
+    This persists, per market, the resolved YES/NO outcome and the
+    daily-max bound it implies, alongside our routine-METAR max and the
+    signed divergence (ours − resolved). Phase 3 reads the per-station
+    divergence distribution from here; the event-level interval is
+    tightened at read time by grouping on (parsed_location,
+    target_date_local).
+
+    ``resolved_max_lower_f`` / ``resolved_max_upper_f`` encode the bound
+    the outcome implies — a pinned interval for a YES-won bracket bucket,
+    a one-sided bound for thresholds. ``divergence_f`` is best-effort: the
+    signed gap when the routine max violates the implied bound, else 0.0.
+    """
+
+    __tablename__ = "market_resolutions"
+    __table_args__ = (
+        UniqueConstraint("market_id", name="uq_market_resolution_market"),
+        Index(
+            "ix_market_resolution_icao_date",
+            "station_icao",
+            "target_date_local",
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    market_id = Column(String, ForeignKey("markets.id"), nullable=False)
+    station_icao = Column(String)
+    parsed_location = Column(String)
+    target_date_local = Column(Date)
+    unit = Column(String)  # 'C' | 'F'
+    parsed_operator = Column(String)
+    parsed_threshold = Column(Float)
+    bucket_low_f = Column(Float)
+    bucket_high_f = Column(Float)
+    yes_won = Column(Boolean, nullable=False)
+    resolved_max_lower_f = Column(Float)
+    resolved_max_upper_f = Column(Float)
+    routine_metar_max_f = Column(Float)
+    divergence_f = Column(Float)
+    resolved_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
 
 
 # ---------------------------------------------------------------------------

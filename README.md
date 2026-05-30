@@ -86,7 +86,7 @@ The scheduler runs on port 8080 (health check) and the dashboard on port 8501.
 | `DATABASE_URL` | `postgresql+asyncpg://weather:weather@localhost:5432/weatheredge` | Database connection string |
 | `TELEGRAM_BOT_TOKEN` | _(empty)_ | Telegram bot token; dry-run if empty |
 | `TELEGRAM_CHAT_ID` | _(empty)_ | Telegram chat ID for alerts |
-| `MIN_EDGE` | `0.10` | Legacy setting; live pipeline uses hardcoded `edge_calculator.MIN_EDGE=0.05` |
+| `MIN_EDGE` | `0.10` | Min edge filter; read live from `settings.MIN_EDGE` (default 0.05, `.env` overrides to 0.10) |
 | `KELLY_FRACTION` | `0.25` | Fractional Kelly multiplier (0–1) for the probability path |
 | `MAX_POSITION_PCT` | `0.05` | Max single directional trade as % of bankroll |
 | `INITIAL_BANKROLL` | `750` | Starting capital in USD |
@@ -122,8 +122,8 @@ python -m src.cli bet portfolio
 python -m src.cli bet redeem --all        # CTF redemption after resolution
 
 # Maintenance
-python -m src.cli admin reset-drawdown-peak    # Reset DrawdownMonitor's stuck peak; restart scheduler after
-python -m src.cli admin reconcile-stuck        # Resolve OPEN+delayed+null-fill trades against on-chain payout; releases stuck exposure
+python -m src.cli admin reset-drawdown-peak    # Reset DrawdownMonitor's stuck peak; hot-reloads on running process within ~5 min (no restart)
+python -m src.cli admin reconcile-stuck        # Resolve OPEN+delayed+null-fill trades against on-chain payout; releases stuck exposure (--include-lost reverts phantom-LOST rows)
 
 # Trace the unified pipeline for one market/station (no orders)
 python debug_pipeline.py

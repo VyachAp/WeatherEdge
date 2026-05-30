@@ -36,6 +36,7 @@ async def log_evaluation(
     current_max_f: float | None = None,
     hours_until_peak: float | None = None,
     forecast_sigma_f: float | None = None,
+    shadow: dict | None = None,
 ) -> None:
     """Append one ``EvaluationLog`` row capturing this edge evaluation.
 
@@ -47,6 +48,13 @@ async def log_evaluation(
     Does not flush — the caller's next ``session.flush()`` (typically the
     ON CONFLICT upsert in ``persistence.dedup.upsert_signal``) batches
     these along with surrounding writes.
+
+    ``shadow`` (M1, 2026-05-30) is an optional dict persisted verbatim to
+    the ``shadow_json`` JSONB column. Use it to record the counterfactual
+    value of a not-yet-live feature (e.g. the per-class calibration
+    output while the pooled fit is still live, or the lead-time σ floor
+    while it's disabled) so a flip can be validated from data *before*
+    it's enabled. Convention: dotted keys (``cal.class``, ``sigma.arm``).
     """
     session.add(EvaluationLog(
         market_id=market_id,
@@ -66,4 +74,5 @@ async def log_evaluation(
         current_max_f=current_max_f,
         hours_until_peak=hours_until_peak,
         forecast_sigma_f=forecast_sigma_f,
+        shadow_json=shadow,
     ))
