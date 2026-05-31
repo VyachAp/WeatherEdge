@@ -173,6 +173,15 @@ class Settings(BaseSettings):
     # This is the "measure before flip" gate for the calibration split.
     SHADOW_CALIBRATION_ENABLED: bool = True
 
+    # Shadow lead-time-σ telemetry (Phase 2, 2026-05-31). Pure telemetry —
+    # CANNOT affect any trade. When True (default), every ensemble-branch
+    # probability-path eval stamps ``evaluation_logs.shadow_json.sigma``
+    # with the live σ and the σ the lead-time arm WOULD produce, so
+    # ``shadow-report --key sigma`` can size the effect of flipping
+    # ``SIGMA_FLOOR_LEAD_TIME_ENABLED`` across the full lead range that live
+    # evals span (backtest-v2 snapshots mid-day and under-samples the tail).
+    SHADOW_SIGMA_LEADTIME_ENABLED: bool = True
+
     # Circuit breakers
     DAILY_LOSS_STOP_USD: float = 200.0
     CONSECUTIVE_LOSS_PAUSE_COUNT: int = 3

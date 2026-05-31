@@ -1319,6 +1319,14 @@ def backtest_v2(days: int, stations: str) -> None:
 
         click.echo(f"\n=== Distribution Backtest Results ===")
         click.echo(f"  Days evaluated:     {result.num_days}")
+        _replay_pct = (
+            100.0 * result.days_replayed / result.num_days
+            if result.num_days else 0.0
+        )
+        click.echo(
+            f"  Days replayed:      {result.days_replayed} ({_replay_pct:.0f}% on "
+            f"real archived forecasts; rest used the placeholder σ fallback)"
+        )
         click.echo(f"  Calibration error:  {result.calibration_error:.4f}")
         click.echo(f"  Brier score:        {result.brier_score:.6f}")
 

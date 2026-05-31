@@ -535,12 +535,18 @@ async def job_unified_pipeline() -> None:
                     eval_shadow = None
                     try:
                         from src.signals.calibration import shadow_calibration
+                        from src.signals.probability_engine import shadow_sigma_fields
                         from src.execution.binary_market import operator_class
+                        shadow_parts: dict = {}
                         cal_shadow = shadow_calibration(
                             edge_result.raw_probability, operator_class(market),
                         )
                         if cal_shadow is not None:
-                            eval_shadow = {"cal": cal_shadow}
+                            shadow_parts["cal"] = cal_shadow
+                        sig_shadow = shadow_sigma_fields(state)
+                        if sig_shadow is not None:
+                            shadow_parts["sigma"] = sig_shadow
+                        eval_shadow = shadow_parts or None
                     except Exception:
                         eval_shadow = None
                     await _log_evaluation(

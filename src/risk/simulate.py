@@ -175,6 +175,12 @@ class DistributionSimResult:
     brier_score: float
     num_days: int
     per_bucket: list[CalibrationBucket]
+    # How many of ``num_days`` replayed a real archived forecast (ensemble
+    # branch exercised) vs the placeholder fallback. A high replay share is
+    # what makes the backtest trustworthy for distribution / σ-floor changes
+    # — with 0 replayed it only tests the hours-based σ fallback. Defaulted
+    # so older callers/tests constructing the result by hand still work.
+    days_replayed: int = 0
 
 
 async def simulate_distribution_pipeline(
@@ -195,11 +201,16 @@ async def simulate_distribution_pipeline(
     from src.db.models import MetarObservation
     from src.signals.probability_engine import compute_distribution
     from src.signals.state_aggregator import WeatherState
+    from src.signals.forecast_archive_replay import (
+        archive_to_forecast_fields,
+        latest_archive_as_of,
+    )
     from sqlalchemy import select, func
 
     # Collect predicted vs actual across all days/stations
     predictions: list[tuple[int, float, bool]] = []  # (bucket, predicted_prob, was_actual)
     num_days = 0
+    days_replayed = 0  # days that used a real archived forecast (ensemble branch)
 
     async with async_session() as session:
         for icao in stations:
@@ -243,18 +254,46 @@ async def simulate_distribution_pipeline(
                 else:
                     rate = 0.0
 
+                # Forecast fields: prefer a real archived forecast as of the
+                # mid-day snapshot instant (so the ensemble-σ branch — used by
+                # ~62% of live evals — is actually exercised). Fall back to the
+                # legacy placeholder when no snapshot exists for that
+                # station-day (history predates the archive writer).
+                as_of = mid_metars[-1].observed_at
+                # Placeholder forecast fields; overwritten below when a real
+                # archived snapshot exists for this station-day.
+                fc_peak_f: float = mid_max + 2.0
+                fc_hours_until_peak: float = 3.0
+                fc_sigma_f: float | None = None
+                fc_model_count: int = 1
+                fc_has_forecast: bool = False
+                arch = await latest_archive_as_of(
+                    session, icao, day_start.date(), as_of
+                )
+                if arch is not None:
+                    fc = archive_to_forecast_fields(arch, as_of)
+                    fc_peak_f = fc["forecast_peak_f"]
+                    fc_hours_until_peak = fc["hours_until_peak"]
+                    fc_sigma_f = fc["forecast_sigma_f"]
+                    fc_model_count = fc["ensemble_model_count"]
+                    fc_has_forecast = fc["has_forecast"]
+                    days_replayed += 1
+
                 state = WeatherState(
                     station_icao=icao,
                     current_max_f=mid_max,
                     metar_trend_rate=rate,
                     dewpoint_trend_rate=0.0,
-                    forecast_peak_f=mid_max + 2.0,  # Simple estimate
-                    hours_until_peak=3.0,
+                    forecast_peak_f=fc_peak_f,
+                    hours_until_peak=fc_hours_until_peak,
                     solar_declining=False,
                     solar_decline_magnitude=0.0,
                     cloud_rising=False,
                     cloud_rise_magnitude=0.0,
                     routine_count_today=mid_count,
+                    forecast_sigma_f=fc_sigma_f,
+                    ensemble_model_count=fc_model_count,
+                    has_forecast=fc_has_forecast,
                 )
 
                 # Generate buckets around expected range
@@ -272,7 +311,8 @@ async def simulate_distribution_pipeline(
     # Compute calibration metrics
     if not predictions:
         return DistributionSimResult(
-            calibration_error=0.0, brier_score=0.0, num_days=0, per_bucket=[]
+            calibration_error=0.0, brier_score=0.0, num_days=0, per_bucket=[],
+            days_replayed=days_replayed,
         )
 
     # Brier score
@@ -302,4 +342,5 @@ async def simulate_distribution_pipeline(
         brier_score=round(brier, 6),
         num_days=num_days,
         per_bucket=per_bucket,
+        days_replayed=days_replayed,
     )

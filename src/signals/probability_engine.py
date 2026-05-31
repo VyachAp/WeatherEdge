@@ -170,8 +170,19 @@ def _effective_sigma_floor(state: WeatherState) -> tuple[float, str]:
     return settings.ENSEMBLE_MIN_SIGMA_F, f"global {settings.ENSEMBLE_MIN_SIGMA_F:.2f}°F"
 
 
-def _compute_sigma(state: WeatherState, reasoning: list[str]) -> float:
+def _compute_sigma(
+    state: WeatherState,
+    reasoning: list[str],
+    *,
+    force_lead_time: bool | None = None,
+) -> float:
     """Base σ for the Gaussian: ensemble spread with floors, else hours-based.
+
+    ``force_lead_time`` overrides ``SIGMA_FLOOR_LEAD_TIME_ENABLED`` for the
+    lead-time arm: ``None`` (default) uses the live setting — bit-for-bit
+    unchanged behavior; ``True``/``False`` force the arm on/off. Used only
+    by :func:`shadow_sigma_fields` to compute the counterfactual σ without
+    touching the flag.
 
     When `state.forecast_sigma_f` is populated (multi-model fetch succeeded),
     it is inflated by `ENSEMBLE_SPREAD_MULTIPLIER` to correct for documented
@@ -206,10 +217,13 @@ def _compute_sigma(state: WeatherState, reasoning: list[str]) -> float:
 
     floor, floor_source = _effective_sigma_floor(state)
     lead = max(0.0, state.hours_until_peak)
+    lead_enabled = (
+        settings.SIGMA_FLOOR_LEAD_TIME_ENABLED
+        if force_lead_time is None
+        else force_lead_time
+    )
     lead_floor = (
-        settings.SIGMA_LEAD_TIME_SLOPE_F_PER_HR * lead
-        if settings.SIGMA_FLOOR_LEAD_TIME_ENABLED
-        else 0.0
+        settings.SIGMA_LEAD_TIME_SLOPE_F_PER_HR * lead if lead_enabled else 0.0
     )
     combined_floor = min(settings.ENSEMBLE_MAX_SIGMA_F, max(floor, lead_floor))
     raw = state.forecast_sigma_f * settings.ENSEMBLE_SPREAD_MULTIPLIER
@@ -223,6 +237,35 @@ def _compute_sigma(state: WeatherState, reasoning: list[str]) -> float:
         f"hours_floor={hours_floor:.2f}°F×{hours_mult})"
     )
     return sigma
+
+
+def shadow_sigma_fields(state: WeatherState) -> dict | None:
+    """Counterfactual lead-time σ for ``evaluation_logs.shadow_json`` (telemetry).
+
+    Pure — never influences a trade. Returns the σ used now (``live_f``,
+    lead-time arm off in prod) and what σ *would* be with the arm forced on
+    (``with_arm_f``), the widening (``delta``), and the lead context. The
+    measure-before-flip instrument for ``SIGMA_FLOOR_LEAD_TIME_ENABLED``:
+    live evals span all leads, so the shadow log captures the far-from-peak
+    regime where the arm bites and the bracket-like-NO bleed lived.
+
+    Returns ``None`` when shadow logging is disabled or the ensemble branch
+    isn't in play (``forecast_sigma_f is None`` → hours-based fallback, no
+    lead-time arm). ``delta`` is 0.0 past peak (the arm is a no-op at
+    ``hours_until_peak ≤ 0``).
+    """
+    if not getattr(settings, "SHADOW_SIGMA_LEADTIME_ENABLED", False):
+        return None
+    if state.forecast_sigma_f is None:
+        return None
+    live = _compute_sigma(state, [], force_lead_time=None)
+    with_arm = _compute_sigma(state, [], force_lead_time=True)
+    return {
+        "live_f": round(live, 3),
+        "with_arm_f": round(with_arm, 3),
+        "delta": round(with_arm - live, 3),
+        "hours_until_peak": round(state.hours_until_peak, 2),
+    }
 
 
 def _apply_climate_prior(
