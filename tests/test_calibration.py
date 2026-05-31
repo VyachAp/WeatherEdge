@@ -274,3 +274,55 @@ class TestShadowCalibration:
             calibration_mod.settings, "SHADOW_CALIBRATION_ENABLED", True
         ):
             assert calibration_mod.shadow_calibration(0.80, "threshold") is None
+
+
+class TestDegenerateFitGuardrail:
+    """Per-class fits with a runaway slope are rejected → pooled fallback.
+
+    Motivated by the live 2026-05-31 observation: the threshold class at
+    n=55 fit slope +3.64 / intercept -2.80, mapping raw 0.78 → 0.04, which
+    would destroy threshold trading. ``_is_plausible_fit`` is pure; the
+    integration is checked via ``get_calibration_coefficients``.
+    """
+
+    def test_is_plausible_fit_band(self):
+        f = calibration_mod._is_plausible_fit
+        assert f(1.0) is True            # identity
+        assert f(0.6) is True            # healthy pooled-like
+        assert f(calibration_mod.CALIBRATION_MIN_SLOPE) is True   # inclusive
+        assert f(calibration_mod.CALIBRATION_MAX_SLOPE) is True   # inclusive
+        assert f(3.64) is False          # the observed runaway
+        assert f(0.0) is False           # collapsed
+        assert f(-0.5) is False          # inverted
+
+    @pytest.mark.asyncio
+    async def test_runaway_class_fit_falls_back_to_pooled(self):
+        """A class whose fit slope is out of band is omitted from the cache
+        so ``get_cached_calibration`` falls back to pooled for it."""
+        from unittest.mock import AsyncMock, MagicMock
+        from src.db.models import TradeStatus
+
+        # 60 threshold signals whose raw probs cluster high (0.9-0.99) but
+        # mostly lose → polyfit produces a steep extrapolating slope.
+        sigs = []
+        for i in range(60):
+            won = i % 4 == 0  # 25% win rate on high-confidence → steep fit
+            t = MagicMock()
+            t.status = TradeStatus.WON if won else TradeStatus.LOST
+            sig = MagicMock()
+            sig.raw_model_prob = 0.90 + (i % 10) * 0.009
+            sig.model_prob = sig.raw_model_prob
+            sig.trades = [t]
+            sig.market = MagicMock(parsed_operator="above")  # threshold class
+            sigs.append(sig)
+
+        session = AsyncMock()
+        res = MagicMock()
+        res.unique.return_value.scalars.return_value.all.return_value = sigs
+        session.execute.return_value = res
+
+        coeffs = await calibration_mod.get_calibration_coefficients(session)
+        assert coeffs is not None
+        assert POOLED_KEY in coeffs  # pooled always present
+        # The degenerate threshold fit must NOT be cached as its own key.
+        assert "threshold" not in coeffs

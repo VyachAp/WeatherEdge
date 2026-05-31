@@ -429,6 +429,46 @@ def _flags_diff(prev: dict | None, cur: dict | None) -> dict:
     return diff
 
 
+def _summarize_floored_fills(rows: list[dict]) -> dict:
+    """Win-rate / EV of near-peak floored-up fills vs normal fills.
+
+    The post-flip gate for ``NEAR_PEAK_FLOOR_UP_ENABLED`` (Phase 1): a
+    floored bet can't be shadowed (it's either placed or not), so the
+    discipline is to measure realised outcomes after the flip. ``rows``
+    are filled-trade dicts ``{floored_up: bool, status: str|None,
+    entry_price: float|None}`` where ``status`` is ``won``/``lost``/
+    ``open``/None. Returns ``{floored: {...}, normal: {...}}`` each with
+    n / resolved / won / won_pct / break_even (mean entry price) /
+    ev_per_dollar. The gate passes when the floored bucket's
+    ``won_pct >= break_even`` (equivalently ``ev_per_dollar >= 0``) over a
+    meaningful resolved count. Pure — unit-tested without a DB.
+    """
+    def _bucket(rs: list[dict]) -> dict:
+        resolved = [r for r in rs if r.get("status") in ("won", "lost")]
+        won = [r for r in resolved if r.get("status") == "won"]
+        entries = [
+            float(r["entry_price"]) for r in resolved if r.get("entry_price")
+        ]
+        evs = [
+            (1.0 / float(r["entry_price"]) - 1.0)
+            if r.get("status") == "won" else -1.0
+            for r in resolved if r.get("entry_price")
+        ]
+        return {
+            "n": len(rs),
+            "resolved": len(resolved),
+            "won": len(won),
+            "won_pct": (len(won) / len(resolved)) if resolved else None,
+            "break_even": (sum(entries) / len(entries)) if entries else None,
+            "ev_per_dollar": (sum(evs) / len(evs)) if evs else None,
+        }
+
+    return {
+        "floored": _bucket([r for r in rows if r.get("floored_up")]),
+        "normal": _bucket([r for r in rows if not r.get("floored_up")]),
+    }
+
+
 async def _epoch_start(session, epoch_id: int | None):
     """``config_epochs.started_at`` for an epoch id (one PK lookup), or None."""
     if epoch_id is None:
@@ -1176,6 +1216,72 @@ def decisions_report(
                     reason_counts.items(), key=lambda kv: -kv[1]
                 ):
                     click.echo(f"| {outcome} | {sr} | {count:,} |")
+                click.echo()
+
+            # --- 4. Floored-fill outcomes — the NEAR_PEAK_FLOOR_UP gate.
+            #     Join trade_filled decisions to their settled Trade and
+            #     split by metadata.floored_up: do the bets we floored up
+            #     (instead of dropping) actually win >= break-even? Empty
+            #     until the flag is flipped and those trades resolve.
+            from src.db.models import Trade as _Trade
+
+            filled = [r for r in rows if r.outcome == "trade_filled"]
+            if filled:
+                mids = list({r.market_id for r in filled})
+                trs = (
+                    await session.execute(
+                        select(_Trade).where(_Trade.market_id.in_(mids))
+                    )
+                ).scalars().all()
+                tmap: dict[tuple, object] = {}
+                for t in trs:
+                    k = (t.market_id, t.direction)
+                    cur = tmap.get(k)
+                    if (
+                        cur is None
+                        or (t.opened_at and cur.opened_at and t.opened_at > cur.opened_at)
+                    ):
+                        tmap[k] = t
+                frows: list[dict] = []
+                for r in filled:
+                    t = tmap.get((r.market_id, r.direction))
+                    md = r.metadata_json or {}
+                    frows.append({
+                        "floored_up": bool(md.get("floored_up")),
+                        "status": (
+                            t.status.value if t and t.status is not None else None
+                        ),
+                        "entry_price": (
+                            float(t.entry_price)
+                            if t and t.entry_price is not None else None
+                        ),
+                    })
+                summ = _summarize_floored_fills(frows)
+                click.echo("## Floored-fill outcomes (NEAR_PEAK_FLOOR_UP gate)")
+                click.echo()
+                click.echo(
+                    "| Bucket | Fills | Resolved | Won | Won% | Break-even | EV/$1 |"
+                )
+                click.echo("|---|---:|---:|---:|---:|---:|---:|")
+
+                def _frow(label: str, b: dict) -> None:
+                    wp = f"{b['won_pct'] * 100:.1f}%" if b["won_pct"] is not None else "—"
+                    be = f"{b['break_even']:.3f}" if b["break_even"] is not None else "—"
+                    ev = f"{b['ev_per_dollar']:+.3f}" if b["ev_per_dollar"] is not None else "—"
+                    click.echo(
+                        f"| {label} | {b['n']:,} | {b['resolved']:,} | "
+                        f"{b['won']:,} | {wp} | {be} | {ev} |"
+                    )
+
+                _frow("floored", summ["floored"])
+                _frow("normal", summ["normal"])
+                if summ["floored"]["resolved"] == 0:
+                    click.echo()
+                    click.echo(
+                        "_No resolved floored fills yet — flip "
+                        "`NEAR_PEAK_FLOOR_UP_ENABLED` and let them settle, then "
+                        "the gate (floored Won% ≥ break-even) becomes readable._"
+                    )
                 click.echo()
 
     asyncio.run(_run())

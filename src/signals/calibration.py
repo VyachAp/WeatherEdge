@@ -36,6 +36,21 @@ logger = logging.getLogger(__name__)
 
 MIN_CALIBRATION_SAMPLES: int = 50
 
+# Degenerate-fit guardrail (2026-05-31). A per-class linear fit on a thin
+# sample can run away: the threshold class at n=55 produced slope +3.64 /
+# intercept -2.80, which maps a raw 0.78 to 0.04 — it extrapolates a steep
+# in-support slope into a band with almost no training data. Applying that
+# would DESTROY threshold trading rather than recalibrate it. A per-class
+# fit is accepted only when its slope sits in a plausible calibration band;
+# otherwise that class falls back to the pooled fit (an absent class key in
+# the cache → ``get_cached_calibration`` returns pooled). Healthy fits
+# observed in prod: pooled 0.60, bracket-like 0.49. Identity is 1.0;
+# overconfident models calibrate to slope < 1. The pooled fit is
+# intentionally NOT guarded — it is the fallback of last resort, so there's
+# nothing safer to fall back to.
+CALIBRATION_MIN_SLOPE: float = 0.2
+CALIBRATION_MAX_SLOPE: float = 2.0
+
 # Cache keys. ``"pooled"`` is the always-fitted global regression that
 # preserves legacy single-fit behavior; the per-class keys are populated
 # only when each class has ≥ ``MIN_CALIBRATION_SAMPLES`` of its own.
@@ -56,6 +71,17 @@ def _fit_linear(predicted: list[float], actual: list[float]) -> tuple[float, flo
     """Fit ``actual ≈ slope * predicted + intercept`` and return floats."""
     slope, intercept = np.polyfit(np.array(predicted), np.array(actual), 1)
     return float(slope), float(intercept)
+
+
+def _is_plausible_fit(slope: float) -> bool:
+    """True when a per-class calibration slope is in the plausible band.
+
+    Guards against degenerate per-class fits on thin samples (a runaway
+    slope extrapolates a steep in-support trend into untrained bands — see
+    :data:`CALIBRATION_MIN_SLOPE`). Pure so it can be unit-tested without a
+    DB. Applied to per-class fits only; pooled is the unguarded fallback.
+    """
+    return CALIBRATION_MIN_SLOPE <= slope <= CALIBRATION_MAX_SLOPE
 
 
 async def get_calibration_coefficients(
@@ -139,17 +165,33 @@ async def get_calibration_coefficients(
     )
 
     for cls, (pred, actual) in per_class.items():
-        if len(pred) >= MIN_CALIBRATION_SAMPLES:
-            coeffs[cls] = _fit_linear(pred, actual)
-            logger.info(
-                "Calibration fitted (%s) on %d signals: slope=%.4f intercept=%.4f",
-                cls, len(pred), coeffs[cls][0], coeffs[cls][1],
-            )
-        else:
+        if len(pred) < MIN_CALIBRATION_SAMPLES:
             logger.info(
                 "Calibration: %s class has %d signals (< %d) — using pooled",
                 cls, len(pred), MIN_CALIBRATION_SAMPLES,
             )
+            continue
+        fit = _fit_linear(pred, actual)
+        slope, intercept = fit
+        if not _is_plausible_fit(slope):
+            # Degenerate-fit guardrail (see CALIBRATION_MIN_SLOPE). A thin
+            # class sample can yield a runaway slope that extrapolates a
+            # steep in-support trend into bands with no training data
+            # (threshold @ n=55: slope +3.64 mapped raw 0.78 → 0.04).
+            # Reject and fall back to pooled for this class.
+            logger.warning(
+                "Calibration: %s class fit REJECTED — slope=%.3f intercept=%.3f "
+                "outside plausible [%.2f, %.2f] on %d samples (degenerate / "
+                "extrapolating); falling back to pooled",
+                cls, slope, intercept, CALIBRATION_MIN_SLOPE,
+                CALIBRATION_MAX_SLOPE, len(pred),
+            )
+            continue
+        coeffs[cls] = fit
+        logger.info(
+            "Calibration fitted (%s) on %d signals: slope=%.4f intercept=%.4f",
+            cls, len(pred), fit[0], fit[1],
+        )
 
     return coeffs
 

@@ -7,12 +7,15 @@ tested here with plain-dict inputs.
 
 from __future__ import annotations
 
+import pytest
+
 from src.cli import (
     _aggregate_divergence,
     _flags_diff,
     _flatten_shadow,
     _quantiles,
     _summarize_exposure,
+    _summarize_floored_fills,
     _summarize_shadow,
 )
 
@@ -144,3 +147,47 @@ def test_flags_diff_handles_none():
     assert _flags_diff(None, {"A": 1}) == {"A": (None, 1)}
     assert _flags_diff({"A": 1}, None) == {"A": (1, None)}
     assert _flags_diff(None, None) == {}
+
+
+# --- _summarize_floored_fills (NEAR_PEAK_FLOOR_UP gate) ---------------------
+
+
+def test_summarize_floored_fills_splits_and_scores():
+    rows = [
+        # floored bucket: 1 win + 1 loss at entry 0.50 → won%=50%, EV=0.0.
+        {"floored_up": True, "status": "won", "entry_price": 0.50},
+        {"floored_up": True, "status": "lost", "entry_price": 0.50},
+        # open is excluded from resolved.
+        {"floored_up": True, "status": "open", "entry_price": None},
+        # normal bucket: 1 win at 0.80 → won%=100%, EV = 1/0.8-1 = +0.25.
+        {"floored_up": False, "status": "won", "entry_price": 0.80},
+    ]
+    out = _summarize_floored_fills(rows)
+    fl, no = out["floored"], out["normal"]
+    assert fl["n"] == 3 and fl["resolved"] == 2 and fl["won"] == 1
+    assert fl["won_pct"] == 0.5
+    assert fl["break_even"] == 0.5
+    assert fl["ev_per_dollar"] == 0.0          # at break-even
+    assert no["n"] == 1 and no["resolved"] == 1 and no["won"] == 1
+    assert no["won_pct"] == 1.0
+    assert no["ev_per_dollar"] == pytest.approx(0.25, abs=1e-9)
+
+
+def test_summarize_floored_fills_empty_buckets():
+    out = _summarize_floored_fills([])
+    for b in (out["floored"], out["normal"]):
+        assert b["n"] == 0 and b["resolved"] == 0 and b["won"] == 0
+        assert b["won_pct"] is None
+        assert b["break_even"] is None
+        assert b["ev_per_dollar"] is None
+
+
+def test_summarize_floored_fills_all_open_no_resolved():
+    rows = [
+        {"floored_up": True, "status": "open", "entry_price": 0.6},
+        {"floored_up": True, "status": None, "entry_price": None},
+    ]
+    fl = _summarize_floored_fills(rows)["floored"]
+    assert fl["n"] == 2
+    assert fl["resolved"] == 0
+    assert fl["won_pct"] is None  # gate not yet readable
