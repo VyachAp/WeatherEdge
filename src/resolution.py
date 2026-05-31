@@ -124,6 +124,50 @@ async def resolve_trades(session: AsyncSession) -> list[Trade]:
     refreshed_prices: dict[str, float | None] = {}
     grace = timedelta(hours=settings.RESOLVE_NO_PRICE_GRACE_HOURS)
     resolved: list[Trade] = []
+    recorded_resolutions: set[str] = set()
+
+    async def _record_resolution(market: Market, yes_won: bool) -> None:
+        """M3: persist the resolved outcome + implied daily-max bound.
+
+        Best-effort ground-truth telemetry (see
+        ``signals.market_resolution``). Only called from the two
+        genuine-outcome branches — on-chain payout and the CLOB-mid
+        fallback — never the null-fill "order never landed" branches,
+        which carry no signal about the actual temperature. Keyed per
+        market and deduped within this call so the same market settling
+        on YES + NO legs writes once. ``routine_metar_max_f`` is filled
+        later at daily settlement (``backfill_routine_max``).
+        """
+        if market.id in recorded_resolutions:
+            return
+        recorded_resolutions.add(market.id)
+        try:
+            from zoneinfo import ZoneInfo
+
+            from src.signals.market_resolution import record_market_resolution
+            from src.signals.mapper import (
+                icao_for_location,
+                icao_timezone,
+                resolve_target_local_day,
+            )
+
+            icao = (
+                icao_for_location(market.parsed_location)
+                if market.parsed_location else None
+            )
+            # tz is retained for signature compatibility but ignored — the
+            # target day is end_date's UTC date for both hemispheres.
+            tz = icao_timezone(icao) if icao else ZoneInfo("UTC")
+            target = resolve_target_local_day(market.end_date, tz)
+            await record_market_resolution(
+                session, market, yes_won=yes_won,
+                station_icao=icao, target_date_local=target,
+            )
+        except Exception:
+            logger.warning(
+                "market_resolution record failed for %s (non-fatal)",
+                market.id, exc_info=True,
+            )
 
     for trade in trades:
         market = trade.market
@@ -145,6 +189,7 @@ async def resolve_trades(session: AsyncSession) -> list[Trade]:
 
         if chain_outcome is not None:
             _apply_settlement(trade, chain_outcome, now)
+            await _record_resolution(market, chain_outcome)
             resolved.append(trade)
             logger.info(
                 "Resolved trade %s on market %s → %s (on-chain payout, pnl=%.2f)",
@@ -296,6 +341,7 @@ async def resolve_trades(session: AsyncSession) -> list[Trade]:
             continue
 
         _apply_settlement(trade, yes_won, now)
+        await _record_resolution(market, yes_won)
         resolved.append(trade)
         logger.info(
             "Resolved trade %s on market %s → %s (CLOB fallback, pnl=%.2f)",

@@ -297,6 +297,152 @@ def _threshold_yes_won(op: str, threshold: float, actual_max_f: float) -> bool:
     return actual_max_f <= threshold
 
 
+# --- Measurement-layer report helpers (Phase 0 readers) ------------------
+# These are PURE functions over plain dicts (no DB, no click) so the
+# number-crunching behind exposure-report / resolution-report /
+# shadow-report / epochs is unit-testable without mocking the async
+# session — mirroring the pure M3 logic in signals.market_resolution.
+
+
+def _quantiles(values: list[float]) -> tuple[float, float, float] | None:
+    """Nearest-rank p25/p50/p75 (module-level; shared by the reports).
+
+    Nearest-rank for tiny samples — interpolation isn't worth a numpy
+    dependency here. Returns None for an empty input.
+    """
+    if not values:
+        return None
+    s = sorted(values)
+    n = len(s)
+    p25 = s[max(0, n // 4 - 1)]
+    p50 = s[n // 2]
+    p75 = s[min(n - 1, (3 * n) // 4)]
+    return p25, p50, p75
+
+
+def _summarize_exposure(rows: list[dict], min_stake: float = 5.0) -> dict:
+    """Summarise a window of ``exposure_snapshots`` rows (as dicts).
+
+    Reports the Phase-0 capital gate: per-tick headroom quantiles + the
+    fraction of ticks where headroom fell below one minimum stake (i.e.
+    a new bet could not be funded). ``by_class`` sums the per-tick
+    ``n_open_by_class`` so the bracket-vs-threshold exposure split is
+    visible. Empty input → ``{"count": 0}``.
+    """
+    if not rows:
+        return {"count": 0}
+    headroom = [float(r["headroom"]) for r in rows]
+    by_class: dict[str, int] = {}
+    for r in rows:
+        for k, v in (r.get("n_open_by_class") or {}).items():
+            by_class[k] = by_class.get(k, 0) + int(v)
+    n_low = sum(1 for h in headroom if h < min_stake)
+    n_open_q = _quantiles([float(r.get("n_open") or 0) for r in rows])
+    return {
+        "count": len(rows),
+        "headroom": _quantiles(headroom),
+        "exposure": _quantiles([float(r["exposure"]) for r in rows]),
+        "equity": _quantiles([float(r["equity"]) for r in rows]),
+        "effective_cap": _quantiles([float(r["effective_cap"]) for r in rows]),
+        "n_open_median": n_open_q[1] if n_open_q else 0.0,
+        "by_class": by_class,
+        "low_headroom_frac": n_low / len(rows),
+    }
+
+
+def _aggregate_divergence(rows: list[dict]) -> list[dict]:
+    """Per-(station, unit) resolver-divergence stats from M3 rows (dicts).
+
+    Only rows that have both ``divergence_f`` and ``routine_metar_max_f``
+    (i.e. the daily-settlement backfill has run) contribute. Returns a
+    list of ``{station_icao, unit, n, mean, std, min, max}`` sorted by
+    ``|mean|`` desc — the worst-diverging stations first. This is the
+    Phase-3 audit surface.
+    """
+    from collections import defaultdict
+
+    groups: dict[tuple, list[float]] = defaultdict(list)
+    for r in rows:
+        if r.get("divergence_f") is None or r.get("routine_metar_max_f") is None:
+            continue
+        groups[(r.get("station_icao"), r.get("unit"))].append(float(r["divergence_f"]))
+    out: list[dict] = []
+    for (icao, unit), vals in groups.items():
+        n = len(vals)
+        mean = sum(vals) / n
+        std = (sum((v - mean) ** 2 for v in vals) / n) ** 0.5 if n else 0.0
+        out.append({
+            "station_icao": icao, "unit": unit, "n": n,
+            "mean": mean, "std": std, "min": min(vals), "max": max(vals),
+        })
+    out.sort(key=lambda d: abs(d["mean"]), reverse=True)
+    return out
+
+
+def _flatten_shadow(obj, prefix: str = "") -> dict:
+    """Flatten a nested ``shadow_json`` dict to dotted leaf keys."""
+    out: dict = {}
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            key = f"{prefix}.{k}" if prefix else str(k)
+            out.update(_flatten_shadow(v, key))
+    else:
+        out[prefix] = obj
+    return out
+
+
+def _summarize_shadow(shadow_dicts: list[dict]) -> dict:
+    """Per-leaf occupancy + numeric quantiles across shadow_json blobs.
+
+    ``{leaf_key: {"count": int, "quantiles": (p25,p50,p75)|None}}``.
+    Booleans are excluded from the numeric quantiles (they're flags, not
+    measurements). Empty / all-None input → ``{}``.
+    """
+    from collections import defaultdict
+
+    leaves: dict[str, list] = defaultdict(list)
+    for sd in shadow_dicts:
+        if not sd:
+            continue
+        for k, v in _flatten_shadow(sd).items():
+            if v is not None:
+                leaves[k].append(v)
+    out: dict = {}
+    for k, vals in leaves.items():
+        nums = [
+            float(v) for v in vals
+            if isinstance(v, (int, float)) and not isinstance(v, bool)
+        ]
+        out[k] = {"count": len(vals), "quantiles": _quantiles(nums) if nums else None}
+    return out
+
+
+def _flags_diff(prev: dict | None, cur: dict | None) -> dict:
+    """``{key: (old, new)}`` for keys whose value changed between epochs."""
+    prev = prev or {}
+    cur = cur or {}
+    diff: dict = {}
+    for k in set(prev) | set(cur):
+        a, b = prev.get(k), cur.get(k)
+        if a != b:
+            diff[k] = (a, b)
+    return diff
+
+
+async def _epoch_start(session, epoch_id: int | None):
+    """``config_epochs.started_at`` for an epoch id (one PK lookup), or None."""
+    if epoch_id is None:
+        return None
+    from sqlalchemy import select
+    from src.db.models import ConfigEpoch
+
+    return (
+        await session.execute(
+            select(ConfigEpoch.started_at).where(ConfigEpoch.id == epoch_id)
+        )
+    ).scalar_one_or_none()
+
+
 async def _recoverable_band_section(session, rows, op_of) -> None:
     """Print the recoverable-band table for THRESHOLD-op probability evals.
 
@@ -641,7 +787,14 @@ async def _single_bucket_no_band_section(session, rows, op_of) -> None:
     type=click.Choice(["threshold", "bracket-like"], case_sensitive=False),
     help="Restrict to one operator class. Default: both.",
 )
-def evals_report(days: int, signal_kind: str | None, operator_class: str | None) -> None:
+@click.option(
+    "--since-epoch", "since_epoch", type=int, default=None,
+    help="Only rows at/after this config_epochs.id's start (see `epochs`).",
+)
+def evals_report(
+    days: int, signal_kind: str | None, operator_class: str | None,
+    since_epoch: int | None = None,
+) -> None:
     """Markdown filter-tuning report from the ``evaluation_logs`` table.
 
     For every per-side edge evaluation in the look-back window:
@@ -672,21 +825,12 @@ def evals_report(days: int, signal_kind: str | None, operator_class: str | None)
     def _pct(num: int, denom: int) -> str:
         return f"{(num / denom * 100):5.1f}%" if denom else "  n/a"
 
-    def _quantiles(values: list[float]) -> tuple[float, float, float] | None:
-        if not values:
-            return None
-        s = sorted(values)
-        n = len(s)
-        # Nearest-rank for tiny samples — interpolation isn't worth the
-        # numpy dependency here.
-        p25 = s[max(0, n // 4 - 1)]
-        p50 = s[n // 2]
-        p75 = s[min(n - 1, (3 * n) // 4)]
-        return p25, p50, p75
-
     async def _run() -> None:
         cutoff = datetime.now(timezone.utc) - timedelta(days=days)
         async with async_session() as session:
+            ep = await _epoch_start(session, since_epoch)
+            if ep is not None and ep > cutoff:
+                cutoff = ep
             stmt = (
                 select(EvaluationLog)
                 .where(EvaluationLog.created_at >= cutoff)
@@ -911,7 +1055,14 @@ def evals_report(days: int, signal_kind: str | None, operator_class: str | None)
     type=click.Choice(["threshold", "bracket-like"], case_sensitive=False),
     help="Restrict to one operator class. Default: both.",
 )
-def decisions_report(days: int, signal_kind: str | None, operator_class: str | None) -> None:
+@click.option(
+    "--since-epoch", "since_epoch", type=int, default=None,
+    help="Only rows at/after this config_epochs.id's start (see `epochs`).",
+)
+def decisions_report(
+    days: int, signal_kind: str | None, operator_class: str | None,
+    since_epoch: int | None = None,
+) -> None:
     """Markdown post-filter funnel report from the ``decision_logs`` table.
 
     ``evaluation_logs`` answers "did the edge clear ``_check_filters``?";
@@ -936,6 +1087,9 @@ def decisions_report(days: int, signal_kind: str | None, operator_class: str | N
     async def _run() -> None:
         cutoff = datetime.now(timezone.utc) - timedelta(days=days)
         async with async_session() as session:
+            ep = await _epoch_start(session, since_epoch)
+            if ep is not None and ep > cutoff:
+                cutoff = ep
             stmt = (
                 select(DecisionLog)
                 .where(DecisionLog.created_at >= cutoff)
@@ -4121,6 +4275,316 @@ def reconcile_stuck(
             )
 
     asyncio.run(_reconcile_stuck())
+
+
+# --- Measurement-layer readers (Phase 0) ---------------------------------
+
+
+@main.command("exposure-report")
+@click.option("--days", default=7, show_default=True, help="Look-back window in days.")
+@click.option(
+    "--since-epoch", "since_epoch", type=int, default=None,
+    help="Only ticks at/after this config_epochs.id's start (see `epochs`).",
+)
+def exposure_report(days: int, since_epoch: int | None) -> None:
+    """Per-tick capital / headroom report from ``exposure_snapshots`` (M4).
+
+    The Phase-0 capital gate: is there room to fund new bets? Prints
+    headroom / exposure / equity quantiles over the window, the fraction
+    of ticks where headroom fell below one ``MIN_STAKE_USD`` (a new bet
+    couldn't be funded), the bracket-vs-threshold open-position split, and
+    a per-UTC-day median-headroom trend so a capital change shows up.
+    """
+    from sqlalchemy import select
+
+    from src.config import settings
+    from src.db.engine import async_session
+    from src.db.models import ExposureSnapshot
+
+    async def _run() -> None:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+        async with async_session() as session:
+            ep = await _epoch_start(session, since_epoch)
+            if ep is not None and ep > cutoff:
+                cutoff = ep
+            snaps = (
+                await session.execute(
+                    select(ExposureSnapshot)
+                    .where(ExposureSnapshot.created_at >= cutoff)
+                    .order_by(ExposureSnapshot.created_at)
+                )
+            ).scalars().all()
+            if not snaps:
+                click.echo(
+                    f"No exposure_snapshots in the last {days}d. "
+                    "Has job_unified_pipeline run since the M4 deploy?"
+                )
+                return
+
+            rows = [
+                {
+                    "headroom": s.headroom, "exposure": s.exposure,
+                    "equity": s.equity, "effective_cap": s.effective_cap,
+                    "n_open": s.n_open, "n_open_by_class": s.n_open_by_class,
+                    "created_at": s.created_at,
+                    "n_sized_to_zero": s.n_sized_to_zero,
+                }
+                for s in snaps
+            ]
+            summ = _summarize_exposure(rows, min_stake=settings.MIN_STAKE_USD)
+
+            click.echo(f"# Exposure report — last {days}d ({summ['count']:,} ticks)")
+            click.echo()
+
+            def _q(label: str, key: str) -> None:
+                q = summ.get(key)
+                if q:
+                    click.echo(f"- **{label}** p25/p50/p75: ${q[0]:,.0f} / ${q[1]:,.0f} / ${q[2]:,.0f}")
+
+            _q("Headroom", "headroom")
+            _q("Exposure", "exposure")
+            _q("Equity", "equity")
+            _q("Effective cap", "effective_cap")
+            click.echo(f"- **Median open positions:** {summ['n_open_median']:.0f}")
+            click.echo(
+                f"- **Ticks with headroom < ${settings.MIN_STAKE_USD:.0f}:** "
+                f"{summ['low_headroom_frac'] * 100:.1f}%  "
+                "(can't fund a new bet — the Phase-0 capital gate)"
+            )
+            if summ["by_class"]:
+                split = ", ".join(
+                    f"{k}={v}" for k, v in sorted(summ["by_class"].items())
+                )
+                click.echo(f"- **Open positions by class (summed):** {split}")
+            click.echo()
+
+            # Per-UTC-day trend so a capital/floor change is visible over time.
+            click.echo("## Daily trend (UTC)")
+            click.echo()
+            click.echo("| Day | Ticks | Median headroom | Median exposure |")
+            click.echo("|---|---:|---:|---:|")
+            by_day: dict[object, list[dict]] = {}
+            for r in rows:
+                by_day.setdefault(r["created_at"].date(), []).append(r)
+            for day in sorted(by_day):
+                drows = by_day[day]
+                hq = _quantiles([float(r["headroom"]) for r in drows])
+                eq = _quantiles([float(r["exposure"]) for r in drows])
+                click.echo(
+                    f"| {day} | {len(drows):,} | "
+                    f"${hq[1]:,.0f} | ${eq[1]:,.0f} |"
+                )
+            click.echo()
+
+    asyncio.run(_run())
+
+
+@main.command("resolution-report")
+@click.option("--days", default=30, show_default=True, help="Look-back window in days.")
+@click.option("--station", default=None, help="Restrict to one ICAO.")
+@click.option(
+    "--unit", default=None, type=click.Choice(["C", "F"], case_sensitive=False),
+    help="Restrict to °C or °F markets.",
+)
+def resolution_report(days: int, station: str | None, unit: str | None) -> None:
+    """Resolver-divergence report from ``market_resolutions`` (M3).
+
+    De-circularises filter tuning: shows, per station, how far our
+    routine-METAR daily max sits from the bound the actual resolution
+    implies (``divergence_f`` = ours − resolved; positive = we read
+    hotter). The Phase-3 gate for re-enabling ``RANGE_OVERSHOOT_LOCK_ENABLED``
+    is the °C-city mean divergence shrinking toward ~0.5°C (~0.9°F).
+    """
+    from sqlalchemy import select
+
+    from src.db.engine import async_session
+    from src.db.models import MarketResolution
+
+    async def _run() -> None:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+        async with async_session() as session:
+            stmt = (
+                select(MarketResolution)
+                .where(MarketResolution.resolved_at >= cutoff)
+                .order_by(MarketResolution.resolved_at)
+            )
+            if station:
+                stmt = stmt.where(MarketResolution.station_icao == station.upper())
+            if unit:
+                stmt = stmt.where(MarketResolution.unit == unit.upper())
+            res = (await session.execute(stmt)).scalars().all()
+            if not res:
+                click.echo(
+                    f"No market_resolutions in the last {days}d "
+                    f"(station={station or 'any'}, unit={unit or 'any'}). "
+                    "Have any held markets settled since the M3 deploy?"
+                )
+                return
+
+            rows = [
+                {
+                    "station_icao": r.station_icao, "unit": r.unit,
+                    "divergence_f": r.divergence_f,
+                    "routine_metar_max_f": r.routine_metar_max_f,
+                }
+                for r in res
+            ]
+            pending = sum(1 for r in rows if r["routine_metar_max_f"] is None)
+            agg = _aggregate_divergence(rows)
+
+            click.echo(f"# Resolution / divergence report — last {days}d")
+            click.echo()
+            click.echo(f"- **Settled rows:** {len(res):,}")
+            click.echo(
+                f"- **Pending backfill** (no routine max yet): {pending:,}  "
+                "(filled at the next daily settlement)"
+            )
+            # Headline: °C-city mean divergence in °C vs the ~0.5°C tolerance.
+            c_rows = [
+                r["divergence_f"] for r in rows
+                if r["unit"] == "C" and r["divergence_f"] is not None
+                and r["routine_metar_max_f"] is not None
+            ]
+            if c_rows:
+                mean_c = (sum(c_rows) / len(c_rows)) * 5.0 / 9.0
+                click.echo(
+                    f"- **°C-city mean divergence:** {mean_c:+.2f}°C "
+                    f"(n={len(c_rows)}; Phase-3 target |mean| < ~0.5°C)"
+                )
+            click.echo()
+
+            if not agg:
+                click.echo(
+                    "_No rows with both an outcome and a routine max yet — "
+                    "run after a daily settlement backfill._"
+                )
+                return
+
+            click.echo("## Divergence by station (ours − resolved, °F)")
+            click.echo()
+            click.echo("| Station | Unit | n | mean | std | min | max |")
+            click.echo("|---|---|---:|---:|---:|---:|---:|")
+            for d in agg:
+                click.echo(
+                    f"| {d['station_icao'] or '?'} | {d['unit'] or '?'} | "
+                    f"{d['n']:,} | {d['mean']:+.2f} | {d['std']:.2f} | "
+                    f"{d['min']:+.1f} | {d['max']:+.1f} |"
+                )
+            click.echo()
+
+    asyncio.run(_run())
+
+
+@main.command("shadow-report")
+@click.option("--days", default=7, show_default=True, help="Look-back window in days.")
+@click.option("--key", default=None, help="Only shadow keys with this dotted prefix.")
+@click.option(
+    "--since-epoch", "since_epoch", type=int, default=None,
+    help="Only rows at/after this config_epochs.id's start (see `epochs`).",
+)
+def shadow_report(days: int, key: str | None, since_epoch: int | None) -> None:
+    """Counterfactual telemetry report from ``evaluation_logs.shadow_json`` (M1).
+
+    Generic over whatever an experiment writes: flattens the JSON to
+    dotted leaf keys and prints per-leaf occupancy + numeric quantiles.
+    Empty until the first experiment emits shadow data (e.g. per-class
+    calibration's ``cal.*`` in Phase 1) — prints a clean empty message.
+    """
+    from sqlalchemy import select
+
+    from src.db.engine import async_session
+    from src.db.models import EvaluationLog
+
+    async def _run() -> None:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+        async with async_session() as session:
+            ep = await _epoch_start(session, since_epoch)
+            if ep is not None and ep > cutoff:
+                cutoff = ep
+            blobs = (
+                await session.execute(
+                    select(EvaluationLog.shadow_json).where(
+                        EvaluationLog.created_at >= cutoff,
+                        EvaluationLog.shadow_json.isnot(None),
+                    )
+                )
+            ).scalars().all()
+            summ = _summarize_shadow([b for b in blobs if b])
+            if key:
+                summ = {k: v for k, v in summ.items() if k.startswith(key)}
+            if not summ:
+                click.echo(
+                    f"No shadow telemetry in the last {days}d"
+                    + (f" with prefix '{key}'" if key else "")
+                    + ". (Populated once a measure-before-flip experiment opts in.)"
+                )
+                return
+
+            click.echo(f"# Shadow telemetry — last {days}d")
+            click.echo()
+            click.echo("| Key | Count | p25 | p50 | p75 |")
+            click.echo("|---|---:|---:|---:|---:|")
+            for k in sorted(summ):
+                info = summ[k]
+                q = info["quantiles"]
+                if q:
+                    click.echo(
+                        f"| {k} | {info['count']:,} | "
+                        f"{q[0]:.4g} | {q[1]:.4g} | {q[2]:.4g} |"
+                    )
+                else:
+                    click.echo(f"| {k} | {info['count']:,} | — | — | — |")
+            click.echo()
+
+    asyncio.run(_run())
+
+
+@main.command("epochs")
+@click.option("--limit", default=20, show_default=True, help="Most recent N epochs.")
+def epochs(limit: int) -> None:
+    """List config epochs (M2) with the flag diff vs the previous one.
+
+    Each row marks a trading-config change; use the ``id`` as
+    ``--since-epoch`` on the other reports to scope telemetry to a clean
+    before/after-flip window.
+    """
+    from sqlalchemy import select
+
+    from src.db.engine import async_session
+    from src.db.models import ConfigEpoch
+
+    async def _run() -> None:
+        async with async_session() as session:
+            eps = (
+                await session.execute(
+                    select(ConfigEpoch).order_by(ConfigEpoch.id.desc()).limit(limit)
+                )
+            ).scalars().all()
+            if not eps:
+                click.echo("No config_epochs yet. (Written at scheduler startup.)")
+                return
+
+            # Oldest-first so each diff compares to the genuine predecessor.
+            eps = list(reversed(eps))
+            click.echo(f"# Config epochs (latest {len(eps)})")
+            click.echo()
+            prev_flags: dict | None = None
+            for e in eps:
+                started = e.started_at.strftime("%Y-%m-%d %H:%M UTC") if e.started_at else "?"
+                click.echo(f"## Epoch {e.id} — {started}" + (f"  ({e.note})" if e.note else ""))
+                diff = _flags_diff(prev_flags, e.flags_json)
+                if prev_flags is None:
+                    click.echo("- _(initial snapshot)_")
+                elif not diff:
+                    click.echo("- _(no tracked-flag change)_")
+                else:
+                    for k in sorted(diff):
+                        old, new = diff[k]
+                        click.echo(f"- `{k}`: {old} → {new}")
+                click.echo()
+                prev_flags = e.flags_json
+
+    asyncio.run(_run())
 
 
 if __name__ == "__main__":

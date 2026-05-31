@@ -199,3 +199,78 @@ class TestPerOperatorCalibration:
             assert get_cached_calibration("bracket-like") == (0.8, 0.05)
             assert get_cached_calibration("threshold") == (0.8, 0.05)
             assert get_cached_calibration() == (0.8, 0.05)
+
+
+class TestShadowCalibration:
+    """Phase 1 measure-before-flip telemetry (``shadow_calibration``).
+
+    Pure telemetry helper that returns BOTH the pooled and the per-class
+    calibrated value for a raw prob, bypassing the
+    ``PER_OPERATOR_CALIBRATION_ENABLED`` flag, so ``shadow-report`` can
+    validate the flip before it touches live trading. Never influences a
+    trade. The autouse ``_clean_cache`` fixture resets the cache around
+    each test.
+    """
+
+    def test_disabled_returns_none(self):
+        calibration_mod._cached_coeffs = {POOLED_KEY: (1.0, 0.0)}
+        calibration_mod._cached_at = time.time()
+        with patch.object(
+            calibration_mod.settings, "SHADOW_CALIBRATION_ENABLED", False
+        ):
+            assert calibration_mod.shadow_calibration(0.8, "threshold") is None
+
+    def test_none_when_no_pooled_fit(self):
+        # Cache empty → nothing to compare against.
+        with patch.object(
+            calibration_mod.settings, "SHADOW_CALIBRATION_ENABLED", True
+        ):
+            assert calibration_mod.shadow_calibration(0.8, "threshold") is None
+
+    def test_none_when_raw_prob_missing(self):
+        calibration_mod._cached_coeffs = {POOLED_KEY: (1.0, 0.0)}
+        calibration_mod._cached_at = time.time()
+        with patch.object(
+            calibration_mod.settings, "SHADOW_CALIBRATION_ENABLED", True
+        ):
+            assert calibration_mod.shadow_calibration(None, "threshold") is None
+
+    def test_pooled_and_class_with_delta(self):
+        # pooled squashes 0.80 → 0.85; threshold class maps 0.80 → 0.78.
+        calibration_mod._cached_coeffs = {
+            POOLED_KEY: (0.5, 0.45),   # 0.5*0.8 + 0.45 = 0.85
+            "threshold": (1.0, -0.02),  # 1.0*0.8 - 0.02 = 0.78
+        }
+        calibration_mod._cached_at = time.time()
+        with patch.object(
+            calibration_mod.settings, "SHADOW_CALIBRATION_ENABLED", True
+        ):
+            out = calibration_mod.shadow_calibration(0.80, "threshold")
+        assert out["raw"] == 0.8
+        assert out["op_class"] == "threshold"
+        assert out["pooled"] == pytest.approx(0.85, abs=1e-6)
+        assert out["class"] == pytest.approx(0.78, abs=1e-6)
+        # delta = class - pooled (negative: class un-squashes downward).
+        assert out["delta"] == pytest.approx(-0.07, abs=1e-6)
+
+    def test_omits_class_when_no_class_fit(self):
+        calibration_mod._cached_coeffs = {POOLED_KEY: (1.0, 0.0)}
+        calibration_mod._cached_at = time.time()
+        with patch.object(
+            calibration_mod.settings, "SHADOW_CALIBRATION_ENABLED", True
+        ):
+            out = calibration_mod.shadow_calibration(0.80, "bracket-like")
+        assert "pooled" in out
+        # No bracket-like fit cached → flag-on would fall back to pooled.
+        assert "class" not in out
+        assert "delta" not in out
+
+    def test_respects_ttl(self):
+        calibration_mod._cached_coeffs = {POOLED_KEY: (1.0, 0.0)}
+        calibration_mod._cached_at = (
+            time.time() - calibration_mod._CACHE_TTL_SEC - 1
+        )
+        with patch.object(
+            calibration_mod.settings, "SHADOW_CALIBRATION_ENABLED", True
+        ):
+            assert calibration_mod.shadow_calibration(0.80, "threshold") is None

@@ -527,6 +527,22 @@ async def job_unified_pipeline() -> None:
                         (end_time - now_utc).total_seconds() / 60.0
                         if end_time else None
                     )
+                    # M1/Phase-1: shadow-log the pooled-vs-per-class
+                    # calibration counterfactual for this raw prob (pure
+                    # telemetry — can't affect the trade). Lets shadow-report
+                    # validate the PER_OPERATOR_CALIBRATION_ENABLED flip
+                    # before it touches live trading. Best-effort.
+                    eval_shadow = None
+                    try:
+                        from src.signals.calibration import shadow_calibration
+                        from src.execution.binary_market import operator_class
+                        cal_shadow = shadow_calibration(
+                            edge_result.raw_probability, operator_class(market),
+                        )
+                        if cal_shadow is not None:
+                            eval_shadow = {"cal": cal_shadow}
+                    except Exception:
+                        eval_shadow = None
                     await _log_evaluation(
                         session,
                         market_id=market.id,
@@ -546,6 +562,7 @@ async def job_unified_pipeline() -> None:
                         current_max_f=state.current_max_f,
                         hours_until_peak=state.hours_until_peak,
                         forecast_sigma_f=state.forecast_sigma_f,
+                        shadow=eval_shadow,
                     )
 
                     edges = [edge_result]
@@ -911,7 +928,10 @@ async def job_daily_settlement() -> None:
                 from src.ingestion.station_bias import record_daily_outcome
                 from src.ingestion.aviation import get_routine_daily_max
                 from src.ingestion.openmeteo import fetch_deterministic_forecast
-                from src.signals.mapper import icao_for_location, geocode, CITY_ICAO
+                from src.signals.mapper import (
+                    icao_for_location, geocode, CITY_ICAO, resolve_target_local_day,
+                )
+                from src.signals.market_resolution import backfill_routine_max
 
                 # Only markets that resolved in the last ~36h. Settlement runs
                 # at 22:00 UTC, markets close at 12:00 UTC the same day → 10h
@@ -945,6 +965,29 @@ async def job_daily_settlement() -> None:
                     )
                     if max_f is None or count < 3:
                         continue
+
+                    # M3: backfill the routine daily max + recomputed
+                    # divergence onto any market_resolution rows the
+                    # resolver seeded for this station-day. Best-effort,
+                    # runs before the bias path's coords/forecast gates so a
+                    # missing forecast can't skip the divergence fill.
+                    try:
+                        from src.signals.mapper import icao_timezone
+                        target_local = resolve_target_local_day(
+                            mkt.end_date, icao_timezone(icao)
+                        )
+                        if target_local is not None:
+                            await backfill_routine_max(
+                                session,
+                                station_icao=icao,
+                                target_date_local=target_local,
+                                routine_metar_max_f=max_f,
+                            )
+                    except Exception:
+                        logger.warning(
+                            "market_resolution backfill failed for %s (non-fatal)",
+                            icao, exc_info=True,
+                        )
 
                     coords = geocode(mkt.parsed_location) if mkt.parsed_location else None
                     if not coords:

@@ -163,6 +163,16 @@ class Settings(BaseSettings):
     # without bracket-like's 0.99-dominated tail distorting it.
     PER_OPERATOR_CALIBRATION_ENABLED: bool = False
 
+    # Shadow calibration telemetry (M1 / Phase 1, 2026-05-31). Pure
+    # telemetry — CANNOT affect any trade. When True (default), every
+    # probability-path eval stamps ``evaluation_logs.shadow_json`` with
+    # both the pooled and the per-class calibrated probability for that
+    # raw input, so ``shadow-report`` can show whether flipping
+    # ``PER_OPERATOR_CALIBRATION_ENABLED`` would actually un-squash the
+    # threshold [0.78,0.85) band BEFORE the flip touches live trading.
+    # This is the "measure before flip" gate for the calibration split.
+    SHADOW_CALIBRATION_ENABLED: bool = True
+
     # Circuit breakers
     DAILY_LOSS_STOP_USD: float = 200.0
     CONSECUTIVE_LOSS_PAUSE_COUNT: int = 3

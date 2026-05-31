@@ -19,6 +19,7 @@ from __future__ import annotations
 from datetime import date
 from typing import TYPE_CHECKING
 
+from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from src.db.models import MarketResolution
@@ -127,3 +128,43 @@ async def record_market_resolution(
         await session.execute(stmt)
     except Exception:
         return
+
+
+async def backfill_routine_max(
+    session: "AsyncSession",
+    *,
+    station_icao: str,
+    target_date_local: "date",
+    routine_metar_max_f: float,
+) -> int:
+    """Fill ``routine_metar_max_f`` + recomputed divergence for a station-day.
+
+    The routine daily max is computed once per station at daily settlement,
+    but a station-day can carry several ``market_resolution`` rows (different
+    thresholds / buckets), each with its own implied bound — so divergence is
+    recomputed per row against the shared observed max. Rows whose
+    ``routine_metar_max_f`` is already set are left untouched (the resolve-time
+    insert seeds it ``None``; settlement fills it once).
+
+    Returns the number of rows updated. Best-effort: never raises.
+    """
+    try:
+        rows = (
+            await session.execute(
+                select(MarketResolution).where(
+                    MarketResolution.station_icao == station_icao,
+                    MarketResolution.target_date_local == target_date_local,
+                    MarketResolution.routine_metar_max_f.is_(None),
+                )
+            )
+        ).scalars().all()
+        for row in rows:
+            row.routine_metar_max_f = routine_metar_max_f
+            row.divergence_f = divergence_f(
+                routine_metar_max_f,
+                row.resolved_max_lower_f,
+                row.resolved_max_upper_f,
+            )
+        return len(rows)
+    except Exception:
+        return 0

@@ -238,6 +238,67 @@ def apply_calibration(
     return corrected, True
 
 
+def _apply_coeffs(prob: float, coeffs: tuple[float, float] | None) -> float | None:
+    """Clamp ``slope*prob + intercept`` to [0,1]; None when no coeffs."""
+    if coeffs is None:
+        return None
+    slope, intercept = coeffs
+    return max(0.0, min(1.0, slope * prob + intercept))
+
+
+def _fresh_coeffs_for_key(key: str) -> tuple[float, float] | None:
+    """Cache read for one key, bypassing the per-class enable FLAG.
+
+    Unlike :func:`get_cached_calibration` this does NOT consult
+    ``PER_OPERATOR_CALIBRATION_ENABLED`` — it returns whatever fit is
+    cached under ``key`` so the shadow logger can compare pooled vs
+    per-class regardless of which one is live. Honours the TTL.
+    """
+    if _cached_at is None or _cached_coeffs is None:
+        return None
+    if (time.time() - _cached_at) > _CACHE_TTL_SEC:
+        return None
+    return _cached_coeffs.get(key)
+
+
+def shadow_calibration(
+    raw_prob: float | None, operator_class: str | None
+) -> dict | None:
+    """Counterfactual calibration outputs for ``evaluation_logs.shadow_json``.
+
+    Pure **telemetry** — never influences a trade. Returns a dict (to be
+    stored under the ``cal`` namespace) carrying the raw probability plus
+    what BOTH the pooled fit and this operator class's own fit would
+    produce for it, so ``shadow-report`` can measure whether flipping
+    ``PER_OPERATOR_CALIBRATION_ENABLED`` would meaningfully move the
+    threshold [0.78,0.85) band BEFORE the flip touches live trading.
+
+    Returns ``None`` when shadow logging is disabled, the input is
+    missing, or no pooled fit is cached yet (nothing to compare).
+    ``class`` is omitted when this class has no ≥``MIN_CALIBRATION_SAMPLES``
+    fit of its own (the flag-on path would fall back to pooled there).
+    """
+    if not getattr(settings, "SHADOW_CALIBRATION_ENABLED", False):
+        return None
+    if raw_prob is None:
+        return None
+    pooled = _fresh_coeffs_for_key(POOLED_KEY)
+    if pooled is None:
+        return None
+    raw = float(raw_prob)
+    out: dict = {
+        "raw": round(raw, 4),
+        "op_class": operator_class,
+        "pooled": round(_apply_coeffs(raw, pooled) or 0.0, 4),
+    }
+    if operator_class is not None:
+        cls = _apply_coeffs(raw, _fresh_coeffs_for_key(operator_class))
+        if cls is not None:
+            out["class"] = round(cls, 4)
+            out["delta"] = round(out["class"] - out["pooled"], 4)
+    return out
+
+
 def reset_calibration_cache() -> None:
     """Test helper — drop the in-process cache."""
     global _cached_coeffs, _cached_at

@@ -164,3 +164,89 @@ def test_record_market_resolution_upserts():
         session.execute.assert_awaited_once()
 
     asyncio.run(_run())
+
+
+# --- M3 backfill ------------------------------------------------------------
+
+
+def test_backfill_routine_max_fills_and_recomputes_divergence():
+    from src.signals.market_resolution import backfill_routine_max
+    from datetime import date
+
+    async def _run():
+        # Two rows for the same station-day, different implied bounds.
+        # ``above 80`` YES → max ≥ 80 (lower=80); ``below 70`` YES → max ≤ 70.
+        r_above = SimpleNamespace(
+            resolved_max_lower_f=80.0, resolved_max_upper_f=None,
+            routine_metar_max_f=None, divergence_f=None,
+        )
+        r_below = SimpleNamespace(
+            resolved_max_lower_f=None, resolved_max_upper_f=70.0,
+            routine_metar_max_f=None, divergence_f=None,
+        )
+        session = AsyncMock()
+        res = MagicMock()
+        res.scalars.return_value.all.return_value = [r_above, r_below]
+        session.execute.return_value = res
+
+        n = await backfill_routine_max(
+            session, station_icao="KXXX", target_date_local=date(2026, 5, 30),
+            routine_metar_max_f=84.0,
+        )
+        assert n == 2
+        # 84 is consistent with "max ≥ 80" → divergence 0.
+        assert r_above.routine_metar_max_f == 84.0
+        assert r_above.divergence_f == 0.0
+        # 84 violates "max ≤ 70" by +14 → we read hotter than the resolver.
+        assert r_below.divergence_f == 14.0
+
+    asyncio.run(_run())
+
+
+def test_resolve_trades_records_resolution_on_chain_outcome():
+    """resolve_trades calls record_market_resolution on a genuine outcome."""
+    from unittest.mock import patch
+    from datetime import datetime, timedelta, timezone
+
+    from src.db.models import Market, Trade, TradeStatus, TradeDirection
+    from src.resolution import resolve_trades
+
+    async def _run():
+        market = Market(
+            id="mkt-m3",
+            question="Will the highest temperature be above 80F?",
+            end_date=datetime.utcnow() - timedelta(hours=1),
+            condition_id="0xCOND",
+            parsed_threshold=80.0,
+            parsed_operator="above",
+            parsed_location="New York",
+        )
+        trade = Trade(
+            id=1, market_id="mkt-m3", direction=TradeDirection.BUY_YES,
+            stake_usd=10.0, entry_price=0.5, status=TradeStatus.OPEN,
+            fill_price=0.5,
+        )
+        trade.market = market
+        session = AsyncMock()
+        res = MagicMock()
+        res.scalars.return_value.unique.return_value = [trade]
+        session.execute.return_value = res
+
+        spy = AsyncMock()
+        with patch(
+            "src.resolution._build_ctf_readonly",
+            new=AsyncMock(return_value=("ctf", "0xfunder")),
+        ), patch(
+            "src.resolution._query_payout_outcome",
+            new=AsyncMock(return_value=True),
+        ), patch(
+            "src.signals.market_resolution.record_market_resolution", new=spy
+        ):
+            resolved = await resolve_trades(session)
+
+        assert len(resolved) == 1
+        spy.assert_awaited_once()
+        # yes_won forwarded as a keyword.
+        assert spy.await_args.kwargs["yes_won"] is True
+
+    asyncio.run(_run())
