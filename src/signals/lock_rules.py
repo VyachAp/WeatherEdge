@@ -340,9 +340,14 @@ def _evaluate_range_lock(
             observed_max_f=current_max_f,
         )
 
-    # NO undershoot — symmetric 2x margin + rc gate.
+    # NO undershoot — symmetric 2x margin + rc gate. Gated by
+    # settings.RANGE_UNDERSHOOT_LOCK_ENABLED (default True; live .env sets
+    # False): the branch is ~9pp model-overconfident (-$26.52/30d, 2026-06-03
+    # audit). Read the flag live off `settings` so .env + monkeypatch take
+    # effect, mirroring RANGE_OVERSHOOT_LOCK_ENABLED above.
     if (
-        current_max_f <= low_f - RANGE_LOCK_MARGIN_MULTIPLIER * margin
+        settings.RANGE_UNDERSHOOT_LOCK_ENABLED
+        and current_max_f <= low_f - RANGE_LOCK_MARGIN_MULTIPLIER * margin
         and routine_count >= range_min_rc
     ):
         has_headroom, evidence = _no_more_heating(state, low_f)

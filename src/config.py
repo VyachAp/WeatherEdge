@@ -427,8 +427,23 @@ class Settings(BaseSettings):
     # exactly markets — systematic resolver/observation divergence (our
     # routine-METAR daily max reads hotter than Polymarket's resolver), not
     # a margin problem (2× was already applied). Disabled by default; the
-    # range_undershoot (+$8, 100%) and range_in_window branches are kept.
+    # range_in_window (YES) branch is kept; range_undershoot is independently
+    # gated below.
     RANGE_OVERSHOOT_LOCK_ENABLED: bool = False
+
+    # The range_undershoot lock branch (NO when observed max undershoots the
+    # range low by 2× margin AND no-more-heating) is, like every bucket/range
+    # NO class, model-OVERCONFIDENT — not a resolver divergence (2026-06-03
+    # audit). It won 71.4% but its avg NO price 0.808 implies an 80.8%
+    # break-even → ~9pp overconfident → -$26.52 / 35 trades over 30d, the same
+    # win-small/lose-big shape as the killed `exactly`-NO. Measurable resolver
+    # divergence is unbiased (±0.1°F), so a °C correction would not help; the
+    # real cure is the deferred lead-time-aware σ-floor (σ is too tight on
+    # narrow windows). Flag read live off `settings` (like overshoot); default
+    # True preserves behavior, the live `.env` sets it False to gate the bleed.
+    # Re-enable only after `SIGMA_FLOOR_LEAD_TIME_ENABLED` lands and the class
+    # turns +EV. range_in_window (YES) is unaffected.
+    RANGE_UNDERSHOOT_LOCK_ENABLED: bool = True
 
     # Master switch for bracket-like NO (`exactly`/`range`/`bracket` BUY_NO)
     # in the PROBABILITY path. When True, `binary_market_edge` rejects any

@@ -453,7 +453,11 @@ class TestRangeMarkets:
         # Margin is observed - high (3°F over 81 + 2 margin = 4 → margin_f=4)
         assert decision.margin_f >= 4.0
 
-    def test_undershoot_with_no_more_heating_locks_no(self):
+    def test_undershoot_with_no_more_heating_locks_no(self, monkeypatch):
+        # Enable undershoot (the live .env gates it off) to test the mechanics.
+        monkeypatch.setattr(
+            "src.signals.lock_rules.settings.RANGE_UNDERSHOOT_LOCK_ENABLED", True
+        )
         mkt = _FakeMarket(
             parsed_threshold=None,
             parsed_operator="bracket",
@@ -649,8 +653,12 @@ class TestRangeLockTighterGates:
         # would otherwise approve, but the 2x-margin gate blocks first.
         assert _eval(state, mkt).side is None
 
-    def test_undershoot_2x_margin_locks_no(self):
+    def test_undershoot_2x_margin_locks_no(self, monkeypatch):
         # current=58 vs exactly=62.6 → undershoot ≈ 4.6°F > 2x margin (4°F).
+        # Enable undershoot (the live .env gates it off) to test the mechanics.
+        monkeypatch.setattr(
+            "src.signals.lock_rules.settings.RANGE_UNDERSHOOT_LOCK_ENABLED", True
+        )
         c17_in_f = 17.0 * 9.0 / 5.0 + 32.0
         mkt = _FakeMarket(
             parsed_threshold=c17_in_f, parsed_operator="exactly",
@@ -696,8 +704,12 @@ class TestRangeOvershootFlag:
         assert decision.side == "NO"
         assert decision.branch == "range_overshoot"
 
-    def test_undershoot_still_fires_when_overshoot_disabled(self):
-        # Undershoot is independent of the overshoot flag — fires at default.
+    def test_undershoot_still_fires_when_overshoot_disabled(self, monkeypatch):
+        # Undershoot is independent of the overshoot flag — fires when its own
+        # flag is enabled even though overshoot stays disabled.
+        monkeypatch.setattr(
+            "src.signals.lock_rules.settings.RANGE_UNDERSHOOT_LOCK_ENABLED", True
+        )
         c17_in_f = 17.0 * 9.0 / 5.0 + 32.0
         mkt = _FakeMarket(
             parsed_threshold=c17_in_f, parsed_operator="exactly",
@@ -710,3 +722,64 @@ class TestRangeOvershootFlag:
         decision = _eval(state, mkt)
         assert decision.side == "NO"
         assert decision.branch == "range_undershoot"
+
+
+class TestRangeUndershootFlag:
+    """`range_undershoot` NO lock is gated by
+    settings.RANGE_UNDERSHOOT_LOCK_ENABLED (default True, but the live `.env`
+    sets it False after the 2026-06-03 audit showed it ~9pp model-overconfident
+    — won 71.4% vs an 80.8% price-implied break-even, -$26.52 / 35 trades / 30d.
+    range_in_window (YES) is unaffected.
+    """
+
+    def _undershoot_market_and_state(self):
+        # 17°C exactly = bucket [62, 63]; observed 58°F undershoots low - 4°F,
+        # past peak + declining → no_more_heating would approve absent the gate.
+        c17_in_f = 17.0 * 9.0 / 5.0 + 32.0
+        mkt = _FakeMarket(
+            parsed_threshold=c17_in_f, parsed_operator="exactly",
+            question="Will the highest temperature in Amsterdam be 17°C on June 15?",
+        )
+        state = _state(
+            current_max_f=58.0, forecast_peak_f=55.0,
+            solar_declining=True, metar_trend=-0.5, routine_count=5,
+        )
+        return state, mkt
+
+    def test_undershoot_fires_when_enabled(self, monkeypatch):
+        # Flag True (the code default; live .env overrides to False) → fires.
+        monkeypatch.setattr(
+            "src.signals.lock_rules.settings.RANGE_UNDERSHOOT_LOCK_ENABLED", True
+        )
+        state, mkt = self._undershoot_market_and_state()
+        decision = _eval(state, mkt)
+        assert decision.side == "NO"
+        assert decision.branch == "range_undershoot"
+
+    def test_undershoot_disabled_via_flag(self, monkeypatch):
+        # Flag False (the live .env value) → no undershoot lock; falls through
+        # to no-lock (observed max is below the in-range window too).
+        monkeypatch.setattr(
+            "src.signals.lock_rules.settings.RANGE_UNDERSHOOT_LOCK_ENABLED", False
+        )
+        state, mkt = self._undershoot_market_and_state()
+        assert _eval(state, mkt).side is None
+
+    def test_in_window_yes_still_fires_when_undershoot_disabled(self, monkeypatch):
+        # range_in_window (YES) is independent of the undershoot flag.
+        monkeypatch.setattr(
+            "src.signals.lock_rules.settings.RANGE_UNDERSHOOT_LOCK_ENABLED", False
+        )
+        c17_in_f = 17.0 * 9.0 / 5.0 + 32.0
+        mkt = _FakeMarket(
+            parsed_threshold=c17_in_f, parsed_operator="exactly",
+            question="Will the highest temperature in Amsterdam be 17°C on June 15?",
+        )
+        # observed 62°F inside [62, 63]; past peak, declining, forecast caps.
+        state = _state(
+            current_max_f=62.0, forecast_peak_f=62.0,
+            solar_declining=True, metar_trend=-0.5, routine_count=5,
+        )
+        decision = _eval(state, mkt)
+        assert decision.side == "YES"
+        assert decision.branch == "range_in_window"
