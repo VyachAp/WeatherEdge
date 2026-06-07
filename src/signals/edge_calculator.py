@@ -17,6 +17,18 @@ from src.signals.probability_engine import BucketDistribution
 logger = logging.getLogger(__name__)
 
 
+def _in_price_valley(effective_price: float) -> bool:
+    """True when the side's BUY price lands in the mid "overconfidence valley".
+
+    Per-trade EV is U-shaped in the effective price of the side bought
+    (2026-06-06 audit): +EV at the extremes, -EV in
+    ``[VALLEY_PRICE_LOW, VALLEY_PRICE_HIGH)``. Drives both the live price-band
+    edge policy (P1/P2) in :func:`binary_market_edge` and the
+    :func:`shadow_valley_fields` counterfactual.
+    """
+    return settings.VALLEY_PRICE_LOW <= effective_price < settings.VALLEY_PRICE_HIGH
+
+
 @dataclass
 class BucketEdge:
     """Edge analysis for a single bucket on one side of a binary market.
@@ -294,6 +306,29 @@ def binary_market_edge(
     ):
         reason = "bracket-like NO disabled (sigma recalibration pending)"
 
+    # Price-band edge policy — the bot's per-trade EV is U-shaped in the
+    # effective price of the side bought: -EV in the mid "overconfidence
+    # valley" [VALLEY_PRICE_LOW, VALLEY_PRICE_HIGH), +EV at the extremes
+    # (2026-06-06 audit; 60d go-forward valley -0.054 EV/$1). Applied to the
+    # chosen side after every other guard under the `reason is None` guard, so
+    # a more specific reject reason still wins in `evaluation_logs`. Operator-
+    # and side-agnostic (it bands on price, not class). Both layers no-op by
+    # default; P1 (block) wins over P2 (edge floor) when both are set.
+    if reason is None and _in_price_valley(side_price):
+        if settings.VALLEY_BLOCK_ENABLED:
+            reason = (
+                f"price-valley blocked "
+                f"[{settings.VALLEY_PRICE_LOW:.2f},{settings.VALLEY_PRICE_HIGH:.2f}) (P1)"
+            )
+        elif (
+            settings.VALLEY_MIN_EDGE is not None
+            and side_edge < settings.VALLEY_MIN_EDGE
+        ):
+            reason = (
+                f"price-valley edge {side_edge:.3f} "
+                f"< {settings.VALLEY_MIN_EDGE} floor (P2)"
+            )
+
     return BucketEdge(
         bucket_value=bucket_value,
         our_probability=side_prob,
@@ -305,6 +340,31 @@ def binary_market_edge(
         raw_probability=side_prob_raw,
         calibrated=calibrated,
     )
+
+
+def shadow_valley_fields(effective_price: float, edge: float) -> dict | None:
+    """Counterfactual for the price-band P2 refinement (measure-before-flip).
+
+    Returns the dict stamped into ``evaluation_logs.shadow_json.valley`` so a
+    future report can join valley evaluations to their resolved outcome (via
+    ``market_id`` — no fired trade required, since blocked valley evals are
+    still logged) and confirm the ``edge >= SHADOW_VALLEY_MIN_EDGE`` split is
+    +EV on out-of-sample data before ``VALLEY_MIN_EDGE`` is set live.
+    ``p2_would_block`` is what the P2 policy *would* do at the shadow
+    threshold, independent of the live ``VALLEY_BLOCK_ENABLED`` / ``VALLEY_MIN_EDGE``
+    flags. Pure; returns ``None`` when ``SHADOW_VALLEY_POLICY_ENABLED`` is off.
+    Stamped at the probability-path ``log_evaluation`` call.
+    """
+    if not settings.SHADOW_VALLEY_POLICY_ENABLED:
+        return None
+    in_v = _in_price_valley(effective_price)
+    return {
+        "in_valley": in_v,
+        "eff_price": round(effective_price, 4),
+        "edge": round(edge, 4),
+        "p2_would_block": bool(in_v and edge < settings.SHADOW_VALLEY_MIN_EDGE),
+        "p2_min_edge": settings.SHADOW_VALLEY_MIN_EDGE,
+    }
 
 
 def _check_filters(

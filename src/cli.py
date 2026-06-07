@@ -417,6 +417,54 @@ def _summarize_shadow(shadow_dicts: list[dict]) -> dict:
     return out
 
 
+def _valley_bet_won(direction: str, yes_won: bool) -> bool:
+    """Did the counterfactual valley bet win? ``BUY_NO`` wins iff the market
+    resolved NO; ``BUY_YES`` iff it resolved YES."""
+    return (yes_won is False) if direction == "BUY_NO" else (yes_won is True)
+
+
+def _valley_ev_per_dollar(price: float, won: bool) -> float:
+    """Per-$1-staked return of a binary bet at side price ``price``:
+    ``(1-p)/p`` profit on win, ``-1`` (full stake lost) on loss. Break-even
+    win rate = ``price`` — matches the trades-replay ``sum(pnl)/sum(stake)``
+    convention."""
+    if price <= 0.0:
+        return 0.0
+    return ((1.0 - price) / price) if won else -1.0
+
+
+def _aggregate_valley(rows: list[dict]) -> dict:
+    """Score resolved valley evaluations, split by the P2 decision.
+
+    Each row: ``{direction, price, yes_won, p2_would_block}``. Returns
+    ``{"all_valley", "p2_allows", "p2_blocks"}`` — each a summary
+    ``{n, won, win_pct, breakeven_pct, edge_pp, ev_per_usd}`` (rate fields are
+    ``None`` for an empty cohort). ``p2_allows`` (``p2_would_block=False``) is
+    the cohort the P2 policy keeps; the P1→P2 promotion gate is this cohort
+    being +EV (and ideally beating ``p2_blocks``).
+    """
+    def _summ(subset: list[dict]) -> dict:
+        n = len(subset)
+        if n == 0:
+            return {"n": 0, "won": 0, "win_pct": None,
+                    "breakeven_pct": None, "edge_pp": None, "ev_per_usd": None}
+        wins = [_valley_bet_won(r["direction"], r["yes_won"]) for r in subset]
+        won = sum(1 for w in wins if w)
+        be = sum(r["price"] for r in subset) / n
+        ev = sum(_valley_ev_per_dollar(r["price"], w)
+                 for r, w in zip(subset, wins)) / n
+        wp = 100.0 * won / n
+        return {"n": n, "won": won, "win_pct": wp,
+                "breakeven_pct": 100.0 * be, "edge_pp": wp - 100.0 * be,
+                "ev_per_usd": ev}
+
+    return {
+        "all_valley": _summ(rows),
+        "p2_allows": _summ([r for r in rows if not r["p2_would_block"]]),
+        "p2_blocks": _summ([r for r in rows if r["p2_would_block"]]),
+    }
+
+
 def _flags_diff(prev: dict | None, cur: dict | None) -> dict:
     """``{key: (old, new)}`` for keys whose value changed between epochs."""
     prev = prev or {}
@@ -4649,6 +4697,146 @@ def shadow_report(days: int, key: str | None, since_epoch: int | None) -> None:
                 else:
                     click.echo(f"| {k} | {info['count']:,} | — | — | — |")
             click.echo()
+
+    asyncio.run(_run())
+
+
+@main.command("valley-report")
+@click.option("--days", default=14, show_default=True, help="Look-back window in days.")
+@click.option(
+    "--since-epoch", "since_epoch", type=int, default=None,
+    help="Only rows at/after this config_epochs.id's start (see `epochs`).",
+)
+def valley_report(days: int, since_epoch: int | None) -> None:
+    """Validate the price-band P2 refinement — the P1→P2 promotion gate.
+
+    Joins probability-path valley evaluations (``shadow_json.valley``, stamped
+    by ``edge_calculator.shadow_valley_fields`` when ``SHADOW_VALLEY_POLICY_ENABLED``)
+    to the resolved outcome (``market_resolutions.yes_won``) and scores them
+    split by the P2 decision (``p2_would_block``). The cohort to watch is
+    **p2_allows** (``would_block=False``) — the high-edge valley trades P2
+    keeps: relax ``VALLEY_BLOCK_ENABLED=False`` + set ``VALLEY_MIN_EDGE`` only
+    once this cohort is clearly +EV out-of-sample (and ideally beats
+    **p2_blocks**). De-duplicated to the latest valley eval per (market, side)
+    — one bet-decision per market-side, not one per tick.
+    """
+    from sqlalchemy import select
+
+    from src.db.engine import async_session
+    from src.db.models import EvaluationLog, MarketResolution
+
+    async def _run() -> None:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+        async with async_session() as session:
+            ep = await _epoch_start(session, since_epoch)
+            if ep is not None and ep > cutoff:
+                cutoff = ep
+            evals = (
+                await session.execute(
+                    select(
+                        EvaluationLog.market_id, EvaluationLog.direction,
+                        EvaluationLog.market_prob, EvaluationLog.shadow_json,
+                    ).where(
+                        EvaluationLog.signal_kind == "probability",
+                        EvaluationLog.created_at >= cutoff,
+                        EvaluationLog.shadow_json.isnot(None),
+                    ).order_by(EvaluationLog.created_at)
+                )
+            ).all()
+
+            # Latest valley eval per (market_id, direction) — ordered by
+            # created_at above, so the last write wins.
+            latest: dict[tuple, dict] = {}
+            for market_id, direction, price, shadow in evals:
+                v = (shadow or {}).get("valley")
+                if not v or not v.get("in_valley"):
+                    continue
+                dirv = getattr(direction, "value", str(direction))
+                latest[(market_id, dirv)] = {
+                    "market_id": market_id,
+                    "direction": dirv,
+                    "price": float(price) if price is not None else None,
+                    "p2_would_block": bool(v.get("p2_would_block")),
+                }
+
+            if not latest:
+                click.echo(
+                    f"No valley shadow evals in the last {days}d. (Populated "
+                    "once SHADOW_VALLEY_POLICY_ENABLED evals fish the "
+                    "[VALLEY_PRICE_LOW, VALLEY_PRICE_HIGH) band.)"
+                )
+                return
+
+            mids = {k[0] for k in latest}
+            outcomes = dict(
+                (
+                    await session.execute(
+                        select(
+                            MarketResolution.market_id, MarketResolution.yes_won
+                        ).where(
+                            MarketResolution.market_id.in_(mids),
+                            MarketResolution.yes_won.isnot(None),
+                        )
+                    )
+                ).all()
+            )
+
+            rows = [
+                {
+                    "direction": e["direction"], "price": e["price"],
+                    "yes_won": bool(outcomes[e["market_id"]]),
+                    "p2_would_block": e["p2_would_block"],
+                }
+                for e in latest.values()
+                if e["price"] is not None and outcomes.get(e["market_id"]) is not None
+            ]
+
+            n_decisions = len(latest)
+            n_resolved = len(rows)
+            click.echo(f"# Valley P2-refinement validation — last {days}d")
+            click.echo()
+            click.echo(f"- **Valley bet-decisions** (dedup market×side): {n_decisions:,}")
+            click.echo(f"- **Resolved** (joined to market_resolutions): {n_resolved:,}")
+            click.echo(f"- **Awaiting resolution / no M3 row:** {n_decisions - n_resolved:,}")
+            click.echo()
+            if not rows:
+                click.echo(
+                    "_No resolved valley decisions yet — let markets settle "
+                    "(and ensure the M3 backfill has run)._"
+                )
+                return
+
+            agg = _aggregate_valley(rows)
+            click.echo("| Cohort | n | Won% | Break-even% | Edge pp | EV/$1 |")
+            click.echo("|---|---:|---:|---:|---:|---:|")
+            for k, lbl in (
+                ("all_valley", "all valley (P1 blocks)"),
+                ("p2_allows", "P2 allows (edge≥thr)"),
+                ("p2_blocks", "P2 blocks (edge<thr)"),
+            ):
+                s = agg[k]
+                if s["n"] == 0:
+                    click.echo(f"| {lbl} | 0 | — | — | — | — |")
+                    continue
+                click.echo(
+                    f"| {lbl} | {s['n']:,} | {s['win_pct']:.0f}% | "
+                    f"{s['breakeven_pct']:.0f}% | {s['edge_pp']:+.1f} | "
+                    f"{s['ev_per_usd']:+.3f} |"
+                )
+            click.echo()
+
+            pa = agg["p2_allows"]
+            if pa["n"] >= 1 and pa["ev_per_usd"] is not None:
+                verdict = (
+                    "✅ +EV — P2 promotion supported"
+                    if pa["ev_per_usd"] > 0 else "❌ not yet +EV — keep P1"
+                )
+                click.echo(
+                    f"**Promotion gate (P2-allows cohort):** {verdict} "
+                    f"(n={pa['n']}, EV/$1 {pa['ev_per_usd']:+.3f}). "
+                    "Confirm on a meaningful sample before flipping."
+                )
+                click.echo()
 
     asyncio.run(_run())
 

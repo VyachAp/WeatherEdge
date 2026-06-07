@@ -11,12 +11,15 @@ import pytest
 
 from src.cli import (
     _aggregate_divergence,
+    _aggregate_valley,
     _flags_diff,
     _flatten_shadow,
     _quantiles,
     _summarize_exposure,
     _summarize_floored_fills,
     _summarize_shadow,
+    _valley_bet_won,
+    _valley_ev_per_dollar,
 )
 
 
@@ -191,3 +194,52 @@ def test_summarize_floored_fills_all_open_no_resolved():
     assert fl["n"] == 2
     assert fl["resolved"] == 0
     assert fl["won_pct"] is None  # gate not yet readable
+
+
+# --- valley-report aggregator (P1→P2 promotion gate) ------------------------
+
+def test_valley_bet_won_directions():
+    # BUY_NO wins when market resolved NO (yes_won False).
+    assert _valley_bet_won("BUY_NO", False) is True
+    assert _valley_bet_won("BUY_NO", True) is False
+    # BUY_YES wins when market resolved YES.
+    assert _valley_bet_won("BUY_YES", True) is True
+    assert _valley_bet_won("BUY_YES", False) is False
+
+
+def test_valley_ev_per_dollar_breakeven_at_price():
+    # Win pays (1-p)/p; loss is full -1. Break-even win rate == price, so a
+    # 50/50 outcome at price 0.5 nets ~0.
+    assert _valley_ev_per_dollar(0.5, True) == pytest.approx(1.0)
+    assert _valley_ev_per_dollar(0.5, False) == pytest.approx(-1.0)
+    assert _valley_ev_per_dollar(0.0, True) == 0.0  # guard against div-by-zero
+
+
+def test_aggregate_valley_splits_and_scores():
+    rows = [
+        # P2 allows (high edge): 3 NO bets at 0.70, 2 win → +EV-ish
+        {"direction": "BUY_NO", "price": 0.70, "yes_won": False, "p2_would_block": False},
+        {"direction": "BUY_NO", "price": 0.70, "yes_won": False, "p2_would_block": False},
+        {"direction": "BUY_NO", "price": 0.70, "yes_won": True, "p2_would_block": False},
+        # P2 blocks (low edge): 2 NO bets at 0.70, both lose → -EV
+        {"direction": "BUY_NO", "price": 0.70, "yes_won": True, "p2_would_block": True},
+        {"direction": "BUY_NO", "price": 0.70, "yes_won": True, "p2_would_block": True},
+    ]
+    agg = _aggregate_valley(rows)
+    assert agg["all_valley"]["n"] == 5
+    assert agg["p2_allows"]["n"] == 3
+    assert agg["p2_blocks"]["n"] == 2
+    # p2_allows: 2/3 win → 66.7%, break-even 70%
+    assert agg["p2_allows"]["win_pct"] == pytest.approx(66.667, abs=0.1)
+    assert agg["p2_allows"]["breakeven_pct"] == pytest.approx(70.0)
+    # p2_blocks all lose → EV -1.0
+    assert agg["p2_blocks"]["ev_per_usd"] == pytest.approx(-1.0)
+    assert agg["p2_blocks"]["win_pct"] == 0.0
+
+
+def test_aggregate_valley_empty_cohorts():
+    agg = _aggregate_valley([])
+    for c in ("all_valley", "p2_allows", "p2_blocks"):
+        assert agg[c]["n"] == 0
+        assert agg[c]["win_pct"] is None
+        assert agg[c]["ev_per_usd"] is None

@@ -536,6 +536,7 @@ async def job_unified_pipeline() -> None:
                     try:
                         from src.signals.calibration import shadow_calibration
                         from src.signals.probability_engine import shadow_sigma_fields
+                        from src.signals.edge_calculator import shadow_valley_fields
                         from src.execution.binary_market import operator_class
                         shadow_parts: dict = {}
                         cal_shadow = shadow_calibration(
@@ -546,6 +547,13 @@ async def job_unified_pipeline() -> None:
                         sig_shadow = shadow_sigma_fields(state)
                         if sig_shadow is not None:
                             shadow_parts["sigma"] = sig_shadow
+                        # P2 price-band refinement counterfactual — banded on
+                        # the chosen side's BUY cost (== BucketEdge.market_price).
+                        val_shadow = shadow_valley_fields(
+                            edge_result.market_price, edge_result.edge,
+                        )
+                        if val_shadow is not None:
+                            shadow_parts["valley"] = val_shadow
                         eval_shadow = shadow_parts or None
                     except Exception:
                         eval_shadow = None

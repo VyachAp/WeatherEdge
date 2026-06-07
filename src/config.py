@@ -475,5 +475,39 @@ class Settings(BaseSettings):
     # evals-report tuner shows survivors at +EV.
     BRACKET_LIKE_NO_DISABLED: bool = False
 
+    # --- Price-band edge policy (2026-06-06 perf audit) -----------------
+    # Per-trade EV is U-shaped in the effective price of the side bought:
+    # +EV at the extremes (deep-value [.40,.60) and near-lock [.85,1.0]) and
+    # -EV in the mid "overconfidence valley" where the Gaussian's mild
+    # over-tightness bites (60d go-forward book: valley -0.054 EV/$1 vs the
+    # extremes +0.086 / +0.096; the bot's realised avg NO price ~0.75 sits in
+    # the valley). Two layers in `binary_market_edge`, applied to the chosen
+    # side under the `reason is None` guard — probability path only, since the
+    # lock path doesn't route through `binary_market_edge`:
+    #   P1 (VALLEY_BLOCK_ENABLED): block any trade whose side-price lands in
+    #      [VALLEY_PRICE_LOW, VALLEY_PRICE_HIGH). Robust, no tuned parameter —
+    #      the interim guard. In-sample 60d: EV/$1 0.033→0.093, win 75→81%,
+    #      volume -40%.
+    #   P2 (VALLEY_MIN_EDGE): instead require a raised edge floor in the valley.
+    #      Higher PnL than P1 (keeps the +EV high-edge valley trades) but the
+    #      0.15 threshold is in-sample-tuned on n=8 removed trades — validate
+    #      via SHADOW_VALLEY_* on out-of-sample data before flipping. None=off.
+    # Precedence: P1 (block) wins when both are set. Both default to no-op.
+    VALLEY_PRICE_LOW: float = 0.60
+    VALLEY_PRICE_HIGH: float = 0.85
+    VALLEY_BLOCK_ENABLED: bool = False
+    VALLEY_MIN_EDGE: float | None = None
+
+    # Shadow telemetry for the P2 refinement (measure-before-flip). Pure —
+    # stamps evaluation_logs.shadow_json.valley with {in_valley, eff_price,
+    # edge, p2_would_block, p2_min_edge} so a future report can join valley
+    # evals to their resolved outcome (via market_id — no fired trade needed)
+    # and confirm the edge>=SHADOW_VALLEY_MIN_EDGE split is +EV before
+    # VALLEY_MIN_EDGE is set live. Runs regardless of VALLEY_BLOCK_ENABLED
+    # (blocked valley evals are still logged, so their counterfactual outcome
+    # stays recoverable).
+    SHADOW_VALLEY_POLICY_ENABLED: bool = True
+    SHADOW_VALLEY_MIN_EDGE: float = 0.15
+
 
 settings = Settings()

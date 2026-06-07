@@ -467,3 +467,145 @@ class TestBracketLikeNoMasterSwitch:
         assert edge.direction == TradeDirection.BUY_NO
         assert edge.passes is True
         assert edge.reject_reason is None
+
+
+class TestPriceBandValleyPolicy:
+    """Price-band edge policy (2026-06-06 audit): per-trade EV is U-shaped in
+    the effective price of the side bought, with a -EV "overconfidence valley"
+    in [VALLEY_PRICE_LOW, VALLEY_PRICE_HIGH). P1 (block) and P2 (raised edge
+    floor) gate the valley; both no-op by default. Side/operator-agnostic.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clean_flags(self, monkeypatch):
+        # Deterministic baseline: calibration off (so probs/edges are exact),
+        # valley flags at their no-op defaults. Individual tests opt in.
+        from src.config import settings
+        monkeypatch.setattr(settings, "APPLY_CALIBRATION", False)
+        monkeypatch.setattr(settings, "VALLEY_BLOCK_ENABLED", False)
+        monkeypatch.setattr(settings, "VALLEY_MIN_EDGE", None)
+        monkeypatch.setattr(settings, "VALLEY_PRICE_LOW", 0.60)
+        monkeypatch.setattr(settings, "VALLEY_PRICE_HIGH", 0.85)
+
+    def _valley_no(self):
+        """A threshold at_least NO whose side price (0.70) is in the valley,
+        passing every other filter (no_prob 0.90, edge 0.20)."""
+        return _eval_binary(
+            question="Will the highest temperature in X be at least 75",
+            threshold_f=75, op="at_least", our_prob_in_window=0.10,
+            yes_bid=0.30, yes_ask=0.32,
+            forecast_peak_f=70.0, current_max_f=68.0, hours_until_peak=2.0,
+        )
+
+    def test_in_price_valley_is_half_open(self):
+        from src.signals.edge_calculator import _in_price_valley
+        assert _in_price_valley(0.60) is True
+        assert _in_price_valley(0.84) is True
+        assert _in_price_valley(0.85) is False   # upper bound exclusive
+        assert _in_price_valley(0.599) is False
+        assert _in_price_valley(0.55) is False    # deep-value extreme
+        assert _in_price_valley(0.90) is False    # near-lock extreme
+
+    def test_baseline_valley_trade_passes_when_flags_off(self):
+        edge = self._valley_no()
+        from src.db.models import TradeDirection
+        assert edge.direction == TradeDirection.BUY_NO
+        assert 0.60 <= edge.market_price < 0.85
+        assert edge.passes is True
+
+    def test_p1_block_rejects_valley_trade(self, monkeypatch):
+        from src.config import settings
+        monkeypatch.setattr(settings, "VALLEY_BLOCK_ENABLED", True)
+        edge = self._valley_no()
+        assert edge.passes is False
+        assert "price-valley blocked" in edge.reject_reason
+
+    def test_p2_floor_rejects_low_edge_valley_trade(self, monkeypatch):
+        from src.config import settings
+        # Edge is 0.20; require 0.25 → blocked.
+        monkeypatch.setattr(settings, "VALLEY_MIN_EDGE", 0.25)
+        edge = self._valley_no()
+        assert edge.passes is False
+        assert "price-valley edge" in edge.reject_reason
+
+    def test_p2_floor_passes_high_edge_valley_trade(self, monkeypatch):
+        from src.config import settings
+        # Edge is 0.20; require 0.15 → the high-edge valley trade survives.
+        monkeypatch.setattr(settings, "VALLEY_MIN_EDGE", 0.15)
+        edge = self._valley_no()
+        assert edge.passes is True
+
+    def test_p1_wins_over_p2_when_both_set(self, monkeypatch):
+        from src.config import settings
+        monkeypatch.setattr(settings, "VALLEY_BLOCK_ENABLED", True)
+        monkeypatch.setattr(settings, "VALLEY_MIN_EDGE", 0.10)  # would pass P2
+        edge = self._valley_no()
+        assert edge.passes is False
+        assert "price-valley blocked" in edge.reject_reason
+
+    def test_extremes_pass_even_when_block_enabled(self, monkeypatch):
+        from src.config import settings
+        monkeypatch.setattr(settings, "VALLEY_BLOCK_ENABLED", True)
+        # Deep-value NO at price 0.55 (yes_bid 0.45) — below the valley, the
+        # +EV value band. no_prob 0.90, edge 0.35 → unambiguous pass.
+        edge = _eval_binary(
+            question="Will the highest temperature in X be at least 75",
+            threshold_f=75, op="at_least", our_prob_in_window=0.10,
+            yes_bid=0.45, yes_ask=0.47,
+            forecast_peak_f=70.0, current_max_f=68.0, hours_until_peak=2.0,
+        )
+        assert edge.market_price < 0.60
+        assert edge.passes is True
+
+    def test_more_specific_reject_reason_wins(self, monkeypatch):
+        from src.config import settings
+        monkeypatch.setattr(settings, "VALLEY_BLOCK_ENABLED", True)
+        # Valley-priced NO (0.70) but edge 0.02 < MIN_EDGE → _check_filters
+        # rejects on edge first; the valley guard must not overwrite it.
+        edge = _eval_binary(
+            question="Will the highest temperature in X be at least 75",
+            threshold_f=75, op="at_least", our_prob_in_window=0.28,
+            yes_bid=0.30, yes_ask=0.32,
+            forecast_peak_f=70.0, current_max_f=68.0, hours_until_peak=2.0,
+        )
+        assert edge.passes is False
+        assert "edge" in edge.reject_reason
+        assert "price-valley" not in edge.reject_reason
+
+
+class TestShadowValleyFields:
+    """`shadow_valley_fields` — pure counterfactual for the P2 refinement,
+    independent of the live VALLEY_* flags; gated by SHADOW_VALLEY_POLICY_ENABLED."""
+
+    @pytest.fixture(autouse=True)
+    def _defaults(self, monkeypatch):
+        from src.config import settings
+        monkeypatch.setattr(settings, "SHADOW_VALLEY_POLICY_ENABLED", True)
+        monkeypatch.setattr(settings, "SHADOW_VALLEY_MIN_EDGE", 0.15)
+        monkeypatch.setattr(settings, "VALLEY_PRICE_LOW", 0.60)
+        monkeypatch.setattr(settings, "VALLEY_PRICE_HIGH", 0.85)
+
+    def test_valley_low_edge_would_block(self):
+        from src.signals.edge_calculator import shadow_valley_fields
+        f = shadow_valley_fields(0.70, 0.10)
+        assert f["in_valley"] is True
+        assert f["p2_would_block"] is True
+        assert f["p2_min_edge"] == 0.15
+
+    def test_valley_high_edge_would_not_block(self):
+        from src.signals.edge_calculator import shadow_valley_fields
+        f = shadow_valley_fields(0.70, 0.20)
+        assert f["in_valley"] is True
+        assert f["p2_would_block"] is False
+
+    def test_outside_valley_never_blocks(self):
+        from src.signals.edge_calculator import shadow_valley_fields
+        f = shadow_valley_fields(0.90, 0.01)
+        assert f["in_valley"] is False
+        assert f["p2_would_block"] is False
+
+    def test_disabled_returns_none(self, monkeypatch):
+        from src.config import settings
+        from src.signals.edge_calculator import shadow_valley_fields
+        monkeypatch.setattr(settings, "SHADOW_VALLEY_POLICY_ENABLED", False)
+        assert shadow_valley_fields(0.70, 0.10) is None
