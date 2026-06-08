@@ -599,3 +599,40 @@ referencing the missing script. Docs have been corrected to frame this
 as a planned bootstrap step pointing here; this entry exists so a future
 audit pass does not re-flag it. The wiring is the asset; only the data is
 missing.
+
+---
+
+## [backlog] Segmented / isotonic calibration for the near-lock band
+
+**Why:** The 2026-06-08 no-trade investigation found the single linear pooled
+calibration (n=594, slope 0.71) over-penalizes the high-confidence near-lock
+band: it maps raw 1.0 → ~0.78, so a threshold trade needs raw prob ≥ ~0.955 to
+clear the `THRESHOLD_MIN_PROBABILITY=0.75` floor after calibration. The pooled
+fit is dragged down by the mid-confidence overconfident losers (84% of the
+training data is the now-disabled bracket-like-NO class), so the genuinely
++EV near-lock trades (~95% realized win) are suppressed along with the bad
+mid-confidence ones. A single global slope can't express "near-locks are
+well-calibrated but mid-confidence is overconfident."
+
+**Success criteria:** a calibrator (piecewise/isotonic, or a per-confidence-band
+fit) that leaves the near-lock band (raw ≥ ~0.95) ≈ identity while still
+discounting the mid band — validated via shadow telemetry (`shadow_json`) before
+flipping, and `decisions-report` showing near-lock fills resume without the
+mid-band -EV bets returning.
+
+**Effort:** ~1-2 days; gated on more clean post-σ-fix data (threshold class is
+n=92 and degenerate today — see `[backlog] Lead-time-aware σ floor`).
+
+**Leverage:** signal-quality + volume (recovers the +EV near-lock trades the
+blunt linear fit currently squashes).
+
+**Files:** `src/signals/calibration.py` (fit + apply), shadow wiring in
+`src/scheduler/__init__.py`, `tests/test_calibration.py`.
+
+**Notes:** Do NOT pursue by forcing volume (lower prob floor / disable
+calibration) — the 2026-06-08 analysis confirmed those bets are ~break-even/-EV
+(realized NO win ~70% at ~0.75 prices). The honest fix order is: (1) σ-floor to
+make raw probs honest, (2) re-fit calibration on the cleaner data, (3) only then
+consider segmentation if the linear fit still mis-serves the tails. The
+`_detect_calibration_squash` daily diagnostic (job_daily_settlement section 7,
+shipped 2026-06-08) surfaces when this squash is actively gating trades.

@@ -880,3 +880,58 @@ class TestStuckAlertCooldown:
             session, datetime(2026, 5, 18, 12, 30, tzinfo=timezone.utc)
         )
         session.rollback.assert_awaited_once()
+
+
+class TestDetectCalibrationSquash:
+    """`_detect_calibration_squash` — pure diagnostic for the calibration-
+    induced trade halt (2026-06-08 investigation). Fires only when ~0 fills
+    AND enough edged evals were rejected on the probability floor *because*
+    calibration pulled an otherwise-passing raw prob below it."""
+
+    def _rows(self, n, raw, cal, floor=0.75):
+        return [
+            {"edge": 0.1, "raw_model_prob": raw, "model_prob": cal,
+             "reject_reason": f"probability {cal:.4f} < {floor}"}
+            for _ in range(n)
+        ]
+
+    def test_fires_on_squash_with_zero_fills(self):
+        from src.scheduler import _detect_calibration_squash
+        out = _detect_calibration_squash(self._rows(30, 0.92, 0.72), fill_count=0)
+        assert out is not None
+        assert out["n_squashed"] == 30
+        assert out["avg_raw"] == pytest.approx(0.92)
+        assert out["avg_cal"] == pytest.approx(0.72)
+
+    def test_silent_when_fills_present(self):
+        from src.scheduler import _detect_calibration_squash
+        assert _detect_calibration_squash(self._rows(30, 0.92, 0.72), fill_count=3) is None
+
+    def test_silent_below_min_count(self):
+        from src.scheduler import _detect_calibration_squash
+        assert _detect_calibration_squash(self._rows(5, 0.92, 0.72), fill_count=0) is None
+
+    def test_ignores_genuine_low_prob_rejects(self):
+        from src.scheduler import _detect_calibration_squash
+        # raw never cleared the floor → not a squash, just a low-confidence eval.
+        rows = self._rows(40, 0.60, 0.55)
+        assert _detect_calibration_squash(rows, fill_count=0) is None
+
+    def test_ignores_non_probability_rejects(self):
+        from src.scheduler import _detect_calibration_squash
+        rows = [
+            {"edge": 0.0, "raw_model_prob": 0.92, "model_prob": 0.72,
+             "reject_reason": "edge 0.0100 < 0.05"}
+            for _ in range(40)
+        ]
+        assert _detect_calibration_squash(rows, fill_count=0) is None
+
+    def test_handles_missing_fields(self):
+        from src.scheduler import _detect_calibration_squash
+        rows = [
+            {"edge": 0.1, "raw_model_prob": None, "model_prob": 0.72,
+             "reject_reason": "probability 0.7200 < 0.75"},
+            {"edge": 0.1, "raw_model_prob": 0.92, "model_prob": 0.72,
+             "reject_reason": "malformed reason"},
+        ]
+        assert _detect_calibration_squash(rows, fill_count=0) is None

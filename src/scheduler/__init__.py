@@ -906,6 +906,99 @@ async def job_unified_pipeline() -> None:
         await alerter.send_system_error(exc, "unified pipeline")
 
 
+# Cooldown key + window for the calibration-squash diagnostic (section 7 of
+# job_daily_settlement). Persisted in bot_state so a restart doesn't re-alert.
+_CALIB_SQUASH_ALERT_KEY = "settlement.calib_squash_last_pushed_at"
+_CALIB_SQUASH_COOLDOWN_HOURS = 48
+# Minimum squashed-eval count before the diagnostic fires (avoid noise on a
+# quiet day that genuinely had no edged candidates).
+_CALIB_SQUASH_MIN_COUNT = 20
+
+
+def _detect_calibration_squash(
+    eval_rows: list[dict], fill_count: int, *, min_squashed: int = _CALIB_SQUASH_MIN_COUNT,
+) -> dict | None:
+    """Diagnose a calibration-induced trade halt. Pure (no I/O).
+
+    Returns ``{n_squashed, avg_raw, avg_cal}`` when the day saw ~no fills AND a
+    meaningful set of edged evals were rejected on the probability floor
+    *because calibration pulled an otherwise-passing raw prob below it* — i.e.
+    the 2026-06-08 "bot correctly sitting out an overconfident regime" signature
+    (raw≈0.92 → cal≈0.72 < 0.75 floor). Returns ``None`` when there were fills,
+    too few squashed evals, or the data is incomplete.
+
+    ``eval_rows`` items carry ``reject_reason`` (``"probability X < FLOOR"``),
+    ``raw_model_prob`` (pre-calibration), ``model_prob`` (post-calibration). A
+    row counts as squashed when calibration moved it from clearing the floor
+    (raw ≥ FLOOR) to below it (cal < FLOOR).
+    """
+    if fill_count > 0:
+        return None
+    squashed: list[tuple[float, float]] = []
+    for r in eval_rows:
+        rr = r.get("reject_reason") or ""
+        if not rr.startswith("probability"):
+            continue
+        raw, cal = r.get("raw_model_prob"), r.get("model_prob")
+        if raw is None or cal is None:
+            continue
+        try:
+            floor = float(rr.rsplit("<", 1)[1].strip())
+        except (IndexError, ValueError):
+            continue
+        if raw >= floor > cal:
+            squashed.append((float(raw), float(cal)))
+    if len(squashed) < min_squashed:
+        return None
+    n = len(squashed)
+    return {
+        "n_squashed": n,
+        "avg_raw": sum(s[0] for s in squashed) / n,
+        "avg_cal": sum(s[1] for s in squashed) / n,
+    }
+
+
+async def _load_alert_cooldown(
+    session: "AsyncSessionType", key: str,
+) -> datetime | None:
+    """Generic bot_state cooldown reader (``{"at_iso": ...}``). Fail-open on a
+    missing bot_state table (mirrors ``_load_stuck_alert_cooldown``)."""
+    try:
+        row = await session.get(BotState, key)
+    except ProgrammingError:
+        await session.rollback()
+        logger.warning("bot_state table missing — %s cooldown not persisted.", key)
+        return None
+    if row is None or not isinstance(row.value, dict):
+        return None
+    iso = row.value.get("at_iso")
+    if not iso:
+        return None
+    try:
+        return datetime.fromisoformat(iso)
+    except ValueError:
+        return None
+
+
+async def _persist_alert_cooldown(
+    session: "AsyncSessionType", key: str, at: datetime,
+) -> None:
+    """Generic bot_state cooldown writer (idempotent upsert)."""
+    try:
+        stmt = (
+            pg_insert(BotState)
+            .values(key=key, value={"at_iso": at.isoformat()}, updated_at=at)
+            .on_conflict_do_update(
+                index_elements=["key"],
+                set_={"value": {"at_iso": at.isoformat()}, "updated_at": at},
+            )
+        )
+        await session.execute(stmt)
+    except ProgrammingError:
+        await session.rollback()
+        logger.warning("bot_state table missing — %s cooldown not persisted.", key)
+
+
 async def job_daily_settlement() -> None:
     """Daily 22:00 UTC — bankroll/drawdown bookkeeping, daily digest.
 
@@ -1075,6 +1168,72 @@ async def job_daily_settlement() -> None:
                     )
             except Exception:
                 logger.warning("Exposure-cap alert check failed (non-fatal)", exc_info=True)
+
+            # 7. Calibration-squash / low-throughput diagnostic. When the day
+            # saw ~no fills AND a meaningful set of edged evals were rejected on
+            # the probability floor *because calibration pulled an otherwise-
+            # passing raw prob below it*, surface it — so a "correctly sitting
+            # out an overconfident regime" halt (2026-06-08 investigation) is
+            # distinguishable from a real bug. Best-effort; bot_state cooldown.
+            try:
+                day_ago = datetime.now(timezone.utc) - timedelta(hours=24)
+                fills = (
+                    await session.execute(
+                        select(Trade.id).where(
+                            Trade.opened_at >= day_ago,
+                            Trade.fill_price.isnot(None),
+                        )
+                    )
+                ).scalars().all()
+                cand = (
+                    await session.execute(
+                        select(
+                            EvaluationLog.edge,
+                            EvaluationLog.raw_model_prob,
+                            EvaluationLog.model_prob,
+                            EvaluationLog.reject_reason,
+                        ).where(
+                            EvaluationLog.signal_kind == "probability",
+                            EvaluationLog.created_at >= day_ago,
+                            EvaluationLog.raw_model_prob.isnot(None),
+                            EvaluationLog.model_prob.isnot(None),
+                            EvaluationLog.reject_reason.like("probability%"),
+                        )
+                    )
+                ).all()
+                eval_rows = [
+                    {"edge": e, "raw_model_prob": rp,
+                     "model_prob": mp, "reject_reason": rr}
+                    for (e, rp, mp, rr) in cand
+                ]
+                squash = _detect_calibration_squash(eval_rows, len(fills))
+                if squash is not None:
+                    now = datetime.now(timezone.utc)
+                    last_at = await _load_alert_cooldown(
+                        session, _CALIB_SQUASH_ALERT_KEY
+                    )
+                    if last_at is None or (now - last_at) >= timedelta(
+                        hours=_CALIB_SQUASH_COOLDOWN_HOURS
+                    ):
+                        await alerter._enqueue(
+                            f"\U0001f4c9 *Low throughput — calibration squash*\n"
+                            f"0 fills in 24h; {squash['n_squashed']} edged evals "
+                            f"gated by the probability floor after calibration "
+                            f"pulled them below it "
+                            f"(raw≈{squash['avg_raw']:.2f} → "
+                            f"cal≈{squash['avg_cal']:.2f}).\n"
+                            f"Likely CORRECT (model overconfidence), not a bug. "
+                            f"Forcing volume is −EV; track "
+                            f"`shadow-report --key sigma` for the σ-floor fix."
+                        )
+                        await _persist_alert_cooldown(
+                            session, _CALIB_SQUASH_ALERT_KEY, now
+                        )
+            except Exception:
+                logger.warning(
+                    "Calibration-squash diagnostic failed (non-fatal)",
+                    exc_info=True,
+                )
 
             await session.commit()
 
