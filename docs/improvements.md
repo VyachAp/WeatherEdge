@@ -28,6 +28,45 @@ gotchas, not here.
 
 ---
 
+## [in-flight] Automated perf-review loop (Layer 1 deterministic + Layer 2 analyst)
+
+**Why:** For ~2 months the "evaluate DB/results → propose flag/code change"
+loop has been run by hand each session. The data backbone already exists
+(M1–M4 telemetry + the pure report aggregators in `cli.py` + codified
+flip-gate criteria), so the loop is automatable. Shipped 2026-06-08,
+**propose-only** (human approves every flip — the project's measure-before-flip
+discipline is non-negotiable on a live trading bot).
+**What shipped:**
+- *Layer 1 (deterministic, in-bot):* `cli.perf_review_result` + the pure fns
+  `_realized_pnl` (phantom-LOST-safe) / `_throttle_breakdown` / `_loss_classes`
+  / `_window_regression` / `_flip_gate_verdicts`, the `perf-review` command
+  (`--days/--json/--push/--write-artifact`), `render_perf_digest`,
+  `_persist_perf_artifact` (bot_state row + gitignored `runtime/*.json`), and
+  `perf-propose-push`. Scheduler `job_perf_review(days)` registered for
+  daily/3d/7d (gated by `PERF_REVIEW_ENABLED`, default False), throttled per
+  cadence via a `bot_state` cooldown, staggered after the 22:00 settlement.
+- *Layer 2 (LLM analyst, out-of-bot):* `docs/agents/perf_analyst_prompt.md` —
+  reads the Layer-1 artifact + this file + memory, evaluates each flip-gate,
+  drafts the exact `.env`/code change with evidence, and writes ONLY to this
+  file + `~/.claude` memory + a Telegram push. Never edits `.env`/`src`.
+**Success criteria:** (a) `PERF_REVIEW_ENABLED=true` in `.env` + restart;
+(b) the three cadences push a digest on schedule without spamming;
+(c) the Layer-2 analyst (scheduled via the `schedule`/routines skill or system
+cron) produces a flip-proposal Telegram + an improvements.md/memory entry each
+cadence, with a clean `git diff` of `.env`/`src`;
+(d) at least one real flip decision (e.g. a `VALLEY_MIN_EDGE` set or a
+`stake_below_min`-blocked threshold loosening) is surfaced from the digest
+rather than a manual query.
+**Effort:** shipped; remaining = enable in `.env` + stand up the Layer-2
+schedule (mechanism TBD: routines vs host cron — needs prod-DB reachability).
+**Leverage:** observability + iteration-velocity.
+**Files:** `src/cli.py`, `src/scheduler/__init__.py`, `src/config.py`,
+`docs/agents/perf_analyst_prompt.md`, `tests/test_perf_review.py`.
+**Notes:** Layer-1 flip-gate inputs are best-effort cheap proxies; the
+threshold recoverable-band number is left to the analyst (it runs
+`evals-report --operator threshold`). The gate verdicts are advisory —
+`insufficient-data` below the codified n (30/30/50/8/20).
+
 ## [in-flight] Monitor stuck-exposure fix + post-Phase-E observation window
 
 **Why:** On 2026-05-17 the bot was discovered silenced for ~24h —

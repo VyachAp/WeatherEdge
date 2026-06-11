@@ -12,3 +12,5 @@ build/
 /data/
 *.grib2
 debug_pipeline.py
+# perf-review JSON artifacts (Layer-1 → Layer-2 analyst handoff)
+runtime/

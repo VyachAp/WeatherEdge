@@ -517,6 +517,284 @@ def _summarize_floored_fills(rows: list[dict]) -> dict:
     }
 
 
+# --- Perf-review aggregators (automated daily / 3d / 7d evaluation) -------
+# Pure functions feeding the `perf-review` command + scheduler job. Same
+# dict-in/dict-out contract as the Phase-0 readers above so they unit-test
+# without a DB. The PnL helper enforces the project's phantom-LOST-safe
+# methodology: a LOST row that never filled released exposure but is NOT a
+# realised loss (see memory project_phantom_losses_2026-05-20), and dry-run
+# rows keep their requested stake so must be excluded from any $ sum.
+
+_PERF_RESOLVED = ("won", "lost")
+# Outcomes that represent a throttle / failure (vs the success branches
+# signal_written / trade_pending / trade_filled). The dominant throttle is
+# the live volume bottleneck.
+_PERF_THROTTLE_OUTCOMES = (
+    "stake_below_min", "drawdown_paused", "cluster_cap_hit", "cap_exceeded",
+    "no_fill", "order_failed", "insufficient_balance", "no_token_ids",
+    "no_client", "dup_blocked_inproc", "dup_blocked_db",
+)
+
+
+def _is_phantom_lost(row: dict) -> bool:
+    """A LOST trade whose order never filled — exposure-release cleanup, not a
+    realised loss. Excluded from every PnL / win-rate sum."""
+    return row.get("status") == "lost" and row.get("fill_price") is None
+
+
+def _perf_tradeable(rows: list[dict]) -> list[dict]:
+    """Rows representing real capital at risk: drop dry-run + phantom-LOST,
+    keep only OPEN / WON / LOST (PENDING never reached the book)."""
+    out: list[dict] = []
+    for r in rows:
+        if r.get("exchange_status") == "dry_run":
+            continue
+        if r.get("status") not in (("open",) + _PERF_RESOLVED):
+            continue
+        if _is_phantom_lost(r):
+            continue
+        out.append(r)
+    return out
+
+
+def _realized_pnl(trade_rows: list[dict]) -> dict:
+    """Phantom-LOST-safe realised P&L over a window of trade-row dicts.
+
+    Each row: ``{status, pnl, stake_usd, fill_price, exchange_status,
+    signal_kind, lock_branch}`` (``status`` lowercased: won/lost/open/...).
+    Returns ``{n, n_won, win_pct, pnl, staked, ev_per_usd, n_open, by_kind,
+    by_branch}`` where the rate fields cover *resolved* (won/lost) trades only.
+    """
+    rows = _perf_tradeable(trade_rows)
+    resolved = [r for r in rows if r.get("status") in _PERF_RESOLVED]
+    n = len(resolved)
+    won = sum(1 for r in resolved if r.get("status") == "won")
+    pnl = sum(float(r.get("pnl") or 0.0) for r in resolved)
+    staked = sum(float(r.get("stake_usd") or 0.0) for r in resolved)
+
+    def _group(key: str) -> dict:
+        groups: dict[object, list[dict]] = {}
+        for r in resolved:
+            g = r.get(key)
+            if g is None:
+                continue
+            groups.setdefault(g, []).append(r)
+        out: dict = {}
+        for g, rs in groups.items():
+            gw = sum(1 for r in rs if r.get("status") == "won")
+            gstk = sum(float(r.get("stake_usd") or 0.0) for r in rs)
+            gpnl = sum(float(r.get("pnl") or 0.0) for r in rs)
+            out[g] = {
+                "n": len(rs), "won": gw, "win_pct": gw / len(rs),
+                "pnl": gpnl, "ev_per_usd": (gpnl / gstk) if gstk else None,
+            }
+        return out
+
+    return {
+        "n": n, "n_won": won, "win_pct": (won / n) if n else None,
+        "pnl": pnl, "staked": staked,
+        "ev_per_usd": (pnl / staked) if staked else None,
+        "n_open": sum(1 for r in rows if r.get("status") == "open"),
+        "by_kind": _group("signal_kind"),
+        "by_branch": _group("lock_branch"),
+    }
+
+
+def _throttle_breakdown(decision_rows: list[dict]) -> dict:
+    """Funnel histogram over ``decision_logs`` rows + the dominant throttle.
+
+    Each row: ``{outcome, metadata_json}``. Returns ``{total, outcomes,
+    dominant_throttle, dominant_throttle_frac, n_throttled, size_reasons,
+    floored_up_n}``. ``dominant_throttle`` is the most common skip/fail
+    outcome — the live volume bottleneck (e.g. ``stake_below_min``).
+    """
+    total = len(decision_rows)
+    outcomes: dict[str, int] = {}
+    size_reasons: dict[str, int] = {}
+    floored = 0
+    for r in decision_rows:
+        oc = r.get("outcome") or "(none)"
+        outcomes[oc] = outcomes.get(oc, 0) + 1
+        md = r.get("metadata_json") or {}
+        if oc in ("stake_below_min", "drawdown_paused"):
+            sr = str(md.get("size_reason", "(none)"))
+            size_reasons[sr] = size_reasons.get(sr, 0) + 1
+        if md.get("floored_up"):
+            floored += 1
+    throttles = {k: v for k, v in outcomes.items() if k in _PERF_THROTTLE_OUTCOMES}
+    dom = max(throttles.items(), key=lambda kv: kv[1]) if throttles else None
+    return {
+        "total": total, "outcomes": outcomes,
+        "dominant_throttle": dom[0] if dom else None,
+        "dominant_throttle_frac": (dom[1] / total) if (dom and total) else None,
+        "n_throttled": sum(throttles.values()),
+        "size_reasons": size_reasons, "floored_up_n": floored,
+    }
+
+
+def _loss_classes(trade_rows: list[dict], min_n: int = 3) -> list[dict]:
+    """Per-(signal_kind, lock_branch) realised P&L, worst (most negative)
+    first. Phantom-LOST-safe; only cohorts with ``>= min_n`` resolved trades.
+    Feeds new/worsening-loss-class detection (the win-small/lose-big shapes)."""
+    rows = [r for r in _perf_tradeable(trade_rows)
+            if r.get("status") in _PERF_RESOLVED]
+    groups: dict[tuple, list[dict]] = {}
+    for r in rows:
+        groups.setdefault((r.get("signal_kind"), r.get("lock_branch")), []).append(r)
+    out: list[dict] = []
+    for (kind, branch), rs in groups.items():
+        if len(rs) < min_n:
+            continue
+        won = sum(1 for r in rs if r.get("status") == "won")
+        pnl = sum(float(r.get("pnl") or 0.0) for r in rs)
+        staked = sum(float(r.get("stake_usd") or 0.0) for r in rs)
+        out.append({
+            "signal_kind": kind, "lock_branch": branch, "n": len(rs),
+            "won": won, "win_pct": won / len(rs), "pnl": pnl,
+            "ev_per_usd": (pnl / staked) if staked else None,
+        })
+    out.sort(key=lambda d: d["pnl"])
+    return out
+
+
+def _window_regression(cur: dict, prev: dict) -> dict:
+    """Current vs prior equal-length window for higher-is-better metrics
+    (``pnl`` / ``win_pct`` / ``ev_per_usd`` / ``volume``). ``regressed`` is
+    True when the metric got worse (delta < 0). ``None`` inputs → no verdict."""
+    out: dict = {}
+    for key in ("pnl", "win_pct", "ev_per_usd", "volume"):
+        a, b = cur.get(key), prev.get(key)
+        if a is None or b is None:
+            out[key] = {"cur": a, "prev": b, "delta": None,
+                        "pct_change": None, "regressed": False}
+            continue
+        delta = a - b
+        out[key] = {"cur": a, "prev": b, "delta": delta,
+                    "pct_change": (delta / abs(b)) if b else None,
+                    "regressed": delta < 0}
+    return out
+
+
+# Minimum resolved-sample sizes before a flip-gate is judged (else
+# "insufficient-data"). Codified in CLAUDE.md + docs/improvements.md.
+_GATE_MIN_N = {
+    "BRACKET_LIKE_NO_DISABLED": 30,
+    "SIGMA_FLOOR_LEAD_TIME_ENABLED": 30,
+    "PER_OPERATOR_CALIBRATION_ENABLED": 50,
+    "VALLEY_MIN_EDGE": 8,
+    "THRESHOLD_MIN_PROBABILITY": 20,
+}
+
+
+def _flip_gate_verdicts(ctx: dict) -> list[dict]:
+    """Per-dark-flag readiness verdicts from measured telemetry. PURE.
+
+    ``ctx`` carries the current flag values + the measured inputs the
+    orchestrator gathered. Each verdict is advisory (``ready`` /
+    ``not-ready`` / ``insufficient-data``) — a human still approves the
+    ``.env`` flip (propose-only). The criteria mirror the codified gates in
+    CLAUDE.md / docs/improvements.md.
+    """
+    flags = ctx.get("flags") or {}
+    out: list[dict] = []
+
+    def add(flag, verdict, measured, threshold, proposed, evidence, n):
+        out.append({
+            "flag": flag, "current_value": flags.get(flag), "verdict": verdict,
+            "measured": measured, "threshold": threshold,
+            "proposed_value": proposed, "evidence": evidence, "sample_n": n,
+        })
+
+    # 1. BRACKET_LIKE_NO_DISABLED → False once bracket-like NO is +EV again.
+    b = ctx.get("bracket_like_no") or {}
+    bn, bev = int(b.get("n") or 0), b.get("ev_per_usd")
+    # Full readiness (sample floor AND +EV) — reused by the σ gate so a thin
+    # bracket-like fluke can't trip the conjunctive condition.
+    bracket_ready = (
+        bn >= _GATE_MIN_N["BRACKET_LIKE_NO_DISABLED"] and bev is not None and bev > 0
+    )
+    if bn < _GATE_MIN_N["BRACKET_LIKE_NO_DISABLED"] or bev is None:
+        bv = "insufficient-data"
+    elif bev > 0:
+        bv = "ready"
+    else:
+        bv = "not-ready"
+    add("BRACKET_LIKE_NO_DISABLED", bv, bev, "realised EV/$1 > 0", False,
+        "bracket-like NO realised EV/$1 over the window (kill-switch "
+        "reactivation gate; ~0 live trades while disabled → insufficient)", bn)
+
+    # 2. SIGMA_FLOOR_LEAD_TIME_ENABLED → True when the σ-arm widens
+    #    far-from-peak AND bracket-like baseline is +EV (conjunctive).
+    s = ctx.get("sigma") or {}
+    sn, sd = int(s.get("n") or 0), s.get("delta_p50")
+    if sn < _GATE_MIN_N["SIGMA_FLOOR_LEAD_TIME_ENABLED"] or sd is None:
+        sv = "insufficient-data"
+    elif sd > 0 and bracket_ready:
+        sv = "ready"
+    else:
+        sv = "not-ready"
+    add("SIGMA_FLOOR_LEAD_TIME_ENABLED", sv, sd,
+        "sigma.delta p50 > 0 (far-from-peak) AND bracket-like EV>0", True,
+        "σ lead-time arm widening on far-from-peak evals; conjunctive with "
+        "the bracket-like-NO gate", sn)
+
+    # 3. PER_OPERATOR_CALIBRATION_ENABLED → True when the threshold class fit
+    #    un-squashes the [0.78,0.85) band AND the slope is plausible.
+    c = ctx.get("cal") or {}
+    cn, cd, slope = int(c.get("n") or 0), c.get("delta_p50"), c.get("slope")
+    slope_ok = slope is not None and 0.2 <= slope <= 2.0
+    if cn < _GATE_MIN_N["PER_OPERATOR_CALIBRATION_ENABLED"] or cd is None or slope is None:
+        cv = "insufficient-data"
+    elif cd >= 0 and slope_ok:
+        cv = "ready"
+    else:
+        cv = "not-ready"
+    add("PER_OPERATOR_CALIBRATION_ENABLED", cv, cd,
+        "threshold cal.delta p50 >= 0 AND slope in [0.2,2.0]", True,
+        f"per-class fit un-squash in-band (threshold slope={slope})", cn)
+
+    # 4. VALLEY_MIN_EDGE → set when the P2-allows cohort is +EV out-of-sample
+    #    and beats P2-blocks.
+    val = ctx.get("valley") or {}
+    vn, va, vb = int(val.get("p2_allows_n") or 0), val.get("p2_allows_ev"), val.get("p2_blocks_ev")
+    if vn < _GATE_MIN_N["VALLEY_MIN_EDGE"] or va is None:
+        vv = "insufficient-data"
+    elif va > 0 and (vb is None or va > vb):
+        vv = "ready"
+    else:
+        vv = "not-ready"
+    add("VALLEY_MIN_EDGE", vv, va, "p2_allows EV/$1 > 0 and > p2_blocks",
+        val.get("p2_min_edge") or 0.15, "price-band P2 promotion gate", vn)
+
+    # 5. THRESHOLD_MIN_PROBABILITY → 0.78 only if the recoverable band is +EV
+    #    AND it isn't dead-on-arrival at the stake_below_min throttle.
+    t = ctx.get("threshold_loosen") or {}
+    tn, tev, dom = int(t.get("recoverable_n") or 0), t.get("recoverable_ev"), bool(t.get("stake_below_min_dominant"))
+    if dom:
+        tv, tevidence = "not-ready", (
+            "stake_below_min dominates the throttle — loosening only adds "
+            "passing evals that can't fund; fix the capital/depth lever first")
+    elif tn < _GATE_MIN_N["THRESHOLD_MIN_PROBABILITY"] or tev is None:
+        tv, tevidence = "insufficient-data", (
+            "recoverable threshold band EV (run `evals-report --operator threshold`)")
+    elif tev > 0:
+        tv, tevidence = "ready", "recoverable threshold band +EV and not throttle-blocked"
+    else:
+        tv, tevidence = "not-ready", "recoverable threshold band not +EV"
+    add("THRESHOLD_MIN_PROBABILITY", tv, tev,
+        "recoverable band EV/$1 > 0 AND stake_below_min not dominant", 0.78,
+        tevidence, tn)
+
+    # 6. NEAR_PEAK_FLOOR_UP_ENABLED — standing note: the real lever is the
+    #    depth cap, not the floor (memory project_floorup_inert_2026-06-03).
+    add("NEAR_PEAK_FLOOR_UP_ENABLED", "not-ready", None,
+        "floored fills win >= break-even", True,
+        "inert: depth cap (20%×book) binds tighter than the floor on <$25 "
+        "books — raise DEPTH_POSITION_CAP_PCT instead", 0)
+
+    return out
+
+
 async def _epoch_start(session, epoch_id: int | None):
     """``config_epochs.started_at`` for an epoch id (one PK lookup), or None."""
     if epoch_id is None:
@@ -4887,6 +5165,451 @@ def epochs(limit: int) -> None:
                 prev_flags = e.flags_json
 
     asyncio.run(_run())
+
+
+# --- perf-review: automated daily / 3d / 7d evaluation orchestrator -------
+
+
+async def perf_review_result(session, days: int, *, prior_window: bool = True) -> dict:
+    """Assemble one window's performance digest as a JSON-serialisable dict.
+
+    The only DB-touching part of Layer 1: batch-reads Trade (current + prior
+    window), DecisionLog, EvaluationLog (+shadow_json), MarketResolution,
+    ExposureSnapshot and the latest 2 ConfigEpochs, then composes the pure
+    aggregators above. Returns ``{window_days, generated_at, pnl, regression,
+    throttle, loss_classes, exposure, epoch, flip_gates, anomalies}``. Used by
+    the ``perf-review`` command and the scheduler ``job_perf_review``.
+    """
+    from sqlalchemy import select
+
+    from src.config import settings
+    from src.db.models import (
+        ConfigEpoch, DecisionLog, EvaluationLog, ExposureSnapshot,
+        MarketResolution,
+    )
+    from src.db.models import Signal as _Signal
+    from src.db.models import Trade as _Trade
+    from src.signals.config_epoch import current_flags
+
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(days=days)
+    prev_start = now - timedelta(days=2 * days)
+
+    # --- Trades (current + prior window) joined to Signal for kind/branch.
+    trade_rows = (
+        await session.execute(
+            select(_Trade, _Signal.signal_kind, _Signal.lock_branch)
+            .join(_Signal, _Trade.signal_id == _Signal.id)
+            .where(_Trade.opened_at >= prev_start)
+        )
+    ).all()
+    trades: list[dict] = []
+    for t, sk, lb in trade_rows:
+        trades.append({
+            "status": t.status.value if t.status is not None else None,
+            "pnl": t.pnl, "stake_usd": t.stake_usd, "fill_price": t.fill_price,
+            "exchange_status": t.exchange_status, "signal_kind": sk,
+            "lock_branch": lb,
+            "direction": getattr(t.direction, "value", str(t.direction)),
+            "market_id": t.market_id, "opened_at": t.opened_at,
+        })
+    cur_trades = [d for d in trades if d["opened_at"] and d["opened_at"] >= start]
+    prev_trades = [
+        d for d in trades
+        if d["opened_at"] and prev_start <= d["opened_at"] < start
+    ]
+    pnl = _realized_pnl(cur_trades)
+    pnl_prev = _realized_pnl(prev_trades)
+    regression = _window_regression(
+        {"pnl": pnl["pnl"], "win_pct": pnl["win_pct"],
+         "ev_per_usd": pnl["ev_per_usd"],
+         "volume": float(len(_perf_tradeable(cur_trades)))},
+        {"pnl": pnl_prev["pnl"], "win_pct": pnl_prev["win_pct"],
+         "ev_per_usd": pnl_prev["ev_per_usd"],
+         "volume": float(len(_perf_tradeable(prev_trades)))},
+    ) if prior_window else {}
+
+    # --- Operator class per market (for the bracket-like-NO gate + stuck-open).
+    market_map = await _load_market_map(session, (d["market_id"] for d in cur_trades))
+
+    # --- Decision funnel (current window).
+    dl_rows = (
+        await session.execute(
+            select(DecisionLog.outcome, DecisionLog.metadata_json)
+            .where(DecisionLog.created_at >= start)
+        )
+    ).all()
+    throttle = _throttle_breakdown(
+        [{"outcome": o, "metadata_json": m} for o, m in dl_rows]
+    )
+
+    # --- Evaluation telemetry (current window): one pass derives the
+    #     calibration-squash inputs, the σ / per-class-calibration shadow
+    #     gate inputs, and the valley (P2) join candidates.
+    ev_rows = (
+        await session.execute(
+            select(
+                EvaluationLog.market_id, EvaluationLog.direction,
+                EvaluationLog.signal_kind, EvaluationLog.market_prob,
+                EvaluationLog.shadow_json, EvaluationLog.reject_reason,
+                EvaluationLog.raw_model_prob, EvaluationLog.model_prob,
+            ).where(EvaluationLog.created_at >= start)
+            .order_by(EvaluationLog.created_at)
+        )
+    ).all()
+    squash_rows: list[dict] = []
+    sigma_deltas: list[float] = []
+    cal_deltas: list[float] = []
+    valley_latest: dict[tuple, dict] = {}
+    for (mid, direction, skind, price, shadow, rr, raw, cal_p) in ev_rows:
+        squash_rows.append({"reject_reason": rr, "raw_model_prob": raw,
+                            "model_prob": cal_p})
+        sj = shadow or {}
+        sig = sj.get("sigma")
+        if sig and sig.get("delta") is not None and sig.get("hours_until_peak") is not None:
+            if float(sig["hours_until_peak"]) >= 4.0:  # far-from-peak regime
+                sigma_deltas.append(float(sig["delta"]))
+        cal = sj.get("cal")
+        if (cal and cal.get("delta") is not None and cal.get("op_class") == "threshold"
+                and cal.get("raw") is not None and 0.78 <= float(cal["raw"]) < 0.85):
+            cal_deltas.append(float(cal["delta"]))
+        val = sj.get("valley")
+        if skind == "probability" and val and val.get("in_valley"):
+            dirv = getattr(direction, "value", str(direction))
+            valley_latest[(mid, dirv)] = {
+                "market_id": mid, "direction": dirv,
+                "price": float(price) if price is not None else None,
+                "p2_would_block": bool(val.get("p2_would_block")),
+            }
+
+    # --- Valley resolved join (P2 promotion gate).
+    valley_rows: list[dict] = []
+    if valley_latest:
+        vmids = list({e["market_id"] for e in valley_latest.values()})
+        outcomes = dict(
+            (
+                await session.execute(
+                    select(MarketResolution.market_id, MarketResolution.yes_won)
+                    .where(MarketResolution.market_id.in_(vmids),
+                           MarketResolution.yes_won.isnot(None))
+                )
+            ).all()
+        )
+        valley_rows = [
+            {"direction": e["direction"], "price": e["price"],
+             "yes_won": bool(outcomes[e["market_id"]]),
+             "p2_would_block": e["p2_would_block"]}
+            for e in valley_latest.values()
+            if e["price"] is not None and outcomes.get(e["market_id"]) is not None
+        ]
+    vagg = _aggregate_valley(valley_rows)
+
+    # --- Exposure (current window).
+    snaps = (
+        await session.execute(
+            select(ExposureSnapshot).where(ExposureSnapshot.created_at >= start)
+        )
+    ).scalars().all()
+    exposure = _summarize_exposure(
+        [{"headroom": s.headroom, "exposure": s.exposure, "equity": s.equity,
+          "effective_cap": s.effective_cap, "n_open": s.n_open,
+          "n_open_by_class": s.n_open_by_class} for s in snaps],
+        min_stake=settings.MIN_STAKE_USD,
+    )
+
+    # --- Config epoch (latest 2 → current id + flag diff).
+    eps = (
+        await session.execute(
+            select(ConfigEpoch).order_by(ConfigEpoch.id.desc()).limit(2)
+        )
+    ).scalars().all()
+    cur_ep = eps[0] if eps else None
+    prev_ep = eps[1] if len(eps) > 1 else None
+    epoch = {
+        "current_id": cur_ep.id if cur_ep else None,
+        "started_at": cur_ep.started_at.isoformat() if cur_ep and cur_ep.started_at else None,
+        "flags_diff": {
+            k: list(v) for k, v in _flags_diff(
+                prev_ep.flags_json if prev_ep else None,
+                cur_ep.flags_json if cur_ep else None,
+            ).items()
+        },
+    }
+
+    # --- Flip-gate inputs.
+    bkt = [d for d in cur_trades
+           if d["direction"] == "BUY_NO"
+           and _op_class(getattr(market_map.get(d["market_id"]), "parsed_operator", None)) == "bracket-like"
+           and d["status"] in _PERF_RESOLVED and not _is_phantom_lost(d)]
+    bkt_stk = sum(float(d.get("stake_usd") or 0.0) for d in bkt)
+    bkt_pnl = sum(float(d.get("pnl") or 0.0) for d in bkt)
+    thr_slope: float | None = None
+    try:
+        from src.signals.calibration import get_cached_calibration
+        _cache = get_cached_calibration()
+        if isinstance(_cache, dict):
+            _thr = _cache.get("threshold")
+            if _thr:
+                thr_slope = float(_thr[0])
+    except Exception:
+        thr_slope = None
+
+    sd_q = _quantiles(sigma_deltas)
+    cd_q = _quantiles(cal_deltas)
+    ctx = {
+        "flags": current_flags(),
+        "bracket_like_no": {"n": len(bkt),
+                            "ev_per_usd": (bkt_pnl / bkt_stk) if bkt_stk else None},
+        "sigma": {"n": len(sigma_deltas), "delta_p50": sd_q[1] if sd_q else None},
+        "cal": {"n": len(cal_deltas), "delta_p50": cd_q[1] if cd_q else None,
+                "slope": thr_slope},
+        "valley": {"p2_allows_n": vagg["p2_allows"]["n"],
+                   "p2_allows_ev": vagg["p2_allows"]["ev_per_usd"],
+                   "p2_blocks_ev": vagg["p2_blocks"]["ev_per_usd"],
+                   "p2_min_edge": settings.SHADOW_VALLEY_MIN_EDGE},
+        "threshold_loosen": {
+            "stake_below_min_dominant": throttle["dominant_throttle"] == "stake_below_min",
+            "recoverable_ev": None, "recoverable_n": 0},
+    }
+    flip_gates = _flip_gate_verdicts(ctx)
+
+    # --- Anomalies (recurring silencer classes + correctly-sitting-out).
+    anomalies: list[dict] = []
+    fills = len(_perf_tradeable(cur_trades))
+    squash = _detect_calibration_squash_local(squash_rows, fills)
+    if squash is not None:
+        anomalies.append({
+            "kind": "calibration_squash",
+            "detail": f"{squash['n_squashed']} edged evals gated by the prob "
+                      f"floor (raw≈{squash['avg_raw']:.2f}→cal≈{squash['avg_cal']:.2f}); "
+                      "0 fills — likely correctly sitting out an overconfident regime",
+            "action": "track shadow-report --key sigma (σ-floor fix), no forced volume",
+        })
+    if exposure.get("count") and exposure.get("low_headroom_frac", 0) > 0.5 \
+            and exposure.get("n_open_median", 0) > 0:
+        anomalies.append({
+            "kind": "exposure_silencer",
+            "detail": f"{exposure['low_headroom_frac']*100:.0f}% of ticks had "
+                      "headroom < one MIN_STAKE — exposure cap may be pinned by open trades",
+            "action": "run `admin reconcile-stuck --dry-run`; check stuck OPEN past end_date",
+        })
+    phantom = sum(1 for d in cur_trades if _is_phantom_lost(d))
+    if phantom:
+        anomalies.append({
+            "kind": "phantom_lost",
+            "detail": f"{phantom} LOST trades with no fill (exposure cleanup, not real losses)",
+            "action": "expected post-grace; `admin reconcile-stuck --include-lost` if mislabeled",
+        })
+    stuck = sum(
+        1 for d in cur_trades
+        if d["status"] == "open"
+        and getattr(market_map.get(d["market_id"]), "end_date", None) is not None
+        and market_map[d["market_id"]].end_date < now
+    )
+    if stuck:
+        anomalies.append({
+            "kind": "stuck_open",
+            "detail": f"{stuck} OPEN trades whose market end_date has passed",
+            "action": "run `admin reconcile-stuck` to settle / release exposure",
+        })
+
+    return {
+        "window_days": days,
+        "generated_at": now.isoformat(),
+        "pnl": pnl,
+        "regression": regression,
+        "throttle": throttle,
+        "loss_classes": _loss_classes(cur_trades),
+        "exposure": exposure,
+        "epoch": epoch,
+        "flip_gates": flip_gates,
+        "anomalies": anomalies,
+    }
+
+
+def _detect_calibration_squash_local(eval_rows: list[dict], fill_count: int):
+    """Thin re-export wrapper so the orchestrator reuses the scheduler's pure
+    detector without importing it at module load (keeps `cli` light)."""
+    from src.scheduler import _detect_calibration_squash
+    return _detect_calibration_squash(eval_rows, fill_count)
+
+
+def render_perf_digest(result: dict, *, markdown: bool = True) -> str:
+    """Render a ``perf_review_result`` dict as a compact digest.
+
+    ``markdown=True`` → Telegram MarkdownV2 (dynamic values escaped via
+    ``_escape_md2``); ``markdown=False`` → plain text for the console. Leads
+    with the PnL headline, the dominant throttle, regressions, flip-ready
+    flags, then anomalies — the same shape we'd hand-write each review.
+    """
+    from src.execution.alerter import _escape_md2
+
+    e = _escape_md2 if markdown else (lambda x: str(x))
+    bold = (lambda t: f"*{t}*") if markdown else (lambda t: t)
+    bullet = "• "
+    L: list[str] = []
+
+    pnl = result.get("pnl") or {}
+    L.append(f"\U0001f4ca {bold('Perf review')} — {e(str(result.get('window_days'))+'d')}")
+    wp = f"{pnl['win_pct']*100:.0f}%" if pnl.get("win_pct") is not None else "n/a"
+    ev = f"{pnl['ev_per_usd']:+.3f}" if pnl.get("ev_per_usd") is not None else "n/a"
+    pnl_s = f"${pnl.get('pnl', 0.0):+,.2f}"
+    L.append(
+        f"\U0001f4b0 PnL {e(pnl_s)} over {e(pnl.get('n', 0))} resolved "
+        f"({e(wp)} win, EV/$1 {e(ev)}); {e(pnl.get('n_open', 0))} open"
+    )
+
+    regs = [k for k, v in (result.get("regression") or {}).items() if v.get("regressed")]
+    if regs:
+        L.append(f"⚠️ Regressed vs prior {e(str(result.get('window_days'))+'d')}: {e(', '.join(regs))}")
+
+    th = result.get("throttle") or {}
+    if th.get("dominant_throttle"):
+        fr = f"{th['dominant_throttle_frac']*100:.0f}%" if th.get("dominant_throttle_frac") is not None else "n/a"
+        L.append(f"\U0001f6a6 Top throttle: {e(th['dominant_throttle'])} ({e(fr)} of decisions)")
+
+    losers = [c for c in (result.get("loss_classes") or []) if c.get("pnl", 0) < 0][:2]
+    for c in losers:
+        cls = c.get("lock_branch") or c.get("signal_kind") or "?"
+        cpnl_s = f"${c['pnl']:+,.2f}"
+        cwin_s = f"{c['win_pct']*100:.0f}%"
+        L.append(
+            f"\U0001f4c9 Loss class {e(cls)}: {e(cpnl_s)} / {e(c['n'])} "
+            f"({e(cwin_s)} win)"
+        )
+
+    gates = result.get("flip_gates") or []
+    ready = [g for g in gates if g.get("verdict") == "ready"]
+    if ready:
+        L.append(bold("Flip-ready:"))
+        for g in ready:
+            meas = g.get("measured")
+            meas_s = f" (measured {meas})" if meas is not None else ""
+            L.append(f"{bullet}{e(g['flag'])} → {e(str(g['proposed_value']))}{e(meas_s)}")
+    else:
+        insf = sum(1 for g in gates if g.get("verdict") == "insufficient-data")
+        L.append(f"No flags flip-ready ({e(insf)} awaiting data).")
+
+    for a in (result.get("anomalies") or []):
+        L.append(f"\U0001f6a8 {e(a.get('kind'))}: {e(a.get('detail'))}")
+
+    sep = "\n" if markdown else "\n"
+    return sep.join(L)
+
+
+async def _persist_perf_artifact(session, days: int, result: dict) -> None:
+    """Persist the digest for Layer 2: a ``bot_state`` row (DB-readable) and a
+    gitignored ``runtime/perf_review_<days>d.json`` file (for a co-located
+    ``claude -p``). Best-effort; never raises into the caller."""
+    import json
+    from pathlib import Path
+
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+    from sqlalchemy.exc import ProgrammingError
+
+    from src.db.models import BotState
+
+    now = datetime.now(timezone.utc)
+    key = f"perf_review.latest.{days}d"
+    try:
+        await session.execute(
+            pg_insert(BotState)
+            .values(key=key, value=result, updated_at=now)
+            .on_conflict_do_update(
+                index_elements=["key"],
+                set_={"value": result, "updated_at": now},
+            )
+        )
+    except ProgrammingError:
+        await session.rollback()
+    try:
+        out = Path("runtime")
+        out.mkdir(exist_ok=True)
+        (out / f"perf_review_{days}d.json").write_text(
+            json.dumps(result, indent=2, default=str)
+        )
+    except OSError:
+        pass
+
+
+async def _push_one(text: str, *, markdown: bool = True) -> bool:
+    """Send a single Telegram message and exit (no polling apparatus).
+
+    Used by ``perf-review --push`` and the standalone ``perf-propose-push``
+    that Layer 2 calls. Returns False (and prints) when no credentials are
+    configured. ``markdown=False`` sends as plain text — safe for arbitrary
+    analyst-generated content that isn't MarkdownV2-escaped."""
+    from src.config import settings
+
+    token = settings.TELEGRAM_BOT_TOKEN
+    chat = settings.TELEGRAM_CHAT_ID
+    if not (token and chat):
+        click.echo("[no Telegram credentials — not pushed]")
+        return False
+    from telegram import Bot
+    from telegram.constants import ParseMode
+
+    bot = Bot(token)
+    async with bot:
+        await bot.send_message(
+            chat_id=chat, text=text,
+            parse_mode=ParseMode.MARKDOWN_V2 if markdown else None,
+            disable_web_page_preview=True,
+        )
+    return True
+
+
+@main.command("perf-review")
+@click.option("--days", default=7, show_default=True, help="Window length in days.")
+@click.option("--json", "as_json", is_flag=True, help="Emit the raw result dict as JSON.")
+@click.option("--push/--no-push", default=False, show_default=True,
+              help="Push the digest to Telegram.")
+@click.option("--write-artifact/--no-write-artifact", default=True, show_default=True,
+              help="Persist the bot_state row + runtime JSON for the Layer-2 analyst.")
+def perf_review(days: int, as_json: bool, push: bool, write_artifact: bool) -> None:
+    """Automated performance digest over a daily / 3-day / 7-day window.
+
+    Layer 1 of the auto-evaluation loop: PnL (phantom-LOST-safe), throughput
+    and the dominant throttle, worst loss classes, exposure headroom,
+    regression vs the prior equal window, and a per-dark-flag flip-gate
+    readiness verdict. Pushes to Telegram and/or persists a JSON artifact the
+    Layer-2 analyst reads. Propose-only — it never changes config.
+    """
+    import json as _json
+
+    from src.db.engine import async_session
+
+    async def _run() -> None:
+        async with async_session() as session:
+            result = await perf_review_result(session, days)
+            if write_artifact:
+                await _persist_perf_artifact(session, days, result)
+                await session.commit()
+        if as_json:
+            click.echo(_json.dumps(result, indent=2, default=str))
+        else:
+            click.echo(render_perf_digest(result, markdown=False))
+        if push:
+            await _push_one(render_perf_digest(result, markdown=True), markdown=True)
+
+    asyncio.run(_run())
+
+
+@main.command("perf-propose-push")
+@click.option("--text", default=None, help="Message text. Omit or use '-' to read stdin.")
+@click.option("--markdown/--plain", default=False, show_default=True,
+              help="MarkdownV2 vs plain text (default plain — safe for arbitrary content).")
+def perf_propose_push(text: str | None, markdown: bool) -> None:
+    """Push one Telegram message and exit — the Layer-2 analyst's delivery
+    channel (it runs outside the bot process, so it can't use the live queue)."""
+    import sys
+
+    if text is None or text == "-":
+        text = sys.stdin.read()
+    if not text.strip():
+        click.echo("Nothing to push (empty text).")
+        return
+    asyncio.run(_push_one(text, markdown=markdown))
 
 
 if __name__ == "__main__":

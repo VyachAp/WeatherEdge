@@ -254,6 +254,78 @@ class TestSizeLockedPositionFloor:
         assert "$5" in pos.reason
 
 
+class TestSizeLockedPositionConviction:
+    """Conviction-weighted lock sizing (``win_prob`` set) — Kelly-from-price
+    capped by the concentration backstop, vs the flat 2% path."""
+
+    def test_win_prob_none_reproduces_flat_path(self):
+        """Regression: the default (win_prob=None) is bit-for-bit the legacy
+        flat 2% result — 2% of $400 = $8, kelly_pct 0."""
+        pos = size_locked_position(400, price=0.85)
+        assert pos.stake_usd == pytest.approx(8.0)
+        assert pos.kelly_pct == 0.0
+        assert "fixed 2%" in pos.reason
+
+    def test_super_margin_concentration_cap_binds(self):
+        """At high win_prob the f*×fraction overshoots the cap, so the
+        max_position_pct backstop governs: 15% of $400 = $60."""
+        pos = size_locked_position(
+            400, price=0.85,
+            win_prob=0.99, kelly_fraction=0.25, max_position_pct=0.15,
+        )
+        # f* = 0.99 - 0.01/(0.15/0.85) ≈ 0.933; ×0.25 ≈ 0.233 → capped to 0.15.
+        assert pos.kelly_pct == pytest.approx(0.15)
+        assert pos.stake_usd == pytest.approx(60.0)
+        assert "conviction kelly" in pos.reason
+
+    def test_cheaper_lock_sizes_bigger_than_dearer(self):
+        """When f* (not the cap) binds, a lower price → more EV → larger
+        stake. Small bankroll keeps the $100 USD cap out of the way."""
+        cheap = size_locked_position(
+            100, price=0.60,
+            win_prob=0.90, kelly_fraction=1.0, max_position_pct=1.0,
+        )
+        dear = size_locked_position(
+            100, price=0.80,
+            win_prob=0.90, kelly_fraction=1.0, max_position_pct=1.0,
+        )
+        # f*(0.60)=0.90-0.10/(0.4/0.6)=0.75 ; f*(0.80)=0.90-0.10/(0.2/0.8)=0.50
+        assert cheap.kelly_pct == pytest.approx(0.75)
+        assert dear.kelly_pct == pytest.approx(0.50)
+        assert cheap.stake_usd > dear.stake_usd
+
+    def test_relaxed_depth_cap_pct(self):
+        """depth_cap_pct widens the depth ceiling for conviction locks: a $100
+        book caps at 50% ($50) instead of the flat path's 15% ($15)."""
+        big = size_locked_position(
+            400, price=0.85, orderbook_depth=100.0,
+            win_prob=0.99, kelly_fraction=0.25, max_position_pct=0.15,
+            depth_cap_pct=0.50,
+        )
+        # raw would be $60 (15% cap), depth-capped to 50% of $100 = $50.
+        assert big.stake_usd == pytest.approx(50.0)
+        assert "50% of $100" in big.reason
+
+    def test_exposure_cap_still_applies(self):
+        """The standard exposure cap clamps conviction stakes too."""
+        pos = size_locked_position(
+            400, price=0.85, current_exposure=280.0,
+            win_prob=0.99, kelly_fraction=0.25, max_position_pct=0.15,
+        )
+        # raw $60, but exposure floor cap = max(100, 300)=300; remaining=20.
+        assert pos.stake_usd == pytest.approx(20.0)
+        assert "exposure cap" in pos.reason
+
+    def test_no_kelly_edge_at_high_price_returns_zero(self):
+        """When price ≥ win_prob there's no Kelly edge → f*=0 → stake 0."""
+        pos = size_locked_position(
+            400, price=0.95,
+            win_prob=0.90, kelly_fraction=0.25, max_position_pct=0.15,
+        )
+        assert pos.stake_usd == 0.0
+        assert pos.kelly_pct == 0.0
+
+
 # ===================================================================
 # binary_market.py – near-peak floor-up gate
 # ===================================================================

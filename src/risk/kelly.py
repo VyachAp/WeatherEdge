@@ -204,31 +204,68 @@ def size_locked_position(
     current_exposure: float = 0.0,
     orderbook_depth: float | None = None,
     floor_to_usd: float | None = None,
+    *,
+    win_prob: float | None = None,
+    kelly_fraction: float | None = None,
+    max_position_pct: float | None = None,
+    depth_cap_pct: float = 0.15,
 ) -> PositionSize:
-    """Size a lock-rule trade. No Kelly — no probability to plug in.
+    """Size a lock-rule trade.
 
-    The lock rule is a deterministic "outcome is physically decided" signal.
-    Stake uses a fixed fraction of bankroll, capped by the standard exposure,
-    max-position, and depth limits. The payout shape (buying near-resolved at
-    high price gives tiny gross margin) means sizing must stay small and
-    depth-aware to avoid moving the book.
+    **Flat path (``win_prob is None`` — the default):** the lock rule is a
+    deterministic "outcome is physically decided" signal with no probability
+    to plug in, so the stake is a fixed fraction of bankroll
+    (``LOCK_POSITION_PCT``), capped by the standard exposure, max-position, and
+    depth limits.
 
-    ``floor_to_usd`` mirrors :func:`size_position`: when set, a sub-``MIN_TRADE_USD``
-    stake is floored up (respecting every cap ceiling) instead of dropped. At a
-    typical bankroll the fixed 2% already clears the floor, so this is mostly a
-    no-op here — wired for symmetry and the "bigger stake" knob.
+    **Conviction path (``win_prob`` set):** an EASY-YES lock on a trusted
+    station is genuinely near-certain (monotonic daily max + unbiased resolver
+    divergence), so flat 2% leaves large EV on the table. Here the stake is
+    sized by *fractional Kelly against the price*::
+
+        b      = (1 - price) / price            # net odds on a YES buy at `price`
+        f_star = max(0, win_prob - (1 - win_prob) / b)
+        frac   = min(f_star * kelly_fraction, max_position_pct)
+
+    No ``KELLY_PROB_CAP`` is applied — that cap exists to tame the noisy
+    probability path; a physically-locked, station-verified bet legitimately
+    sits near 1.0. ``max_position_pct`` is the hard concentration backstop.
+
+    ``depth_cap_pct`` is the orderbook-depth cap fraction (0.15 on the flat
+    path; relaxed for conviction locks that walk the book). ``floor_to_usd``
+    mirrors :func:`size_position`: when set, a sub-``MIN_TRADE_USD`` stake is
+    floored up (respecting every cap ceiling) instead of dropped — used by the
+    flat path's near-peak floor-up, not by conviction sizing.
     """
     price = max(0.01, min(0.99, price))
 
-    raw_stake = bankroll * settings.LOCK_POSITION_PCT
+    if win_prob is not None:
+        kf = kelly_fraction if kelly_fraction is not None else settings.LOCK_KELLY_FRACTION
+        cap_pct = (
+            max_position_pct if max_position_pct is not None
+            else settings.LOCK_POSITION_PCT
+        )
+        b = (1.0 - price) / price
+        f_star = max(0.0, win_prob - (1.0 - win_prob) / b) if b > 0 else 0.0
+        frac = min(f_star * kf, cap_pct)
+        kelly_pct = frac
+        raw_stake = bankroll * frac
+        reasons: list[str] = [
+            f"conviction kelly {frac:.1%} (p={win_prob:.2f}, f*={f_star:.2f}, "
+            f"cap={cap_pct:.0%})"
+        ]
+    else:
+        kelly_pct = 0.0
+        raw_stake = bankroll * settings.LOCK_POSITION_PCT
+        reasons = [f"fixed {settings.LOCK_POSITION_PCT:.0%} bankroll"]
+
     stake = raw_stake
     capped = False
-    reasons: list[str] = [f"fixed {settings.LOCK_POSITION_PCT:.0%} bankroll"]
 
     max_remaining = _effective_exposure_cap(bankroll) - current_exposure
     if max_remaining <= 0:
         return PositionSize(
-            stake_usd=0, kelly_pct=0.0, capped=True,
+            stake_usd=0, kelly_pct=kelly_pct, capped=True,
             reason="exposure limit reached",
         )
     if stake > max_remaining:
@@ -243,11 +280,11 @@ def size_locked_position(
         reasons.append(f"lock-rule cap ${usd_cap:.0f}")
 
     if orderbook_depth is not None and orderbook_depth > 0:
-        depth_cap = orderbook_depth * 0.15
+        depth_cap = orderbook_depth * depth_cap_pct
         if stake > depth_cap:
             stake = depth_cap
             capped = True
-            reasons.append(f"depth cap (15% of ${orderbook_depth:.0f})")
+            reasons.append(f"depth cap ({depth_cap_pct:.0%} of ${orderbook_depth:.0f})")
 
     if 0 < stake < MIN_TRADE_USD:
         floored = _apply_floor(
@@ -256,7 +293,7 @@ def size_locked_position(
                 max_remaining,
                 usd_cap,
                 (
-                    orderbook_depth * 0.15
+                    orderbook_depth * depth_cap_pct
                     if orderbook_depth is not None and orderbook_depth > 0
                     else float("inf")
                 ),
@@ -264,17 +301,17 @@ def size_locked_position(
         )
         if floored is not None:
             return PositionSize(
-                stake_usd=round(floored, 2), kelly_pct=0.0, capped=True,
+                stake_usd=round(floored, 2), kelly_pct=kelly_pct, capped=True,
                 reason=f"floored to ${floored:.2f} (near-peak)",
             )
         return PositionSize(
-            stake_usd=0, kelly_pct=0.0, capped=True,
+            stake_usd=0, kelly_pct=kelly_pct, capped=True,
             reason=f"below ${MIN_TRADE_USD:.0f} minimum",
         )
 
     return PositionSize(
         stake_usd=round(stake, 2),
-        kelly_pct=0.0,
+        kelly_pct=kelly_pct,
         capped=capped,
         reason=", ".join(reasons),
     )

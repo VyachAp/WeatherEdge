@@ -182,6 +182,14 @@ class Settings(BaseSettings):
     # evals span (backtest-v2 snapshots mid-day and under-samples the tail).
     SHADOW_SIGMA_LEADTIME_ENABLED: bool = True
 
+    # Automated performance review (Layer 1 of the auto-evaluation loop).
+    # When True, setup_scheduler registers daily / 3-day / 7-day jobs that
+    # compute a perf digest, persist a JSON artifact for the Layer-2 analyst,
+    # and push a Telegram summary (throttled per cadence via bot_state).
+    # Propose-only — the jobs never change config. Default off so a deploy
+    # doesn't start pushing until the operator opts in.
+    PERF_REVIEW_ENABLED: bool = False
+
     # Circuit breakers
     DAILY_LOSS_STOP_USD: float = 200.0
     CONSECUTIVE_LOSS_PAUSE_COUNT: int = 3
@@ -269,6 +277,35 @@ class Settings(BaseSettings):
     LOCK_RULE_MIN_PRICE: float = 0.05
     LOCK_MARGIN_F: float = 2.0
     LOCK_POSITION_PCT: float = 0.02
+
+    # --- Conviction-weighted lock sizing (default-off; see the plan) ---------
+    # When enabled, an EASY-YES lock on a trusted (whitelisted) station is
+    # sized by fractional Kelly against its price + branch certainty, capped at
+    # LOCK_MAX_POSITION_PCT_*, instead of the flat LOCK_POSITION_PCT. EASY-YES
+    # is the only truly monotonic (daily max can't decrease) and resolver-
+    # divergence-clean lock class — every other branch / direction keeps the
+    # flat 2% path, as do off-whitelist stations.
+    LOCK_CONVICTION_SIZING_ENABLED: bool = False
+    # Comma-separated ICAO whitelist that gets conviction sizing (empty =
+    # nobody, even with the flag on). Curate from `resolution-report`: stations
+    # with decent N, |mean divergence| ≈ 0, and no large outlier.
+    LOCK_BIG_SIZE_STATIONS: str = ""
+    LOCK_KELLY_FRACTION: float = 0.25
+    # Assumed true win-prob per branch (Phase-3 divergence audit: unbiased
+    # ±0.28°F abs-mean; a 4°F super-margin ≈ 14× that spread).
+    LOCK_WIN_PROB_SUPER: float = 0.99
+    LOCK_WIN_PROB_STANDARD: float = 0.97
+    # Hard concentration caps (fraction of bankroll) — the backstop a single
+    # black-swan wrong-station resolution can never exceed, whatever Kelly says.
+    LOCK_MAX_POSITION_PCT_SUPER: float = 0.15
+    LOCK_MAX_POSITION_PCT_STANDARD: float = 0.07
+    # FAK walk ceiling for conviction lock orders (≤ LOCK_RULE_MAX_PRICE): the
+    # order sweeps every ask at/below this price to deploy the requested size.
+    LOCK_WALK_MAX_PRICE: float = 0.95
+    # Relaxed depth cap for conviction locks (vs the flat path's hard 0.15) so
+    # the Kelly stake isn't pre-throttled to a sliver of top-of-book before the
+    # order even walks.
+    LOCK_DEPTH_CAP_PCT_BIG: float = 0.50
 
     # Multi-model ensemble (Open-Meteo models= param). Spread across these
     # models drives the probability-engine sigma instead of the hardcoded

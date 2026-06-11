@@ -530,3 +530,89 @@ async def test_floor_up_excluded_for_bracket_like_lock(monkeypatch):
     market = _market(operator="range")
     _, c = await _invoke(decision=_no_decision(branch="range_in_window"), market=market)
     assert c["size_locked_position"].call_args.kwargs["floor_to_usd"] is None
+
+
+# ---------------------------------------------------------------------------
+# Conviction-weighted sizing wiring — only EASY-YES on a whitelisted station,
+# only with the master flag on, gets the Kelly params + a widened walk budget.
+# ---------------------------------------------------------------------------
+
+
+def _enable_conviction(monkeypatch, *, stations: str = "KPHX"):
+    monkeypatch.setattr(lre.settings, "LOCK_CONVICTION_SIZING_ENABLED", True)
+    monkeypatch.setattr(lre.settings, "LOCK_BIG_SIZE_STATIONS", stations)
+    monkeypatch.setattr(lre.settings, "LOCK_KELLY_FRACTION", 0.25)
+    monkeypatch.setattr(lre.settings, "LOCK_WIN_PROB_SUPER", 0.99)
+    monkeypatch.setattr(lre.settings, "LOCK_WIN_PROB_STANDARD", 0.97)
+    monkeypatch.setattr(lre.settings, "LOCK_MAX_POSITION_PCT_SUPER", 0.15)
+    monkeypatch.setattr(lre.settings, "LOCK_MAX_POSITION_PCT_STANDARD", 0.07)
+    monkeypatch.setattr(lre.settings, "LOCK_WALK_MAX_PRICE", 0.95)
+    monkeypatch.setattr(lre.settings, "LOCK_DEPTH_CAP_PCT_BIG", 0.50)
+
+
+@pytest.mark.asyncio
+async def test_conviction_super_passes_kelly_params_and_walks(monkeypatch):
+    """EASY-YES super-margin on a whitelisted station → conviction Kelly
+    params flow to the sizer (no floor_to_usd), and place_order gets a
+    widened slippage budget to walk the book up to LOCK_WALK_MAX_PRICE."""
+    _enable_conviction(monkeypatch)
+    _, c = await _invoke(decision=_yes_decision(branch="easy_super"), yes_price=0.80)
+
+    kwargs = c["size_locked_position"].call_args.kwargs
+    assert kwargs["win_prob"] == 0.99
+    assert kwargs["max_position_pct"] == 0.15
+    assert kwargs["kelly_fraction"] == 0.25
+    assert kwargs["depth_cap_pct"] == 0.50
+    assert "floor_to_usd" not in kwargs  # conviction path bypasses floor-up
+    # Walk budget = (0.95 - 0.80) × 100 = 15¢, passed as a keyword.
+    assert c["place_order"].call_args.kwargs["max_slippage_cents"] == pytest.approx(15.0)
+
+
+@pytest.mark.asyncio
+async def test_conviction_standard_uses_standard_params(monkeypatch):
+    """easy_standard branch draws the standard win-prob + concentration cap."""
+    _enable_conviction(monkeypatch)
+    _, c = await _invoke(decision=_yes_decision(branch="easy_standard"))
+
+    kwargs = c["size_locked_position"].call_args.kwargs
+    assert kwargs["win_prob"] == 0.97
+    assert kwargs["max_position_pct"] == 0.07
+
+
+@pytest.mark.asyncio
+async def test_conviction_skipped_off_whitelist(monkeypatch):
+    """Flag on but station not whitelisted → flat path (floor_to_usd present,
+    no win_prob), and the default 2¢ slippage."""
+    _enable_conviction(monkeypatch, stations="KJFK")  # not KPHX
+    _, c = await _invoke(decision=_yes_decision(branch="easy_super"), yes_price=0.80)
+
+    kwargs = c["size_locked_position"].call_args.kwargs
+    assert kwargs.get("win_prob") is None
+    assert "floor_to_usd" in kwargs
+    # Flat path omits the walk kwarg → place_order's 2¢ default stands.
+    assert "max_slippage_cents" not in c["place_order"].call_args.kwargs
+
+
+@pytest.mark.asyncio
+async def test_conviction_skipped_when_flag_off(monkeypatch):
+    """Whitelisted but master flag off (default) → flat path."""
+    monkeypatch.setattr(lre.settings, "LOCK_BIG_SIZE_STATIONS", "KPHX")
+    # LOCK_CONVICTION_SIZING_ENABLED left at its default (False).
+    _, c = await _invoke(decision=_yes_decision(branch="easy_super"))
+    assert c["size_locked_position"].call_args.kwargs.get("win_prob") is None
+
+
+@pytest.mark.asyncio
+async def test_conviction_skipped_for_no_side(monkeypatch):
+    """Only the monotonic YES direction is upsized; a NO lock stays flat."""
+    _enable_conviction(monkeypatch)
+    _, c = await _invoke(decision=_no_decision(branch="easy_super"), yes_bid=0.10)
+    assert c["size_locked_position"].call_args.kwargs.get("win_prob") is None
+
+
+@pytest.mark.asyncio
+async def test_conviction_skipped_for_hard_branch(monkeypatch):
+    """HARD (forecast-driven, not pure monotonicity) stays flat."""
+    _enable_conviction(monkeypatch)
+    _, c = await _invoke(decision=_yes_decision(branch="hard"))
+    assert c["size_locked_position"].call_args.kwargs.get("win_prob") is None

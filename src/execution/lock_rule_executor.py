@@ -71,6 +71,14 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _lock_big_size_stations() -> set[str]:
+    """Parse ``settings.LOCK_BIG_SIZE_STATIONS`` (comma-separated ICAOs) into a
+    set of upper-cased codes. Empty when unset — conviction sizing then applies
+    to nobody, even with ``LOCK_CONVICTION_SIZING_ENABLED`` on."""
+    raw = settings.LOCK_BIG_SIZE_STATIONS or ""
+    return {s.strip().upper() for s in raw.split(",") if s.strip()}
+
+
 async def try_lock_rule_trade(
     *,
     session: "AsyncSession",
@@ -234,25 +242,61 @@ async def try_lock_rule_trade(
     # outcomes via market_id+direction+created_at.
     await _log_lock_eval(True, None, buy_depth or None)
 
-    # Near-peak floor-up: lock decisions are deterministic (prob ≡ 1.0), so the
-    # confidence arm of the gate always passes for threshold lock markets;
-    # bracket-like lock branches (range_*) are excluded (validate-first).
-    floor_to_usd = (
-        settings.NEAR_PEAK_FLOOR_STAKE_USD
-        if near_peak_floor_eligible(
-            market,
-            our_probability=1.0,
-            hours_until_peak=state.hours_until_peak,
+    # Conviction-weighted sizing: only the truly monotonic EASY-YES direction,
+    # only on a station whose routine-METAR max is trusted to match the
+    # resolver (whitelist), only when the master flag is on. Everything else
+    # falls through to the flat 2% path. See `risk.kelly.size_locked_position`.
+    conviction = (
+        settings.LOCK_CONVICTION_SIZING_ENABLED
+        and decision.side == "YES"
+        and decision.branch in ("easy_super", "easy_standard")
+        and icao.upper() in _lock_big_size_stations()
+    )
+
+    if conviction:
+        win_prob = (
+            settings.LOCK_WIN_PROB_SUPER
+            if decision.branch == "easy_super"
+            else settings.LOCK_WIN_PROB_STANDARD
         )
-        else None
-    )
-    pos = size_locked_position(
-        bankroll=bankroll,
-        price=effective_price,
-        current_exposure=exposure,
-        orderbook_depth=buy_depth or None,
-        floor_to_usd=floor_to_usd,
-    )
+        max_position_pct = (
+            settings.LOCK_MAX_POSITION_PCT_SUPER
+            if decision.branch == "easy_super"
+            else settings.LOCK_MAX_POSITION_PCT_STANDARD
+        )
+        pos = size_locked_position(
+            bankroll=bankroll,
+            price=effective_price,
+            current_exposure=exposure,
+            orderbook_depth=buy_depth or None,
+            win_prob=win_prob,
+            kelly_fraction=settings.LOCK_KELLY_FRACTION,
+            max_position_pct=max_position_pct,
+            depth_cap_pct=settings.LOCK_DEPTH_CAP_PCT_BIG,
+        )
+    else:
+        win_prob = None
+        # Near-peak floor-up: lock decisions are deterministic (prob ≡ 1.0), so
+        # the confidence arm of the gate always passes for threshold lock
+        # markets; bracket-like lock branches (range_*) are excluded
+        # (validate-first). Redundant under conviction sizing (stakes already
+        # clear the floor), so the flat path owns it.
+        floor_to_usd = (
+            settings.NEAR_PEAK_FLOOR_STAKE_USD
+            if near_peak_floor_eligible(
+                market,
+                our_probability=1.0,
+                hours_until_peak=state.hours_until_peak,
+            )
+            else None
+        )
+        pos = size_locked_position(
+            bankroll=bankroll,
+            price=effective_price,
+            current_exposure=exposure,
+            orderbook_depth=buy_depth or None,
+            floor_to_usd=floor_to_usd,
+        )
     dd_state = monitor.check(bankroll)
     stake = pos.stake_usd * dd_state.size_multiplier
     floored_up = (pos.reason or "").startswith("floored")
@@ -275,6 +319,12 @@ async def try_lock_rule_trade(
             "raw_stake_usd": pos.stake_usd,
             "dd_multiplier": dd_state.size_multiplier,
             "routine_count": decision.routine_count,
+            "conviction": conviction,
+            "win_prob": win_prob,
+            "kelly_pct": pos.kelly_pct,
+            "walk_max_price": (
+                settings.LOCK_WALK_MAX_PRICE if conviction else None
+            ),
         },
     )
 
@@ -363,12 +413,21 @@ async def try_lock_rule_trade(
     session.add(trade)
     await session.flush()
 
-    order_ok = await place_order(
-        trade, session,
-        submit_yes_bid=yes_bid,
-        submit_yes_ask=yes_ask,
-        submit_depth_usd=buy_depth or None,
-    )
+    # Walk the book for conviction locks: widen the FAK slippage budget so the
+    # limit reaches LOCK_WALK_MAX_PRICE and the order sweeps every ask at/below
+    # it (place_order already reconciles stake_usd to the actual fill). Clamped
+    # ≥ the 2¢ default so a near-ceiling price never narrows the budget. The
+    # flat path omits the kwarg entirely → place_order's 2¢ default stands.
+    order_kwargs: dict = {
+        "submit_yes_bid": yes_bid,
+        "submit_yes_ask": yes_ask,
+        "submit_depth_usd": buy_depth or None,
+    }
+    if conviction:
+        order_kwargs["max_slippage_cents"] = max(
+            2.0, (settings.LOCK_WALK_MAX_PRICE - effective_price) * 100.0
+        )
+    order_ok = await place_order(trade, session, **order_kwargs)
     if not order_ok:
         # Distinguish wallet pre-flight skips from real submission failures
         # so dashboards can separate "held back intentionally" from "tried
@@ -434,6 +493,8 @@ async def try_lock_rule_trade(
                 "margin_f": decision.margin_f,
                 "is_dry_run": True,
                 "floored_up": floored_up,
+                "conviction": conviction,
+                "win_prob": win_prob,
             },
         )
     else:
@@ -485,6 +546,8 @@ async def try_lock_rule_trade(
                 "margin_f": decision.margin_f,
                 "fill_price": indicative_price,
                 "floored_up": floored_up,
+                "conviction": conviction,
+                "win_prob": win_prob,
             },
         )
 

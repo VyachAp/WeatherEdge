@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import signal
 from datetime import date, datetime, timedelta, timezone
@@ -1884,6 +1885,46 @@ async def job_reconcile_orders() -> None:
         logger.warning("Order reconciliation job failed", exc_info=True)
 
 
+async def job_perf_review(days: int) -> None:
+    """Periodic performance digest — Layer 1 of the auto-evaluation loop.
+
+    Computes the window digest (``cli.perf_review_result``), persists the
+    JSON artifact for the Layer-2 analyst, and pushes a Telegram summary —
+    throttled per cadence via a ``bot_state`` cooldown so the daily / 3d / 7d
+    jobs don't spam. Propose-only: never changes config. Registered (gated by
+    ``PERF_REVIEW_ENABLED``) for days ∈ {1, 3, 7} in ``setup_scheduler``.
+    """
+    # Lazy import: the CLI module is only needed when this job runs, and
+    # importing it at module load would create a scheduler⇄cli cycle.
+    from src.cli import (
+        _persist_perf_artifact,
+        perf_review_result,
+        render_perf_digest,
+    )
+
+    alerter = get_alerter()
+    try:
+        async with async_session() as session:
+            key = f"perf_review.last_pushed_at.{days}d"
+            now = datetime.now(timezone.utc)
+            last = await _load_alert_cooldown(session, key)
+            # Window just under the cadence so a coalesced/late run still fires
+            # but a same-day double-trigger is suppressed.
+            cooldown = timedelta(
+                hours={1: 20, 3: 68, 7: 164}.get(days, max(1, days * 24 - 4))
+            )
+            if last is not None and (now - last) < cooldown:
+                return
+            result = await perf_review_result(session, days)
+            await _persist_perf_artifact(session, days, result)
+            await alerter._enqueue(render_perf_digest(result, markdown=True))
+            await _persist_alert_cooldown(session, key, now)
+            await session.commit()
+    except Exception as exc:
+        logger.exception("Perf-review job failed (%dd)", days)
+        await alerter.send_system_error(exc, f"perf review {days}d")
+
+
 # ---------------------------------------------------------------------------
 # Main entry
 # ---------------------------------------------------------------------------
@@ -1953,6 +1994,24 @@ def setup_scheduler() -> AsyncIOScheduler:
             "Order reconciliation enabled (every %dm)",
             settings.ORDER_RECONCILE_INTERVAL_MINUTES,
         )
+
+    if settings.PERF_REVIEW_ENABLED:
+        # One parametrised job, three cadences. functools.partial (not a loop
+        # closure) avoids APScheduler late-binding of `days`. Staggered after
+        # the 22:00 settlement so the digest reflects the freshly-settled book.
+        for _days, _trigger, _jid in (
+            (1, CronTrigger(hour=22, minute=30, timezone="UTC"), "perf_review_daily"),
+            (3, CronTrigger(day_of_week="mon,thu", hour=22, minute=40, timezone="UTC"), "perf_review_3d"),
+            (7, CronTrigger(day_of_week="mon", hour=22, minute=50, timezone="UTC"), "perf_review_7d"),
+        ):
+            scheduler.add_job(
+                functools.partial(job_perf_review, _days),
+                _trigger,
+                id=_jid,
+                max_instances=1,
+                coalesce=True,
+            )
+        logger.info("Perf-review jobs enabled (daily / 3d / 7d)")
 
     return scheduler
 
