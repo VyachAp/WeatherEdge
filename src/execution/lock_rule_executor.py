@@ -352,6 +352,8 @@ async def try_lock_rule_trade(
                 "size_reason": pos.reason,
                 "depth_usd": buy_depth,
                 "effective_price": effective_price,
+                "conviction": conviction,
+                "win_prob": win_prob,
             },
         )
         return 0.0
@@ -379,6 +381,8 @@ async def try_lock_rule_trade(
                     "branch": decision.branch,
                     "cluster_used_usd": cluster_used,
                     "cap_usd": settings.CLUSTER_STAKE_CAP_USD,
+                    "conviction": conviction,
+                    "win_prob": win_prob,
                 },
             )
             return 0.0
@@ -461,6 +465,8 @@ async def try_lock_rule_trade(
             metadata={
                 "branch": decision.branch,
                 "exchange_status": trade.exchange_status,
+                "conviction": conviction,
+                "win_prob": win_prob,
             },
         )
         return 0.0
@@ -525,7 +531,12 @@ async def try_lock_rule_trade(
                 signal_kind="lock",
                 outcome=OUTCOME_NO_FILL,
                 requested_stake_usd=stake,
-                metadata={"branch": decision.branch, "margin_f": decision.margin_f},
+                metadata={
+                    "branch": decision.branch,
+                    "margin_f": decision.margin_f,
+                    "conviction": conviction,
+                    "win_prob": win_prob,
+                },
             )
             return 0.0
         trade.status = TradeStatus.OPEN

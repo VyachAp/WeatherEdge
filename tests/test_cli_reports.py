@@ -15,6 +15,7 @@ from src.cli import (
     _flags_diff,
     _flatten_shadow,
     _quantiles,
+    _summarize_conviction_locks,
     _summarize_exposure,
     _summarize_floored_fills,
     _summarize_shadow,
@@ -243,3 +244,51 @@ def test_aggregate_valley_empty_cohorts():
         assert agg[c]["n"] == 0
         assert agg[c]["win_pct"] is None
         assert agg[c]["ev_per_usd"] is None
+
+
+# --- _summarize_conviction_locks --------------------------------------------
+
+
+def test_summarize_conviction_locks_empty():
+    s = _summarize_conviction_locks([])
+    assert s["fires"] == 0
+    assert s["filled"] == 0 and s["throttled"] == 0
+    assert s["deployed_actual"] == 0.0
+    assert s["settled"] == 0 and s["net_pnl"] == 0.0
+    assert s["by_branch"] == {}
+
+
+def test_summarize_conviction_locks_funnel_and_settlement():
+    rows = [
+        # deployed + settled WON
+        {"outcome": "trade_filled", "branch": "easy_super",
+         "requested_stake_usd": 68.0, "actual_stake_usd": 60.0,
+         "status": "WON", "pnl": 9.5},
+        # deployed (dry-run pending), not settled
+        {"outcome": "trade_pending", "branch": "easy_standard",
+         "requested_stake_usd": 20.0, "actual_stake_usd": 20.0,
+         "status": "PENDING", "pnl": None},
+        # walked the book but empty → no fill
+        {"outcome": "no_fill", "branch": "easy_super",
+         "requested_stake_usd": 50.0, "actual_stake_usd": None,
+         "status": None, "pnl": None},
+        # throttled by drawdown
+        {"outcome": "drawdown_paused", "branch": "easy_super",
+         "requested_stake_usd": 0.0, "actual_stake_usd": 0.0,
+         "status": None, "pnl": None},
+        # deployed + settled LOST
+        {"outcome": "trade_filled", "branch": "easy_super",
+         "requested_stake_usd": 60.0, "actual_stake_usd": 55.0,
+         "status": "LOST", "pnl": -55.0},
+    ]
+    s = _summarize_conviction_locks(rows)
+    assert s["fires"] == 5
+    assert s["filled"] == 3            # 2 trade_filled + 1 trade_pending
+    assert s["no_fill"] == 1
+    assert s["throttled"] == 1
+    # deployed sums over the 3 "filled" rows only
+    assert s["deployed_actual"] == pytest.approx(60.0 + 20.0 + 55.0)
+    assert s["deployed_requested"] == pytest.approx(68.0 + 20.0 + 60.0)
+    assert s["settled"] == 2 and s["won"] == 1 and s["lost"] == 1
+    assert s["net_pnl"] == pytest.approx(9.5 - 55.0)
+    assert s["by_branch"] == {"easy_super": 4, "easy_standard": 1}

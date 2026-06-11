@@ -4915,6 +4915,197 @@ def resolution_report(days: int, station: str | None, unit: str | None) -> None:
     asyncio.run(_run())
 
 
+def _summarize_conviction_locks(rows: list[dict]) -> dict:
+    """Aggregate conviction-lock decision rows (each already joined to its
+    settled Trade, if any). Pure — unit-tested in ``tests/test_cli_reports.py``.
+
+    Each ``row`` carries: ``outcome``, ``requested_stake_usd``,
+    ``actual_stake_usd``, ``branch``, ``status`` (Trade status name or None),
+    ``pnl`` (None until settled).
+    """
+    deployed_outcomes = {"trade_filled", "trade_pending"}
+    throttle_outcomes = {
+        "stake_below_min", "drawdown_paused", "cluster_cap_hit",
+        "order_failed", "insufficient_balance",
+    }
+    filled = [r for r in rows if r["outcome"] in deployed_outcomes]
+    settled = [r for r in rows if r.get("status") in ("WON", "LOST")]
+    won = [r for r in settled if r["status"] == "WON"]
+    by_branch: dict[str, int] = {}
+    for r in rows:
+        b = r.get("branch") or "?"
+        by_branch[b] = by_branch.get(b, 0) + 1
+    return {
+        "fires": len(rows),
+        "filled": len(filled),
+        "no_fill": sum(1 for r in rows if r["outcome"] == "no_fill"),
+        "throttled": sum(1 for r in rows if r["outcome"] in throttle_outcomes),
+        "deployed_actual": sum(r.get("actual_stake_usd") or 0.0 for r in filled),
+        "deployed_requested": sum(r.get("requested_stake_usd") or 0.0 for r in filled),
+        "settled": len(settled),
+        "won": len(won),
+        "lost": len(settled) - len(won),
+        "net_pnl": sum(r.get("pnl") or 0.0 for r in settled),
+        "by_branch": by_branch,
+    }
+
+
+@main.command("lock-conviction-report")
+@click.option("--days", default=14, show_default=True, help="Look-back window in days.")
+@click.option("--json", "as_json", is_flag=True, help="Emit JSON instead of a table.")
+def lock_conviction_report(days: int, as_json: bool) -> None:
+    """Monitor conviction-weighted EASY-YES lock fires (``LOCK_CONVICTION_SIZING``).
+
+    Surfaces every lock decision tagged ``conviction=true`` in the last
+    ``--days`` — what sized, whether it filled / walked the book / was
+    throttled, and how it settled — so you can confirm the feature behaves
+    after the live flip. Fires are EASY-YES only and only on the whitelisted
+    stations, so an empty report is normal, not an error.
+    """
+    import json as _json
+
+    from sqlalchemy import select
+
+    from src.config import settings
+    from src.db.engine import async_session
+    from src.db.models import DecisionLog, Market, Trade
+    from src.execution.lock_rule_executor import _lock_big_size_stations
+
+    async def _run() -> None:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+        async with async_session() as session:
+            stmt = (
+                select(DecisionLog)
+                .where(DecisionLog.created_at >= cutoff)
+                .where(DecisionLog.signal_kind == "lock")
+                .where(DecisionLog.metadata_json["conviction"].astext == "true")
+                .order_by(DecisionLog.created_at.desc())
+            )
+            decisions = (await session.execute(stmt)).scalars().all()
+
+            market_ids = {d.market_id for d in decisions}
+            trades_by_key: dict[tuple, list] = {}
+            questions: dict[str, str] = {}
+            if market_ids:
+                trs = (await session.execute(
+                    select(Trade).where(Trade.market_id.in_(market_ids))
+                )).scalars().all()
+                for t in trs:
+                    trades_by_key.setdefault((t.market_id, t.direction), []).append(t)
+                mks = (await session.execute(
+                    select(Market).where(Market.id.in_(market_ids))
+                )).scalars().all()
+                questions = {m.id: (m.question or "") for m in mks}
+
+            def _match_trade(d):
+                """The Trade a conviction decision produced = same
+                (market_id, direction) opened nearest the decision time."""
+                cands = trades_by_key.get((d.market_id, d.direction), [])
+                if not cands:
+                    return None
+                return min(cands, key=lambda t: abs(
+                    ((t.opened_at or d.created_at) - d.created_at).total_seconds()
+                ))
+
+            rows: list[dict] = []
+            for d in decisions:
+                meta = d.metadata_json or {}
+                t = _match_trade(d)
+                rows.append({
+                    "when": d.created_at,
+                    "market_id": d.market_id,
+                    "direction": d.direction.name,
+                    "outcome": d.outcome,
+                    "branch": meta.get("branch"),
+                    "win_prob": meta.get("win_prob"),
+                    "requested_stake_usd": d.requested_stake_usd,
+                    "actual_stake_usd": d.actual_stake_usd,
+                    "dd_multiplier": d.dd_multiplier,
+                    "status": t.status.name if t is not None else None,
+                    "pnl": t.pnl if t is not None else None,
+                    "question": questions.get(d.market_id, ""),
+                })
+
+            summary = _summarize_conviction_locks(rows)
+            whitelist = sorted(_lock_big_size_stations())
+            flag_on = settings.LOCK_CONVICTION_SIZING_ENABLED
+
+            if as_json:
+                click.echo(_json.dumps({
+                    "days": days, "flag_enabled": flag_on, "whitelist": whitelist,
+                    "summary": summary,
+                    "rows": [{**r, "when": r["when"].isoformat()} for r in rows],
+                }, indent=2, default=str))
+                return
+
+            click.echo(f"# Conviction lock report — last {days}d")
+            click.echo()
+            click.echo(
+                "- **Flag:** LOCK_CONVICTION_SIZING_ENABLED="
+                f"{'on' if flag_on else 'OFF'}"
+            )
+            click.echo(
+                f"- **Whitelist:** {', '.join(whitelist) if whitelist else '(empty)'}"
+            )
+            click.echo()
+
+            if not rows:
+                click.echo(
+                    f"_No conviction lock fires in the last {days}d. Expected to be "
+                    "infrequent (EASY-YES only, whitelisted stations only) — not an "
+                    "error. Check `bet status` for the drawdown level if you expected "
+                    "one._"
+                )
+                return
+
+            click.echo(
+                f"## Fires ({summary['fires']}: {summary['filled']} deployed, "
+                f"{summary['no_fill']} no-fill, {summary['throttled']} throttled)"
+            )
+            click.echo()
+            click.echo(
+                "| when (UTC) | outcome | branch | win_p | req$ | act$ | dd× | "
+                "settle | pnl | market |"
+            )
+            click.echo("|---|---|---|---:|---:|---:|---:|---|---:|---|")
+            for r in rows:
+                wp = r["win_prob"]
+                wp_s = "—" if wp is None else f"{wp:.2f}"
+                dd = r["dd_multiplier"]
+                dd_s = f"{dd:.2f}" if dd is not None else "1.00"
+                pnl_s = "" if r["pnl"] is None else f"{r['pnl']:+.2f}"
+                branch_s = (r["branch"] or "?").replace("easy_", "")
+                click.echo(
+                    f"| {r['when']:%m-%d %H:%M} | {r['outcome']} | {branch_s} | "
+                    f"{wp_s} | {(r['requested_stake_usd'] or 0):.2f} | "
+                    f"{(r['actual_stake_usd'] or 0):.2f} | {dd_s} | "
+                    f"{r['status'] or '—'} | {pnl_s} | {r['question'][:34]} |"
+                )
+            click.echo()
+
+            click.echo("## Summary")
+            click.echo(
+                f"- **Deployed:** ${summary['deployed_actual']:.2f} actual / "
+                f"${summary['deployed_requested']:.2f} requested "
+                "(gap = book walked / partial fills)"
+            )
+            if summary["settled"]:
+                wr = 100.0 * summary["won"] / summary["settled"]
+                click.echo(
+                    f"- **Settled:** {summary['won']}W / {summary['lost']}L "
+                    f"({wr:.0f}% win), net pnl ${summary['net_pnl']:+.2f}"
+                )
+            else:
+                click.echo("- **Settled:** none yet")
+            branches = ", ".join(
+                f"{k}={v}" for k, v in sorted(summary["by_branch"].items())
+            )
+            click.echo(f"- **By branch:** {branches}")
+            click.echo()
+
+    asyncio.run(_run())
+
+
 @main.command("shadow-report")
 @click.option("--days", default=7, show_default=True, help="Look-back window in days.")
 @click.option("--key", default=None, help="Only shadow keys with this dotted prefix.")
