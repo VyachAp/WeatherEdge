@@ -1122,6 +1122,21 @@ async def job_daily_settlement() -> None:
             except Exception:
                 logger.exception("Station bias recording failed (non-fatal)")
 
+            # 4b. M3 straggler sweep — backfill routine_metar_max_f for any
+            # MarketResolution row the ~36h live-fetch loop above missed
+            # (settlement outage, data-starved day, or aged-out live history),
+            # reading the daily max from stored METARs. Self-heals stragglers so
+            # they don't stay NULL forever. Best-effort; never blocks settlement.
+            try:
+                from src.signals.market_resolution import sweep_stranded_routine_max
+                filled = await sweep_stranded_routine_max(session)
+                if filled:
+                    logger.info(
+                        "M3 straggler sweep filled %d routine-max rows", filled
+                    )
+            except Exception:
+                logger.warning("M3 straggler sweep failed (non-fatal)", exc_info=True)
+
             # (Per-station fast-lock-poll dedup is now reset at each
             # station's local-day rollover by ``_maybe_clear_per_station_caches``;
             # no global wipe at 22:00 UTC.)

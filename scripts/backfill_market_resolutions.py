@@ -28,20 +28,25 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-from datetime import datetime, time, timedelta, timezone
 
 from sqlalchemy import select
 from sqlalchemy.orm import joinedload
 
 from src.db.engine import async_session
 from src.db.models import (
-    MetarObservation,
     Trade,
     TradeDirection,
     TradeStatus,
 )
-from src.signals.mapper import icao_for_location, icao_timezone, resolve_target_local_day
-from src.signals.market_resolution import record_market_resolution
+from src.signals.mapper import (
+    icao_for_location,
+    icao_timezone,
+    resolve_target_local_day,
+)
+from src.signals.market_resolution import (
+    record_market_resolution,
+    stored_routine_daily_max_f,
+)
 
 
 def _yes_won(trade: Trade) -> bool:
@@ -54,23 +59,6 @@ def _yes_won(trade: Trade) -> bool:
     is_yes = trade.direction == TradeDirection.BUY_YES
     # yes_won is True when (won and is_yes) or (lost and not is_yes).
     return (won and is_yes) or ((not won) and (not is_yes))
-
-
-async def _stored_daily_max_f(session, icao, utc_start, utc_end) -> float | None:
-    """Max routine-METAR temp_f in [utc_start, utc_end) from stored obs."""
-    rows = (
-        await session.execute(
-            select(MetarObservation.temp_f).where(
-                MetarObservation.station_icao == icao,
-                MetarObservation.observed_at >= utc_start,
-                MetarObservation.observed_at < utc_end,
-                MetarObservation.is_speci == False,  # noqa: E712
-                MetarObservation.temp_f.isnot(None),
-            )
-        )
-    ).scalars().all()
-    temps = [float(t) for t in rows if t is not None]
-    return max(temps) if temps else None
 
 
 async def run(commit: bool) -> None:
@@ -107,15 +95,13 @@ async def run(commit: bool) -> None:
                 no_station += 1
                 continue
 
-            tz = icao_timezone(icao)
-            target = resolve_target_local_day(market.end_date, tz)
+            target = resolve_target_local_day(market.end_date, icao_timezone(icao))
             routine_max_f = None
             if target is not None:
-                local_start = datetime.combine(target, time(0, 0), tzinfo=tz)
-                utc_start = local_start.astimezone(timezone.utc)
-                utc_end = (local_start + timedelta(days=1)).astimezone(timezone.utc)
-                routine_max_f = await _stored_daily_max_f(
-                    session, icao, utc_start, utc_end
+                # Shared stored-METAR reader (also used by the nightly
+                # straggler sweep) — permissive here: take whatever obs exist.
+                routine_max_f, _count = await stored_routine_daily_max_f(
+                    session, icao, target
                 )
             if routine_max_f is None:
                 no_max += 1

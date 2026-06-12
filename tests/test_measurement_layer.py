@@ -250,3 +250,88 @@ def test_resolve_trades_records_resolution_on_chain_outcome():
         assert spy.await_args.kwargs["yes_won"] is True
 
     asyncio.run(_run())
+
+
+# ---------------------------------------------------------------------------
+# Stranded-row self-heal: stored_routine_daily_max_f + sweep_stranded_routine_max
+# ---------------------------------------------------------------------------
+
+
+def test_stored_routine_daily_max_f_returns_max_and_count(monkeypatch):
+    import src.signals.market_resolution as mr
+    from datetime import date, timezone
+
+    async def _run():
+        # icao_timezone is irrelevant to the assertion (execute is mocked); pin
+        # it so the helper doesn't depend on the real station table.
+        monkeypatch.setattr(mr, "icao_timezone", lambda icao: timezone.utc)
+        session = AsyncMock()
+        res = MagicMock()
+        res.scalars.return_value.all.return_value = [70.0, 84.0, None, 72.5]
+        session.execute.return_value = res
+
+        mx, cnt = await mr.stored_routine_daily_max_f(
+            session, "KXXX", date(2026, 5, 31)
+        )
+        assert mx == 84.0 and cnt == 3  # None dropped
+
+        res.scalars.return_value.all.return_value = []
+        assert await mr.stored_routine_daily_max_f(
+            session, "KXXX", date(2026, 5, 31)
+        ) == (None, 0)
+
+    asyncio.run(_run())
+
+
+def test_sweep_stranded_routine_max_gates_and_fills(monkeypatch):
+    import src.signals.market_resolution as mr
+    from datetime import date
+
+    async def _run():
+        pairs = [
+            ("KAAA", date(2026, 5, 31)),  # 5 obs → fill
+            ("KBBB", date(2026, 6, 1)),   # 2 obs (< min) → skip
+            ("KCCC", date(2026, 6, 2)),   # no stored obs → skip
+        ]
+        session = AsyncMock()
+        res = MagicMock()
+        res.all.return_value = pairs
+        session.execute.return_value = res
+
+        maxes = {
+            ("KAAA", date(2026, 5, 31)): (84.0, 5),
+            ("KBBB", date(2026, 6, 1)): (70.0, 2),
+            ("KCCC", date(2026, 6, 2)): (None, 0),
+        }
+
+        async def fake_stored(s, icao, target):
+            return maxes[(icao, target)]
+
+        backfilled: list = []
+
+        async def fake_backfill(s, *, station_icao, target_date_local,
+                                routine_metar_max_f):
+            backfilled.append((station_icao, routine_metar_max_f))
+            return 1
+
+        monkeypatch.setattr(mr, "stored_routine_daily_max_f", fake_stored)
+        monkeypatch.setattr(mr, "backfill_routine_max", fake_backfill)
+
+        n = await mr.sweep_stranded_routine_max(session, min_routines=3)
+        assert n == 1                       # only KAAA filled
+        assert backfilled == [("KAAA", 84.0)]
+
+    asyncio.run(_run())
+
+
+def test_sweep_stranded_routine_max_noop_when_nothing_null():
+    import src.signals.market_resolution as mr
+
+    async def _run():
+        session = AsyncMock()
+        res = MagicMock()
+        res.all.return_value = []
+        session.execute.return_value = res
+        assert await mr.sweep_stranded_routine_max(session) == 0
+
+    asyncio.run(_run())
