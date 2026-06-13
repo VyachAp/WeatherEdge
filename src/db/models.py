@@ -394,6 +394,73 @@ class MarketResolution(Base):
     )
 
 
+class ShadowLedger(Base):
+    """Unselected decision ledger for the redesigned four-stage shadow flow.
+
+    One row per market the shadow decision module evaluated, **every tick**,
+    whether or not it (or the live paths) would trade. This is the
+    architectural fix for the calibration problem: the legacy
+    ``evaluation_logs`` only cleanly joins outcomes to trades we *placed* — a
+    fills-selected sample — so we can neither calibrate the probability model
+    nor prove the filters discard +EV trades. This table scores **every**
+    evaluated market against ``market_resolutions.yes_won`` (join on
+    ``market_id``), giving the clean, unselected dataset the ``calibration-report``
+    needs to decide whether the new model beats the market baseline OOS.
+
+    The new module places NO orders; ``shadow_stake_usd`` is the size it WOULD
+    have taken. Capturing ``prior_yes`` (forecast-only), ``updated_yes`` (after
+    the observational update) and ``obs_fraction`` lets the report bucket
+    calibration by how much of the day was observed — the falsifiable test of
+    the information-latency thesis (calibration + edge should improve with
+    ``obs_fraction``).
+
+    Volume: one row per (binary market × tick), comparable to ``evaluation_logs``.
+    Indexed on ``(market_id, created_at)`` for the per-market join + on
+    ``created_at`` for windowed report scans.
+    """
+
+    __tablename__ = "shadow_ledger"
+    __table_args__ = (
+        Index("ix_shadow_ledger_market_created", "market_id", "created_at"),
+        Index("ix_shadow_ledger_created", "created_at"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    market_id = Column(String, ForeignKey("markets.id"), nullable=False)
+    station_icao = Column(String)
+    target_date_local = Column(Date)
+    # --- stage 1: probability estimate ---
+    prior_yes = Column(Float, nullable=False)
+    updated_yes = Column(Float, nullable=False)
+    info_advantage = Column(Float, nullable=False)
+    obs_fraction = Column(Float, nullable=False)
+    mean_f = Column(Float)
+    prior_sigma_f = Column(Float)
+    updated_sigma_f = Column(Float)
+    # --- market context at evaluation time ---
+    yes_bid = Column(Float)
+    yes_ask = Column(Float)
+    market_mid = Column(Float)
+    depth_usd = Column(Float)
+    minutes_to_close = Column(Float)
+    # --- stages 2-4: cost, edge, decision, size ---
+    side = Column(String)            # 'YES' | 'NO' | NULL
+    effective_cost = Column(Float)
+    net_edge = Column(Float)
+    sigma_edge = Column(Float)
+    would_trade = Column(Boolean, nullable=False, default=False)
+    shadow_stake_usd = Column(Float)
+    decision_reason = Column(String)
+    # Full feature snapshot (all WeatherState fields the model used) + the
+    # stage reasoning trail — the "why" the legacy logs never persisted.
+    feature_json = Column(JSONB)
+    created_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Aviation weather models
 # ---------------------------------------------------------------------------

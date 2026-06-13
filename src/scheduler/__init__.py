@@ -528,6 +528,28 @@ async def job_unified_pipeline() -> None:
                         (end_time - now_utc).total_seconds() / 60.0
                         if end_time else None
                     )
+
+                    # Redesigned decision flow (information-latency thesis):
+                    # run the pure four-stage shadow model for this market and
+                    # record it to the unselected shadow_ledger. Places NO
+                    # orders and never mutates the Market row — it runs purely
+                    # alongside the live probability + lock paths so the
+                    # calibration-report can prove (or refute) it OOS before any
+                    # capital is routed to it. Depth_no reuses the YES-side
+                    # depth as a proxy to avoid an extra CLOB call per market
+                    # (slippage rarely binds at shadow stakes). Best-effort.
+                    try:
+                        from src.signals.shadow_ledger import record_shadow_decision
+                        await record_shadow_decision(
+                            session, market, state,
+                            yes_bid=yes_bid, yes_ask=yes_ask, yes_mid=price,
+                            depth_yes_usd=mkt_depth, depth_no_usd=mkt_depth,
+                            minutes_to_close=eval_minutes_to_close,
+                            bankroll=bankroll,
+                        )
+                    except Exception:  # noqa: BLE001 — shadow must not break live
+                        logger.debug("shadow ledger hook failed", exc_info=True)
+
                     # M1/Phase-1: shadow-log the pooled-vs-per-class
                     # calibration counterfactual for this raw prob (pure
                     # telemetry — can't affect the trade). Lets shadow-report

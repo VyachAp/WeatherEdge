@@ -379,6 +379,102 @@ def _aggregate_divergence(rows: list[dict]) -> list[dict]:
     return out
 
 
+_OBS_BINS: tuple[tuple[str, float, float], ...] = (
+    ("0.00-0.25", 0.00, 0.25),
+    ("0.25-0.50", 0.25, 0.50),
+    ("0.50-0.75", 0.50, 0.75),
+    ("0.75-1.00", 0.75, 1.0001),  # include the past-peak 1.0 rows
+)
+
+
+def _brier(p: float, y: int) -> float:
+    return (p - y) ** 2
+
+
+def _logloss(p: float, y: int) -> float:
+    import math
+    eps = 1e-6
+    p = min(1.0 - eps, max(eps, p))
+    return -(y * math.log(p) + (1 - y) * math.log(1.0 - p))
+
+
+def _score_cohort(rows: list[dict]) -> dict | None:
+    """Brier/log-loss of our prob vs the market baseline for one cohort.
+
+    Each row needs ``updated_yes`` (our P(YES)), ``market_mid`` (the market's
+    implied P(YES)), and ``yes_won`` (the 0/1 label). The promotion gate is
+    ``model_beats_market``: our scores strictly lower (better) than just trusting
+    the price. Returns None for an empty cohort.
+    """
+    labeled = [r for r in rows if r.get("yes_won") is not None
+               and r.get("market_mid") is not None]
+    if not labeled:
+        return None
+    n = len(labeled)
+    mb = sum(_brier(float(r["updated_yes"]), int(r["yes_won"])) for r in labeled) / n
+    kb = sum(_brier(float(r["market_mid"]), int(r["yes_won"])) for r in labeled) / n
+    ml = sum(_logloss(float(r["updated_yes"]), int(r["yes_won"])) for r in labeled) / n
+    kl = sum(_logloss(float(r["market_mid"]), int(r["yes_won"])) for r in labeled) / n
+    return {
+        "n": n,
+        "model_brier": mb, "market_brier": kb,
+        "model_logloss": ml, "market_logloss": kl,
+        "model_beats_market": (mb < kb and ml < kl),
+    }
+
+
+def _would_trade_ev(rows: list[dict]) -> dict:
+    """Realised win-rate + EV/$1 of the shadow bets the model WOULD have placed.
+
+    A bet wins iff its chosen side matches the outcome (YES↔yes_won). Profit per
+    $1 staked = ``1/price - 1`` on a win, ``-1`` on a loss, where ``price`` is the
+    modelled all-in ``effective_cost``. Empty → ``{"n": 0}``.
+    """
+    bets = [r for r in rows if r.get("would_trade") and r.get("yes_won") is not None
+            and r.get("side") and r.get("effective_cost")]
+    if not bets:
+        return {"n": 0}
+    wins, ev = 0, 0.0
+    for r in bets:
+        won = (r["side"] == "YES") == bool(r["yes_won"])
+        price = min(0.999, max(0.001, float(r["effective_cost"])))
+        ev += (1.0 / price - 1.0) if won else -1.0
+        wins += 1 if won else 0
+    return {"n": len(bets), "win_rate": wins / len(bets), "ev_per_dollar": ev / len(bets)}
+
+
+def _calibration_report(rows: list[dict]) -> dict:
+    """Promotion-gate aggregation for the shadow ledger (pure).
+
+    Buckets every labeled shadow prediction by observation-fraction and scores
+    our probability against the market baseline (Brier + log-loss). The
+    information-latency thesis predicts ``model_beats_market`` should turn True
+    as ``obs_fraction`` rises (we know more than the market near peak) and stay
+    False far from peak (forecast disagreement = noise). Also splits by operator
+    class and reports the EV of the bets the model would have placed.
+    """
+    overall = _score_cohort(rows)
+    buckets = []
+    for label, lo, hi in _OBS_BINS:
+        cohort = [r for r in rows if lo <= float(r.get("obs_fraction") or 0.0) < hi]
+        sc = _score_cohort(cohort)
+        if sc is not None:
+            sc["bucket"] = label
+            buckets.append(sc)
+    by_class: dict[str, dict] = {}
+    for cls in ("threshold", "bracket-like"):
+        sc = _score_cohort([r for r in rows if r.get("operator_class") == cls])
+        if sc is not None:
+            by_class[cls] = sc
+    return {
+        "n_total": len(rows),
+        "overall": overall,
+        "buckets": buckets,
+        "by_class": by_class,
+        "would_trade": _would_trade_ev(rows),
+    }
+
+
 def _flatten_shadow(obj, prefix: str = "") -> dict:
     """Flatten a nested ``shadow_json`` dict to dotted leaf keys."""
     out: dict = {}
@@ -5101,6 +5197,200 @@ def lock_conviction_report(days: int, as_json: bool) -> None:
                 f"{k}={v}" for k, v in sorted(summary["by_branch"].items())
             )
             click.echo(f"- **By branch:** {branches}")
+            click.echo()
+
+    asyncio.run(_run())
+
+
+@main.command("calibration-report")
+@click.option("--days", default=30, show_default=True, help="Look-back window in days.")
+@click.option("--station", default=None, help="Restrict to one ICAO.")
+@click.option("--json", "as_json", is_flag=True, help="Emit raw JSON.")
+def calibration_report(days: int, station: str | None, as_json: bool) -> None:
+    """Promotion gate for the redesigned four-stage shadow decision flow.
+
+    Joins ``shadow_ledger`` predictions to ``market_resolutions.yes_won`` and
+    scores our probability against the market baseline (just trusting the
+    price), bucketed by observation-fraction. The information-latency thesis is
+    confirmed iff ``model_beats_market`` (lower Brier AND log-loss) turns True in
+    the high-obs_fraction buckets and stays False far from peak. Only flip live
+    sizing on for a bucket once it beats the baseline here out-of-sample.
+    """
+    from sqlalchemy import select
+
+    from src.db.engine import async_session
+    from src.db.models import MarketResolution, ShadowLedger
+    from src.execution.binary_market import operator_class
+
+    async def _run() -> None:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+        async with async_session() as session:
+            stmt = (
+                select(ShadowLedger, MarketResolution.yes_won,
+                       MarketResolution.parsed_operator)
+                .join(MarketResolution,
+                      MarketResolution.market_id == ShadowLedger.market_id)
+                .where(ShadowLedger.created_at >= cutoff)
+            )
+            if station:
+                stmt = stmt.where(ShadowLedger.station_icao == station.upper())
+            res = (await session.execute(stmt)).all()
+            if not res:
+                click.echo(
+                    f"No labeled shadow_ledger rows in the last {days}d "
+                    f"(station={station or 'any'}). The shadow runner needs to "
+                    "have evaluated markets that have since settled (M3)."
+                )
+                return
+
+            rows = [
+                {
+                    "updated_yes": sl.updated_yes,
+                    "prior_yes": sl.prior_yes,
+                    "market_mid": sl.market_mid,
+                    "obs_fraction": sl.obs_fraction,
+                    "yes_won": (1 if yes_won else 0) if yes_won is not None else None,
+                    "would_trade": sl.would_trade,
+                    "side": sl.side,
+                    "effective_cost": sl.effective_cost,
+                    "operator_class": operator_class(op),
+                }
+                for sl, yes_won, op in res
+            ]
+            report = _calibration_report(rows)
+
+            if as_json:
+                import json
+                click.echo(json.dumps(report, indent=2, default=str))
+                return
+
+            click.echo(f"# Calibration report (shadow flow) — last {days}d")
+            click.echo()
+            click.echo(f"- **Labeled predictions:** {report['n_total']:,}")
+            ov = report["overall"]
+            if ov:
+                verdict = "✅ beats market" if ov["model_beats_market"] else "❌ does not beat market"
+                click.echo(
+                    f"- **Overall:** model Brier {ov['model_brier']:.4f} vs "
+                    f"market {ov['market_brier']:.4f}; log-loss "
+                    f"{ov['model_logloss']:.4f} vs {ov['market_logloss']:.4f} — {verdict}"
+                )
+            click.echo()
+            click.echo("## By observation-fraction (the thesis test)")
+            click.echo()
+            click.echo("| obs_fraction | n | model Brier | mkt Brier | model LL | mkt LL | beats? |")
+            click.echo("|---|---:|---:|---:|---:|---:|:--:|")
+            for b in report["buckets"]:
+                click.echo(
+                    f"| {b['bucket']} | {b['n']:,} | {b['model_brier']:.4f} | "
+                    f"{b['market_brier']:.4f} | {b['model_logloss']:.4f} | "
+                    f"{b['market_logloss']:.4f} | {'✅' if b['model_beats_market'] else '❌'} |"
+                )
+            click.echo()
+            if report["by_class"]:
+                click.echo("## By operator class")
+                click.echo()
+                click.echo("| class | n | model Brier | mkt Brier | beats? |")
+                click.echo("|---|---:|---:|---:|:--:|")
+                for cls, sc in report["by_class"].items():
+                    click.echo(
+                        f"| {cls} | {sc['n']:,} | {sc['model_brier']:.4f} | "
+                        f"{sc['market_brier']:.4f} | {'✅' if sc['model_beats_market'] else '❌'} |"
+                    )
+                click.echo()
+            wt = report["would_trade"]
+            if wt.get("n"):
+                click.echo(
+                    f"## Would-trade EV: n={wt['n']:,}, win={wt['win_rate']:.1%}, "
+                    f"EV/$1={wt['ev_per_dollar']:+.3f}"
+                )
+                click.echo()
+
+    asyncio.run(_run())
+
+
+@main.command("shadow-backtest")
+@click.option("--days", default=60, show_default=True, help="Look-back window over settled markets.")
+@click.option("--json", "as_json", is_flag=True, help="Emit raw JSON.")
+def shadow_backtest(days: int, as_json: bool) -> None:
+    """Replay the four-stage shadow model over settled markets (immediate gate).
+
+    Reconstructs the point-in-time ``WeatherState`` for each settled market from
+    archived forecasts + stored METARs, runs ``evaluate_shadow`` at several
+    observation-fractions, and scores our probability vs the market-price
+    baseline with the SAME aggregator as the live ``calibration-report``. Gives
+    an immediate read on the information-latency thesis without waiting for the
+    live shadow ledger to fill. See ``risk.shadow_backtest`` for fidelity
+    caveats (reconstructed obs, no historical spread).
+    """
+    from src.db.engine import async_session
+    from src.risk.shadow_backtest import run_shadow_backtest
+
+    async def _run() -> None:
+        async with async_session() as session:
+            out = await run_shadow_backtest(session, days=days)
+        rows, stats = out["rows"], out["stats"]
+        if not rows:
+            click.echo(
+                f"No replayable rows in the last {days}d. Need settled "
+                f"market_resolutions with archived forecasts + stored METARs. "
+                f"Skips: {stats}"
+            )
+            return
+        report = _calibration_report(rows)
+
+        if as_json:
+            import json
+            click.echo(json.dumps({"report": report, "stats": stats}, indent=2, default=str))
+            return
+
+        click.echo(f"# Shadow-backtest (replay) — last {days}d")
+        click.echo()
+        click.echo(
+            f"- **Markets replayed:** {stats['markets']:,}  "
+            f"(evaluation points: {stats['points']:,}, labeled rows: {report['n_total']:,})"
+        )
+        click.echo(
+            f"- **Skips:** no_spec={stats['no_spec']}, few_metars={stats['few_metars']}, "
+            f"no_archive={stats['no_archive']}, no_price={stats['no_price']}"
+        )
+        ov = report["overall"]
+        if ov:
+            verdict = "✅ beats market" if ov["model_beats_market"] else "❌ does not beat market"
+            click.echo(
+                f"- **Overall:** model Brier {ov['model_brier']:.4f} vs market "
+                f"{ov['market_brier']:.4f}; log-loss {ov['model_logloss']:.4f} vs "
+                f"{ov['market_logloss']:.4f} — {verdict}"
+            )
+        click.echo()
+        click.echo("## By observation-fraction (the thesis test)")
+        click.echo()
+        click.echo("| obs_fraction | n | model Brier | mkt Brier | model LL | mkt LL | beats? |")
+        click.echo("|---|---:|---:|---:|---:|---:|:--:|")
+        for b in report["buckets"]:
+            click.echo(
+                f"| {b['bucket']} | {b['n']:,} | {b['model_brier']:.4f} | "
+                f"{b['market_brier']:.4f} | {b['model_logloss']:.4f} | "
+                f"{b['market_logloss']:.4f} | {'✅' if b['model_beats_market'] else '❌'} |"
+            )
+        click.echo()
+        if report["by_class"]:
+            click.echo("## By operator class")
+            click.echo()
+            click.echo("| class | n | model Brier | mkt Brier | beats? |")
+            click.echo("|---|---:|---:|---:|:--:|")
+            for cls, sc in report["by_class"].items():
+                click.echo(
+                    f"| {cls} | {sc['n']:,} | {sc['model_brier']:.4f} | "
+                    f"{sc['market_brier']:.4f} | {'✅' if sc['model_beats_market'] else '❌'} |"
+                )
+            click.echo()
+        wt = report["would_trade"]
+        if wt.get("n"):
+            click.echo(
+                f"## Would-trade EV (spread-free, optimistic): n={wt['n']:,}, "
+                f"win={wt['win_rate']:.1%}, EV/$1={wt['ev_per_dollar']:+.3f}"
+            )
             click.echo()
 
     asyncio.run(_run())
