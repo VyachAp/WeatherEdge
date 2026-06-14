@@ -282,3 +282,39 @@ async def test_place_order_preflight_runs_after_daily_cap(trade_for_place_order)
     assert ok is False
     assert trade_for_place_order.exchange_status == "cap_exceeded"
     bal_mock.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Regression: orderbook depth must be probed at the BUY price (the ask), not
+# the mid. `_compute_depth` sums asks with `ask_price <= price`; on any
+# positive spread the best ask is above the mid, so probing at the mid returns
+# 0 every time. The scheduler used to probe YES depth at the mid, which
+# silently depth-vetoed every BUY_YES (probability path AND EASY-YES lock),
+# skewing the whole book to NO (the NO side already probed at its true ask).
+# This pins the semantics that justify passing yes_ask, not live_price (mid).
+# ---------------------------------------------------------------------------
+
+
+def _book(asks):
+    return SimpleNamespace(asks=[SimpleNamespace(price=p, size=s) for p, s in asks])
+
+
+def test_compute_depth_at_mid_is_zero_but_real_at_ask():
+    from src.execution.polymarket_client import _compute_depth
+
+    # bid 0.49 / ask 0.52 → mid 0.505; asks at 0.52 (×100) and 0.55 (×40).
+    book = _book([(0.52, 100.0), (0.55, 40.0)])
+    mid, ask = 0.505, 0.52
+
+    # The bug: probing at the mid finds no qualifying asks → 0.
+    assert _compute_depth(book, mid) == 0.0
+    # The fix: probing at the ask finds the fillable level → real depth.
+    assert _compute_depth(book, ask) == 0.52 * 100.0
+    # Probing higher sweeps deeper levels too.
+    assert _compute_depth(book, 0.55) == 0.52 * 100.0 + 0.55 * 40.0
+
+
+def test_compute_depth_empty_book_is_zero():
+    from src.execution.polymarket_client import _compute_depth
+
+    assert _compute_depth(_book([]), 0.9) == 0.0

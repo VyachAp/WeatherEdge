@@ -399,7 +399,18 @@ async def job_unified_pipeline() -> None:
                             yes_bid, yes_ask = quote
                             live_price = (yes_bid + yes_ask) / 2
                         if live_price:
-                            mkt_depth = get_orderbook_depth(token_ids[0], live_price)
+                            # Probe YES depth at the price we'd actually PAY to
+                            # buy YES — the ask — NOT the mid. `_compute_depth`
+                            # sums asks with `ask_price <= price`; the best ask
+                            # is always above the mid on any positive spread, so
+                            # probing at the mid returns 0 every time, which
+                            # silently depth-vetoed every BUY_YES on both the
+                            # probability path and the EASY-YES lock path (the
+                            # NO side already probes at its true ask, 1-yes_bid,
+                            # so the book skewed all-NO). Mirrors the per-side
+                            # BUY-price rule noted above.
+                            yes_buy_px = yes_ask if yes_ask is not None else live_price
+                            mkt_depth = get_orderbook_depth(token_ids[0], yes_buy_px)
 
                     # Don't persist the live mid back onto the ORM row —
                     # concurrent writers caused cross-transaction deadlocks.
@@ -535,15 +546,18 @@ async def job_unified_pipeline() -> None:
                     # orders and never mutates the Market row — it runs purely
                     # alongside the live probability + lock paths so the
                     # calibration-report can prove (or refute) it OOS before any
-                    # capital is routed to it. Depth_no reuses the YES-side
-                    # depth as a proxy to avoid an extra CLOB call per market
-                    # (slippage rarely binds at shadow stakes). Best-effort.
+                    # capital is routed to it. Pass the true per-side buy depth:
+                    # mkt_depth is now the YES@ask depth (fixed above) and the
+                    # deferred fn gives the NO@(1-bid) depth — so the shadow's
+                    # would_trade liquidity gate matches the live paths' (the
+                    # NO book is cached, so this is at most one extra CLOB call).
+                    # Best-effort.
                     try:
                         from src.signals.shadow_ledger import record_shadow_decision
                         await record_shadow_decision(
                             session, market, state,
                             yes_bid=yes_bid, yes_ask=yes_ask, yes_mid=price,
-                            depth_yes_usd=mkt_depth, depth_no_usd=mkt_depth,
+                            depth_yes_usd=mkt_depth, depth_no_usd=_no_depth_for_market(),
                             minutes_to_close=eval_minutes_to_close,
                             bankroll=bankroll,
                         )
