@@ -173,8 +173,19 @@ def estimate_probability(
     state: WeatherState,
     spec: MarketSpec,
     params: ShadowParams = DEFAULT_PARAMS,
+    *,
+    anchored_max_f: float | None = None,
 ) -> ProbEstimate:
-    """Stage 1: forecast prior + observational update + information advantage."""
+    """Stage 1: forecast prior + observational update + information advantage.
+
+    ``anchored_max_f`` is the observed daily max anchored to *this market's*
+    target local day (computed by the caller via ``lock_rules._market_daily_max``).
+    The monotonic floor must use it rather than ``state.current_max_f``, which is
+    the station's rolling/aggregation-day max and can leak a neighbouring local
+    day's peak into a market whose own day has not peaked yet — that leak forces a
+    spurious ``updated_yes → 1.0``. Falls back to ``state.current_max_f`` only when
+    the caller could not anchor (e.g. the market's day has not started).
+    """
     reasoning: list[str] = []
     p = params
 
@@ -210,8 +221,8 @@ def estimate_probability(
 
     # Hard monotonic floor: the daily max cannot be below the observed max. This
     # is genuine information (the lock path is its certain limit). Truncate the
-    # updated Normal at current_max_f and renormalise the YES mass.
-    cmax = state.current_max_f
+    # updated Normal at the day-anchored observed max and renormalise the YES mass.
+    cmax = anchored_max_f if anchored_max_f is not None else state.current_max_f
     tail = 1.0 - _phi((cmax - mean) / max(updated_sigma, 1e-6))
     if tail > 1e-6:
         yes_above = _yes_prob_truncated(spec, mean, updated_sigma, cmax)
@@ -436,10 +447,15 @@ def evaluate_shadow(
     depth_no_usd: float | None,
     minutes_to_close: float | None,
     bankroll: float,
+    anchored_max_f: float | None = None,
     params: ShadowParams = DEFAULT_PARAMS,
 ) -> ShadowResult:
-    """Run all four stages for one market. Places no orders; returns the decision."""
-    est = estimate_probability(state, spec, params)
+    """Run all four stages for one market. Places no orders; returns the decision.
+
+    ``anchored_max_f`` — observed daily max anchored to this market's target local
+    day; forwarded to the monotonic floor in ``estimate_probability`` (see there).
+    """
+    est = estimate_probability(state, spec, params, anchored_max_f=anchored_max_f)
     base = decide_bet(
         est, yes_bid=yes_bid, yes_ask=yes_ask, yes_mid=yes_mid,
         depth_yes_usd=depth_yes_usd, depth_no_usd=depth_no_usd,

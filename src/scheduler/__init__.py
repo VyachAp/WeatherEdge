@@ -559,7 +559,7 @@ async def job_unified_pipeline() -> None:
                             yes_bid=yes_bid, yes_ask=yes_ask, yes_mid=price,
                             depth_yes_usd=mkt_depth, depth_no_usd=_no_depth_for_market(),
                             minutes_to_close=eval_minutes_to_close,
-                            bankroll=bankroll,
+                            bankroll=bankroll, now_utc=now_utc,
                         )
                     except Exception:  # noqa: BLE001 — shadow must not break live
                         logger.debug("shadow ledger hook failed", exc_info=True)

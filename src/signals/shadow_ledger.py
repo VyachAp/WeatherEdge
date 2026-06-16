@@ -15,10 +15,12 @@ from __future__ import annotations
 
 import logging
 from dataclasses import asdict
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 from src.db.models import ShadowLedger
 from src.execution.binary_market import market_range_f
+from src.signals.lock_rules import _market_daily_max
 from src.signals.shadow_decision import (
     DEFAULT_PARAMS,
     MarketSpec,
@@ -86,6 +88,7 @@ async def record_shadow_decision(
     depth_no_usd: float | None,
     minutes_to_close: float | None,
     bankroll: float,
+    now_utc: datetime | None = None,
     params: ShadowParams = DEFAULT_PARAMS,
 ) -> ShadowResult | None:
     """Run the four-stage shadow model for one market and append a ledger row.
@@ -99,11 +102,22 @@ async def record_shadow_decision(
         if spec is None:
             return None
 
+        # Anchor the monotonic floor to THIS market's target local day, exactly
+        # as the lock path does — ``state.current_max_f`` is the station's
+        # rolling/aggregation-day max and leaks a neighbouring day's peak into a
+        # market whose own day has not peaked yet, spuriously locking YES→1.0.
+        if now_utc is None:
+            now_utc = datetime.now(timezone.utc)
+        anchored_max_f: float | None = None
+        if market.end_date is not None:
+            anchored_max_f, _ = _market_daily_max(state, market.end_date, now_utc)
+
         result = evaluate_shadow(
             state, spec,
             yes_bid=yes_bid, yes_ask=yes_ask, yes_mid=yes_mid,
             depth_yes_usd=depth_yes_usd, depth_no_usd=depth_no_usd,
-            minutes_to_close=minutes_to_close, bankroll=bankroll, params=params,
+            minutes_to_close=minutes_to_close, bankroll=bankroll,
+            anchored_max_f=anchored_max_f, params=params,
         )
 
         side_depth = depth_yes_usd if result.decision.side == "YES" else depth_no_usd

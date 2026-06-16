@@ -89,6 +89,24 @@ def test_monotonic_floor_forces_yes_when_already_locked():
     assert est.updated_yes > 0.99
 
 
+def test_monotonic_floor_uses_anchored_max_not_cross_day_state_max():
+    # Regression: state.current_max_f carries a neighbouring local day's peak
+    # (89.6°F) into a market whose own day is pre-peak (forecast 82°F, threshold
+    # 85°F). Without anchoring, the floor at 89.6 spuriously locks YES→1.0.
+    spec = MarketSpec(operator="at_least", threshold_f=85.0)
+    state = _state(current_max_f=89.6, forecast_peak_f=82.0, hours_until_peak=5.0,
+                   forecast_sigma_f=2.0)
+
+    # Control: the un-anchored path is the bug — it forces YES.
+    leaked = estimate_probability(state, spec)
+    assert leaked.updated_yes > 0.99
+
+    # Fixed: anchored to this market's day max (78°F, below threshold) → no lock.
+    fixed = estimate_probability(state, spec, anchored_max_f=78.0)
+    assert fixed.updated_yes < 0.5
+    assert fixed.info_advantage < leaked.info_advantage
+
+
 # --- stages 2-4: decision + sizing -----------------------------------------
 
 
