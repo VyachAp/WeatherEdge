@@ -351,6 +351,111 @@ async def resolve_trades(session: AsyncSession) -> list[Trade]:
     return resolved
 
 
+# Settlement-time label cap: distinct on-chain payout lookups per run. The
+# first run after deploy drains a backlog (the shadow flow started writing
+# ~06-12); subsequent nightly runs only see the last day's newly-resolved
+# markets, so the cap rarely binds in steady state. Bounds RPC load.
+_LABEL_MAX_CHAIN_CALLS = 600
+_LABEL_LOOKBACK_DAYS = 45
+
+
+async def label_resolved_markets(
+    session: AsyncSession,
+    *,
+    lookback_days: int = _LABEL_LOOKBACK_DAYS,
+    max_chain_calls: int = _LABEL_MAX_CHAIN_CALLS,
+) -> int:
+    """Label the resolved weather markets the SHADOW FLOW evaluated — not just traded ones.
+
+    The shadow-flow promotion gate (``calibration-report``) joins ``ShadowLedger``
+    to ``MarketResolution``, but ``record_market_resolution`` is only called from
+    ``resolve_trades``' OPEN-trade-on-expired-market loop, so labels are starved to
+    the markets the bot actually traded (~0.8% of those the shadow flow evaluated).
+    This settlement-time pass labels any expired, on-chain-resolvable market the
+    shadow flow scored (i.e. present in ``shadow_ledger``) but that is not yet in
+    ``market_resolutions``, using the same authoritative ``payoutNumerators`` source
+    ``resolve_trades`` trusts. Scoping to shadow-evaluated markets targets exactly the
+    gate and bounds the on-chain lookups (~hundreds, not the ~17k micro-bucket markets
+    ``scan_markets`` ingests). UMA-unreported markets return ``None`` from the chain
+    and are skipped (natural grace — picked up a later run). ``routine_metar_max_f`` is
+    left ``None`` here and filled by the ``sweep_stranded_routine_max`` pass that runs
+    right after. Best-effort: never raises, never blocks settlement, places no orders.
+    Returns the number of markets newly labeled. Does not commit — the caller batches it.
+    """
+    from src.db.models import MarketResolution, ShadowLedger
+    from src.signals.mapper import (
+        icao_for_location,
+        icao_timezone,
+        resolve_target_local_day,
+    )
+    from src.signals.market_resolution import record_market_resolution
+
+    try:
+        now = datetime.now(timezone.utc)
+        cutoff = now - timedelta(days=lookback_days)
+
+        labeled_ids = select(MarketResolution.market_id)
+        shadow_ids = select(ShadowLedger.market_id).distinct()
+        markets = (
+            await session.execute(
+                select(Market)
+                .where(
+                    Market.end_date < now,
+                    Market.end_date >= cutoff,
+                    Market.parsed_operator.isnot(None),
+                    Market.condition_id.isnot(None),
+                    Market.id.in_(shadow_ids),
+                    Market.id.notin_(labeled_ids),
+                )
+                .order_by(Market.end_date.desc())
+            )
+        ).scalars().all()
+        if not markets:
+            return 0
+
+        ctf, _funder = await _build_ctf_readonly()
+        if ctf is None:
+            logger.warning(
+                "label_resolved_markets: no CTF handle — skipping label pass "
+                "(%d candidate markets)", len(markets),
+            )
+            return 0
+
+        chain_cache: dict[str, bool | None] = {}
+        calls = 0
+        labeled = 0
+        for market in markets:
+            cid = market.condition_id
+            if cid not in chain_cache:
+                if calls >= max_chain_calls:
+                    break
+                chain_cache[cid] = await _query_payout_outcome(ctf, cid)
+                calls += 1
+            outcome = chain_cache[cid]
+            if outcome is None:
+                continue  # UMA hasn't reported yet — try again next run.
+            icao = (
+                icao_for_location(market.parsed_location)
+                if market.parsed_location else None
+            )
+            # tz is accepted for signature compatibility but the target day is
+            # end_date's UTC date for both hemispheres (mirrors _record_resolution).
+            tz = icao_timezone(icao) if icao else None
+            target = (
+                resolve_target_local_day(market.end_date, tz)
+                if market.end_date else None
+            )
+            await record_market_resolution(
+                session, market, yes_won=outcome,
+                station_icao=icao, target_date_local=target,
+            )
+            labeled += 1
+        return labeled
+    except Exception:
+        logger.warning("label_resolved_markets failed (non-fatal)", exc_info=True)
+        return 0
+
+
 async def _build_ctf_readonly() -> tuple[object | None, str | None]:
     """Build a read-only CTF contract handle + funder address.
 

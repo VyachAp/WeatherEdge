@@ -1158,6 +1158,22 @@ async def job_daily_settlement() -> None:
             except Exception:
                 logger.exception("Station bias recording failed (non-fatal)")
 
+            # 4a-bis. Label EVERY resolved weather market (not just bot-traded
+            # ones) via on-chain payout, so the shadow-flow promotion gate
+            # (calibration-report) isn't starved to the ~0.8% of evaluated
+            # markets the bot happened to trade. Creates MarketResolution rows
+            # with routine_metar_max_f=None; the sweep below fills them. Runs
+            # BEFORE the sweep for exactly that reason. Best-effort.
+            try:
+                from src.resolution import label_resolved_markets
+                newly = await label_resolved_markets(session)
+                if newly:
+                    logger.info(
+                        "M3 label pass: labeled %d untraded resolved markets", newly
+                    )
+            except Exception:
+                logger.warning("M3 label pass failed (non-fatal)", exc_info=True)
+
             # 4b. M3 straggler sweep — backfill routine_metar_max_f for any
             # MarketResolution row the ~36h live-fetch loop above missed
             # (settlement outage, data-starved day, or aged-out live history),

@@ -274,6 +274,20 @@ def test_render_perf_digest_markdown_and_plain():
     assert "\\$" in md or "\\." in md
 
 
+def test_render_perf_digest_since_window_label():
+    # Lever 1: --since windows surface the absolute start in the header so the
+    # operator knows they're reading the live book, not the rolling window.
+    res = _sample_result()
+    res["window_days"] = 18
+    res["since"] = "2026-05-30T00:00:00+00:00"
+    res["window_start"] = "2026-05-30T00:00:00+00:00"
+    out = render_perf_digest(res, markdown=False)
+    assert "since 2026-05-30" in out
+    # Absent `since` → no "since" in the header line.
+    res2 = _sample_result()
+    assert "since" not in render_perf_digest(res2, markdown=False).splitlines()[0]
+
+
 def test_render_perf_digest_no_ready_flags():
     res = _sample_result()
     for g in res["flip_gates"]:

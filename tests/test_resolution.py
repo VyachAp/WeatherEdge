@@ -14,8 +14,83 @@ from src.resolution import (
     get_current_bankroll,
     get_open_trade_value,
     get_unredeemed_won_payout,
+    label_resolved_markets,
     resolve_trades,
 )
+
+
+def _resolvable_market(mid, *, cid, operator="at_least", threshold=70.0,
+                       location="London", days_ago=1):
+    m = MagicMock(spec=Market)
+    m.id = mid
+    m.condition_id = cid
+    m.parsed_operator = operator
+    m.parsed_threshold = threshold
+    m.parsed_location = location
+    m.end_date = datetime.now(timezone.utc) - timedelta(days=days_ago)
+    return m
+
+
+class TestLabelResolvedMarkets:
+    """Lever 2: label EVERY resolved weather market (not just bot-traded ones)."""
+
+    @pytest.mark.asyncio
+    async def test_labels_reported_skips_uma_unreported(self):
+        m_yes = _resolvable_market("1", cid="0xc1")
+        m_pending = _resolvable_market("2", cid="0xc2")
+        exec_result = MagicMock()
+        exec_result.scalars.return_value.all.return_value = [m_yes, m_pending]
+        session = AsyncMock()
+        session.execute.return_value = exec_result
+
+        record = AsyncMock()
+        # c1 reported YES on-chain; c2's UMA hasn't reported (None) → skipped.
+        payout = AsyncMock(side_effect=lambda ctf, cid: True if cid == "0xc1" else None)
+        with patch("src.resolution._build_ctf_readonly",
+                   new=AsyncMock(return_value=(MagicMock(), "0xfunder"))), \
+             patch("src.resolution._query_payout_outcome", new=payout), \
+             patch("src.signals.market_resolution.record_market_resolution", new=record):
+            labeled = await label_resolved_markets(session)
+
+        assert labeled == 1
+        assert record.await_count == 1
+        # the one labeled is the reported market, with yes_won propagated
+        _, kwargs = record.await_args
+        assert kwargs["yes_won"] is True
+
+    @pytest.mark.asyncio
+    async def test_no_ctf_handle_is_noop(self):
+        exec_result = MagicMock()
+        exec_result.scalars.return_value.all.return_value = [
+            _resolvable_market("1", cid="0xc1")
+        ]
+        session = AsyncMock()
+        session.execute.return_value = exec_result
+        record = AsyncMock()
+        with patch("src.resolution._build_ctf_readonly",
+                   new=AsyncMock(return_value=(None, None))), \
+             patch("src.signals.market_resolution.record_market_resolution", new=record):
+            labeled = await label_resolved_markets(session)
+        assert labeled == 0
+        assert record.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_caps_chain_calls(self):
+        markets = [_resolvable_market(str(i), cid=f"0xc{i}") for i in range(5)]
+        exec_result = MagicMock()
+        exec_result.scalars.return_value.all.return_value = markets
+        session = AsyncMock()
+        session.execute.return_value = exec_result
+        payout = AsyncMock(return_value=True)
+        record = AsyncMock()
+        with patch("src.resolution._build_ctf_readonly",
+                   new=AsyncMock(return_value=(MagicMock(), "0xfunder"))), \
+             patch("src.resolution._query_payout_outcome", new=payout), \
+             patch("src.signals.market_resolution.record_market_resolution", new=record):
+            labeled = await label_resolved_markets(session, max_chain_calls=2)
+        # only 2 distinct condition_ids queried → at most 2 labeled
+        assert labeled == 2
+        assert payout.await_count == 2
 
 
 @pytest.fixture

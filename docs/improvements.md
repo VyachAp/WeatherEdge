@@ -675,3 +675,68 @@ make raw probs honest, (2) re-fit calibration on the cleaner data, (3) only then
 consider segmentation if the linear fit still mis-serves the tails. The
 `_detect_calibration_squash` daily diagnostic (job_daily_settlement section 7,
 shipped 2026-06-08) surfaces when this squash is actively gating trades.
+
+---
+
+## [done 2026-06-18] Profitability reframing + measurement foundation (Levers 1 & 2 shipped)
+
+**Why:** A 31-agent read-only diagnostic + independent spot-checks reframed the
+"bot is losing -$101/30d" alarm: ~93-98% of that headline is a **settling legacy
+tail** (`exactly`-NO opened pre-05-30 + `range_undershoot` pre-06-02, both already
+gated). The truly-**live** book (opened ≥06-01, phantom-safe) is **-$21.42/44,
+statistically ~zero**. The kill switches worked. The real blocker on *further*
+profitability is **broken measurement**: (a) reporting steered on a legacy-polluted
+headline; (b) `calibration-report` labels were starved to **8 distinct markets of
+978 evaluated (0.8%)** because `record_market_resolution` only fired for bot-traded
+markets.
+
+**Shipped (measure-before-flip foundation, zero capital risk):**
+- **Lever 1** — `perf-review --since YYYY-MM-DD` (absolute opened-window start).
+  `--since 2026-05-30` reads the live book (-$18/72) vs the rolling -$101/30d.
+  `perf_review_result(since=)`, digest header label, skips artifact write.
+- **Lever 2 (keystone)** — `resolution.label_resolved_markets`, called from
+  `job_daily_settlement` before the straggler sweep: labels every expired,
+  on-chain-resolvable market the shadow flow scored (in `shadow_ledger`, not yet in
+  `market_resolutions`) via on-chain `payoutNumerators`; UMA-unreported → skipped.
+  Scoped to shadow-evaluated (~864 backlog), capped 600 chain calls/run. Validated
+  by a rolled-back live trial (14 labeled / 40 chain calls).
+
+**Phase-2 "closest gated live lever" verdict (read-only, 2026-06-18) — NONE is
+ready to flip; all three are blocked:**
+- **L4 lead-time σ-floor** (`SIGMA_FLOOR_LEAD_TIME_ENABLED`): the σ arm bites only
+  far from peak (`shadow_json.sigma.delta` p50=0, p75=+0.55°F @ lead p75 9.9h), but
+  `evals-report --operator bracket-like` baseline is still **-0.085 EV/$1** (survivors
+  win 61.8%, below break-even). Re-enabling bracket-like-NO would still be -EV, and
+  the live loss tail is at/past-peak threshold-NO where all σ-floor arms are no-ops.
+  Closest in instrumentation, but **not over the line**; stays ship-dark/validate.
+- **L5 conviction-lock** (`LOCK_CONVICTION_SIZING_ENABLED`): EASY-YES threshold locks
+  don't fire — but the cause is **economic, not a bug**: post-fix lock-YES evals reject
+  overwhelmingly on **`price 1.00 outside [0.05,0.95]`** (381 of the rejects). By the
+  time the bot's margin-confirmed EASY-YES lock triggers (`current_max ≥ threshold + 2°F`,
+  ≥3 routines), Polymarket has already priced YES at 1.00 — **no latency edge left**.
+  Conviction-sizing targets an opportunity set that doesn't exist at tradeable prices;
+  flipping it fires ~0×. (`above` markets are also vanishingly rare in the universe: 42
+  vs 24,690 `exactly`.)
+- **L6 depth-cap**: throttled volume is majority **YES** post-fix (56 YES / 29 NO in
+  `stake_below_min`), not 73% NO (that figure was a pre-fix-window artifact). Binding
+  size_reason is "below $5 minimum" (72/85) on a small/exposure-saturated bankroll. A
+  targeted relaxation is *less* dangerous than the synthesis thought (recoverable side
+  is no longer the -EV NO book) — but still gated on proving the post-fix YES EV first
+  (n=4 fills today is far too thin).
+
+**CORRECTION to the earlier "all-NO book is the deeper root" framing — it was a stale
+90d-window artifact.** The all-NO DIRECTION skew was the 06-14 depth-probed-at-mid bug
+([[project_yes_depth_mid_bug_2026-06-14]]), and it is **already fixed**: pre-fix, BUY_YES
+passed **0 of 362,906** probability evals (100% vetoed); post-fix BUY_YES passes *more
+than* BUY_NO (prob 94 vs 34; lock 18 vs 4) and is the **majority of fills** (4 YES / 2 NO).
+The 90d lock counts (0 EASY-YES) were dominated by pre-fix history. So direction is solved.
+
+**Actual current state + real next investigation:** the book is now (a) **direction-fixed**,
+(b) **capital-throttled** (`stake_below_min` "below $5 minimum" on a $300-456 exposure-
+saturated bankroll), (c) **EV-unproven post-fix** (only 6 fills in 4d, net -$16.64, 3W/3L).
+The binding question is no longer "why all NO" but **"do we have any edge on the markets we
+CAN trade (price ∈ [0.05,0.95])?"** — the easy near-lock edge is priced away (point 5 above),
+so the bot's remaining edge lives in the mid-confidence band where it has historically been
+overconfident. The L2 label decoupling (8 → ~100+/day) is exactly what's needed to answer
+this from `calibration-report`/`resolution-report` once a settlement cycle runs. **Do not**
+flip L4/L5/L6 or force volume until the post-fix EV is proven on real labels.

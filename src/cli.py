@@ -5651,15 +5651,25 @@ def epochs(limit: int) -> None:
 # --- perf-review: automated daily / 3d / 7d evaluation orchestrator -------
 
 
-async def perf_review_result(session, days: int, *, prior_window: bool = True) -> dict:
+async def perf_review_result(
+    session, days: int, *, prior_window: bool = True, since: "datetime | None" = None,
+) -> dict:
     """Assemble one window's performance digest as a JSON-serialisable dict.
 
     The only DB-touching part of Layer 1: batch-reads Trade (current + prior
     window), DecisionLog, EvaluationLog (+shadow_json), MarketResolution,
     ExposureSnapshot and the latest 2 ConfigEpochs, then composes the pure
-    aggregators above. Returns ``{window_days, generated_at, pnl, regression,
-    throttle, loss_classes, exposure, epoch, flip_gates, anomalies}``. Used by
-    the ``perf-review`` command and the scheduler ``job_perf_review``.
+    aggregators above. Returns ``{window_days, window_start, generated_at, pnl,
+    regression, throttle, loss_classes, exposure, epoch, flip_gates, anomalies}``.
+    Used by the ``perf-review`` command and the scheduler ``job_perf_review``.
+
+    Windowing is on ``Trade.opened_at`` (not resolved date), so the figure is
+    "how did the bets we PLACED in this window do". ``since`` overrides the
+    rolling ``days`` window with an **absolute** start — use it to read the live
+    book from a kill-switch flip date (e.g. ``2026-05-30``), excluding the
+    legacy losers opened before it that a rolling 30d window still straddles;
+    the prior comparison window then becomes the equal-length span immediately
+    before ``since`` (post-flip vs pre-flip, an honest regression read).
     """
     from sqlalchemy import select
 
@@ -5673,8 +5683,16 @@ async def perf_review_result(session, days: int, *, prior_window: bool = True) -
     from src.signals.config_epoch import current_flags
 
     now = datetime.now(timezone.utc)
-    start = now - timedelta(days=days)
-    prev_start = now - timedelta(days=2 * days)
+    if since is not None:
+        if since.tzinfo is None:
+            since = since.replace(tzinfo=timezone.utc)
+        start = since
+        window = now - since
+        prev_start = start - window
+        days = max(1, int(window.total_seconds() // 86400))
+    else:
+        start = now - timedelta(days=days)
+        prev_start = now - timedelta(days=2 * days)
 
     # --- Trades (current + prior window) joined to Signal for kind/branch.
     trade_rows = (
@@ -5896,6 +5914,8 @@ async def perf_review_result(session, days: int, *, prior_window: bool = True) -
 
     return {
         "window_days": days,
+        "window_start": start.isoformat(),
+        "since": since.isoformat() if since is not None else None,
         "generated_at": now.isoformat(),
         "pnl": pnl,
         "regression": regression,
@@ -5931,7 +5951,11 @@ def render_perf_digest(result: dict, *, markdown: bool = True) -> str:
     L: list[str] = []
 
     pnl = result.get("pnl") or {}
-    L.append(f"\U0001f4ca {bold('Perf review')} — {e(str(result.get('window_days'))+'d')}")
+    _since = result.get("since")
+    _win = str(result.get("window_days")) + "d"
+    if _since:
+        _win += " since " + str(_since)[:10]
+    L.append(f"\U0001f4ca {bold('Perf review')} — {e(_win)}")
     wp = f"{pnl['win_pct']*100:.0f}%" if pnl.get("win_pct") is not None else "n/a"
     ev = f"{pnl['ev_per_usd']:+.3f}" if pnl.get("ev_per_usd") is not None else "n/a"
     pnl_s = f"${pnl.get('pnl', 0.0):+,.2f}"
@@ -6042,12 +6066,17 @@ async def _push_one(text: str, *, markdown: bool = True) -> bool:
 
 @main.command("perf-review")
 @click.option("--days", default=7, show_default=True, help="Window length in days.")
+@click.option("--since", "since_str", default=None,
+              help="Absolute opened-window start (YYYY-MM-DD), overrides --days. "
+                   "Use a kill-switch flip date to read the live book without "
+                   "legacy losers (e.g. --since 2026-05-30).")
 @click.option("--json", "as_json", is_flag=True, help="Emit the raw result dict as JSON.")
 @click.option("--push/--no-push", default=False, show_default=True,
               help="Push the digest to Telegram.")
 @click.option("--write-artifact/--no-write-artifact", default=True, show_default=True,
               help="Persist the bot_state row + runtime JSON for the Layer-2 analyst.")
-def perf_review(days: int, as_json: bool, push: bool, write_artifact: bool) -> None:
+def perf_review(days: int, since_str: str | None, as_json: bool, push: bool,
+                write_artifact: bool) -> None:
     """Automated performance digest over a daily / 3-day / 7-day window.
 
     Layer 1 of the auto-evaluation loop: PnL (phantom-LOST-safe), throughput
@@ -6055,15 +6084,24 @@ def perf_review(days: int, as_json: bool, push: bool, write_artifact: bool) -> N
     regression vs the prior equal window, and a per-dark-flag flip-gate
     readiness verdict. Pushes to Telegram and/or persists a JSON artifact the
     Layer-2 analyst reads. Propose-only — it never changes config.
+
+    Windows on ``opened_at``. Pass ``--since YYYY-MM-DD`` to read the live book
+    from an absolute date (e.g. a kill-switch flip) so a rolling window doesn't
+    blend in legacy losers opened before it; the regression then compares the
+    post-date span vs the equal span before it.
     """
     import json as _json
 
     from src.db.engine import async_session
 
+    since = None
+    if since_str:
+        since = datetime.strptime(since_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+
     async def _run() -> None:
         async with async_session() as session:
-            result = await perf_review_result(session, days)
-            if write_artifact:
+            result = await perf_review_result(session, days, since=since)
+            if write_artifact and since is None:
                 await _persist_perf_artifact(session, days, result)
                 await session.commit()
         if as_json:
