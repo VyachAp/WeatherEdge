@@ -740,3 +740,41 @@ so the bot's remaining edge lives in the mid-confidence band where it has histor
 overconfident. The L2 label decoupling (8 → ~100+/day) is exactly what's needed to answer
 this from `calibration-report`/`resolution-report` once a settlement cycle runs. **Do not**
 flip L4/L5/L6 or force volume until the post-fix EV is proven on real labels.
+
+---
+
+## [done 2026-06-18] Latency/peak-ordering investigation + fast-poll depth-bug fix
+
+**Why:** Hypothesis — the bot wastes its perishable near-peak edge because station processing
+isn't prioritised/fast for cities near peak (the price-1.00 EASY-YES rejections).
+
+**Findings (2 Explore agents + live data):** directionally true but a **small, bounded** lever.
+Both loops iterate cities in uncontrolled dict-insertion order (no peak priority). BUT prices are
+live (`get_best_bid_ask` → 30s `_fetch_orderbook` cache, NOT 5-15m stale — the agent's "stale"
+claim was wrong, conflated with the 15m `current_yes_price` scan), and the market is genuinely fast:
+**~92% of EASY-YES signals (381/~410) are already at price 1.00** when the bot looks; only ~8% sit
+in a capturable [0.85,0.95] window. The deeper near-peak issue is overconfidence, not speed.
+
+**Shipped (the one safe, justified latency fix):** `job_fast_lock_poll` had the **unfixed twin of
+the 06-14 depth-at-mid bug** — probed YES depth at `(yes_bid+yes_ask)/2` (the mid) → understated
+depth vetoed near-certain EASY-YES locks. Now probes at `yes_ask` (`src/scheduler/__init__.py`
+~1641); NO-side re-probes its own ask in `try_lock_rule_trade`. Test
+`test_fast_poll_yes_depth_probes_ask_not_mid`. Unlocks the ~8% capturable EASY-YES locks.
+
+**Edge-quality pivot — diagnosis dissolved the "near-peak overconfidence" concern:**
+- **Live-engine un-anchored `current_max_f` (shadow-fix twin) is CONFIRMED but INERT.** 2,132
+  strong-leak evals (pre-peak `htp>2` yet `current_max_f ≥ forecast_peak+2°F`, e.g. htp=14h cmax=93
+  fpeak=85 — yesterday's max leaking), but **0 of 2,132 passed** (all rejected by the lead-time gate
+  far from peak). A real correctness bug (same pattern as the 06-16 shadow fix, `compute_distribution`
+  uses `state.current_max_f` not a per-market `_market_daily_max`) with **zero trading impact** —
+  hygiene only; NOT worth touching the live engine for 0 EV. Fix later behind backtest-v2 if at all.
+- **The near-peak "overconfidence" was a legacy-bracket-like artifact.** Near-peak (`|htp|≤1`) PASSING
+  probability evals are **100% threshold** (at_least 461, at_most 108) — **zero** single-bucket/bracket.
+  Threshold is the **+EV** class (+$23.54/61 realised, 30d). So the live near-peak book has no
+  overconfidence leak; the −EV was the now-killed bracket-like tail contaminating the aggregate median
+  (model 0.38-0.53 vs market 0.18 was computed across all evals incl. legacy).
+
+**Conclusion:** the live edge quality is OK (threshold-dominated, +EV). The σ-floor/calibration levers
+target the already-killed bracket-like class, not the live book. The binding constraint remains
+**capital-throttled low volume** (the profitability reframing), not latency or edge quality. No further
+latency/edge-quality build is justified by the data; let post-fix EV + L2 labels accrue.

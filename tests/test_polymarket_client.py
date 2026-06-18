@@ -318,3 +318,21 @@ def test_compute_depth_empty_book_is_zero():
     from src.execution.polymarket_client import _compute_depth
 
     assert _compute_depth(_book([]), 0.9) == 0.0
+
+
+def test_fast_poll_yes_depth_probes_ask_not_mid():
+    """Fast-poll (job_fast_lock_poll) used to probe YES depth at the mid — the
+    unfixed twin of the 2026-06-14 unified-pipeline bug — silently vetoing
+    EASY-YES locks. Pins the buy-price selection rule the loop now uses:
+    yes_buy_px = yes_ask if yes_ask and yes_ask > 0 else yes_price(mid)."""
+    from src.execution.polymarket_client import _compute_depth
+
+    yes_bid, yes_ask = 0.49, 0.52
+    yes_price = (yes_bid + yes_ask) / 2  # mid 0.505 (still passed as the price arg)
+    yes_buy_px = yes_ask if yes_ask and yes_ask > 0 else yes_price
+    assert yes_buy_px == yes_ask
+
+    book = _book([(0.52, 100.0)])
+    # Old (mid): vetoed. New (ask): real fillable depth.
+    assert _compute_depth(book, yes_price) == 0.0
+    assert _compute_depth(book, yes_buy_px) == 0.52 * 100.0

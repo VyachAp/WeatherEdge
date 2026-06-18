@@ -1638,7 +1638,16 @@ async def job_fast_lock_poll() -> None:
                     yes_bid, yes_ask = quote
                     yes_price = (yes_bid + yes_ask) / 2
 
-                    yes_depth = get_orderbook_depth(token_ids[0], yes_price) if yes_price > 0 else 0.0
+                    # Probe YES depth at the BUY price (the ask), NOT the mid.
+                    # `_compute_depth` sums asks <= price, so probing at the mid
+                    # returns 0 on any positive spread and silently vetoes
+                    # EASY-YES locks — the twin of the unified pipeline's
+                    # depth-at-mid bug fixed 2026-06-14. NO-side locks re-probe
+                    # their own ask inside try_lock_rule_trade, so only the YES
+                    # probe needs this. INVARIANT: depth probes use the buy
+                    # price, never the mid.
+                    yes_buy_px = yes_ask if yes_ask and yes_ask > 0 else yes_price
+                    yes_depth = get_orderbook_depth(token_ids[0], yes_buy_px) if yes_buy_px > 0 else 0.0
                     end_time = market.end_date or now_utc + timedelta(hours=24)
 
                     stake = await _try_lock_rule_trade(
