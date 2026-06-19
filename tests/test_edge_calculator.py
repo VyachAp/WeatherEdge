@@ -312,6 +312,57 @@ class TestCheckFiltersThresholdOverrides:
         assert a is not None and "probability" in a
 
 
+class TestCheckFiltersMinEntryPriceOverride:
+    """`_check_filters` accepts a `min_entry_price` override so the probability
+    path can concentrate on the near-lock band (PROBABILITY_MIN_ENTRY_PRICE)
+    while the lock path keeps the global low floor and can buy cheap-but-certain
+    contracts. None default reproduces the global MIN_ENTRY_PRICE."""
+
+    def test_override_rejects_below_scoped_floor(self):
+        from src.signals.edge_calculator import _check_filters
+
+        # A side priced 0.70 passes the global 0.40 floor but is rejected by a
+        # 0.80 override — the probability-path concentration.
+        assert _check_filters(
+            edge=0.2, prob=0.95, price=0.70,
+            routine_count=5, minutes_to_close=120, depth=100.0,
+        ) is None  # global 0.40 floor admits 0.70
+        reason = _check_filters(
+            edge=0.2, prob=0.95, price=0.70,
+            routine_count=5, minutes_to_close=120, depth=100.0,
+            min_entry_price=0.80,
+        )
+        assert reason is not None and "price" in reason
+
+    def test_lock_path_keeps_cheap_bets(self):
+        from src.signals.edge_calculator import _check_filters
+
+        # The lock path passes no override → cheap-but-certain bet at 0.50 is
+        # still allowed even though the probability path floor would be 0.80.
+        assert _check_filters(
+            edge=0.4, prob=0.99, price=0.50,
+            routine_count=5, minutes_to_close=120, depth=100.0,
+            min_entry_price=None,
+        ) is None
+
+    def test_none_defaults_reproduce_global(self):
+        from src.signals.edge_calculator import _check_filters
+        from src.config import settings
+
+        price = settings.MIN_ENTRY_PRICE - 0.05
+        a = _check_filters(
+            edge=0.5, prob=0.99, price=price,
+            routine_count=5, minutes_to_close=120, depth=100.0,
+        )
+        b = _check_filters(
+            edge=0.5, prob=0.99, price=price,
+            routine_count=5, minutes_to_close=120, depth=100.0,
+            min_entry_price=None,
+        )
+        assert a == b
+        assert a is not None and "price" in a
+
+
 class TestBinaryMarketEdgeThresholdFloors:
     """`binary_market_edge` applies THRESHOLD_MIN_* to threshold ops ONLY.
     Bracket-like ops keep the strict global floors (and their NO guards)."""

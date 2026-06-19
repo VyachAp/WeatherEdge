@@ -86,6 +86,14 @@ class Settings(BaseSettings):
     MIN_PROBABILITY: float = 0.85
     MIN_ENTRY_PRICE: float = 0.40
     MAX_ENTRY_PRICE: float = 0.97
+    # Probability-path-only entry-price floor (None = use the global
+    # MIN_ENTRY_PRICE). Realized June book splits sharply by the price of the
+    # side bought: everything < ~0.80 lost (−$42 / 26 trades), the 0.80–1.00
+    # near-lock band won 94% (+$17 / 18). Setting this to 0.80 concentrates the
+    # probability path on the band where it demonstrably wins. Scoped so the
+    # LOCK path keeps firing cheap-but-certain bets (it has its own
+    # LOCK_RULE_MIN_PRICE gate and never wants a high floor). None = no change.
+    PROBABILITY_MIN_ENTRY_PRICE: float | None = None
     # Operator-aware overrides for the two filters that were globally
     # tightened during the 2026-05-08 bracket-overconfidence crisis
     # (MIN_PROBABILITY 0.50→0.85, MIN_EDGE→0.10). Threshold markets

@@ -233,6 +233,7 @@ def binary_market_edge(
         depth=side_depth,
         min_edge=settings.THRESHOLD_MIN_EDGE if is_threshold else None,
         min_probability=settings.THRESHOLD_MIN_PROBABILITY if is_threshold else None,
+        min_entry_price=settings.PROBABILITY_MIN_ENTRY_PRICE,
     )
 
     # Layer 1 — bracket-like (exactly/range/bracket) max-lead gate, measured
@@ -377,6 +378,7 @@ def _check_filters(
     min_routine_count: int | None = None,
     min_edge: float | None = None,
     min_probability: float | None = None,
+    min_entry_price: float | None = None,
 ) -> str | None:
     """Return rejection reason or None if all filters pass.
 
@@ -396,10 +398,18 @@ def _check_filters(
     class (``binary_market_edge`` passes the threshold-only
     ``THRESHOLD_MIN_*`` overrides). ``None`` = use the global setting, so
     legacy callers (lock path) are unchanged.
+
+    ``min_entry_price`` overrides ``settings.MIN_ENTRY_PRICE`` so the
+    probability path can concentrate on the near-lock band
+    (``PROBABILITY_MIN_ENTRY_PRICE``) without raising the floor on the lock
+    path, which legitimately wants cheap-but-certain bets. ``None`` = global.
     """
     eff_min_edge = settings.MIN_EDGE if min_edge is None else min_edge
     eff_min_prob = (
         settings.MIN_PROBABILITY if min_probability is None else min_probability
+    )
+    eff_min_entry_price = (
+        settings.MIN_ENTRY_PRICE if min_entry_price is None else min_entry_price
     )
 
     if edge < eff_min_edge:
@@ -408,8 +418,8 @@ def _check_filters(
     if prob < eff_min_prob:
         return f"probability {prob:.4f} < {eff_min_prob}"
 
-    if price < settings.MIN_ENTRY_PRICE:
-        return f"price {price:.2f} < {settings.MIN_ENTRY_PRICE}"
+    if price < eff_min_entry_price:
+        return f"price {price:.2f} < {eff_min_entry_price}"
 
     if price > settings.MAX_ENTRY_PRICE:
         return f"price {price:.2f} > {settings.MAX_ENTRY_PRICE}"

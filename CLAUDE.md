@@ -230,6 +230,8 @@ All filters must pass:
 
 **Operator-aware edge/probability floors.** `_check_filters` takes optional `min_edge` / `min_probability` overrides (same pattern as `min_routine_count`). `binary_market_edge` passes `settings.THRESHOLD_MIN_EDGE` / `THRESHOLD_MIN_PROBABILITY` for **threshold ops only** (`above`/`at_least`/`below`/`at_most`); bracket-like ops keep the strict global floors + the three single-bucket NO guards. Both Settings default `None` (= use global, no behavior change). Rationale: the global `MIN_PROBABILITY=0.85` was tightened for the bracket crisis, but threshold markets were never the problem (telemetry shows the `prob∈[0.78,0.85)` threshold band is profitable). The lock path stays on the global floors.
 
+**Probability-path entry-price floor.** `_check_filters` also takes a `min_entry_price` override (same `None`=global pattern). `binary_market_edge` passes `settings.PROBABILITY_MIN_ENTRY_PRICE`; the lock executor passes nothing → keeps the global `MIN_ENTRY_PRICE` (and its own `LOCK_RULE_MIN_PRICE=0.05`). Rationale (2026-06-19): the realized June book split sharply by the **price of the side bought** — everything < ~0.80 lost (−$42 / 26 trades), the 0.80–1.00 near-lock band won 94% (+$17 / 18), and `calibration-report` showed the probability model does NOT beat market in any obs-fraction bucket (the edge is the price band, not the model). Setting `PROBABILITY_MIN_ENTRY_PRICE=0.80` concentrates the probability path on the near-lock band while the lock path keeps firing cheap-but-certain bets (where a low price is *good*).
+
 ### Binary vs bracket markets
 
 `_is_binary_market(market)` returns True when `parsed_threshold` and `parsed_operator` are set and operator != "bracket".
@@ -319,6 +321,7 @@ Per-city routine-count and bias-runaway checks live in the aggregator and edge f
 All knobs in `src/config.py` (Pydantic `Settings`, overridable via `.env`):
 
 - `MIN_EDGE` (0.05), `MIN_PROBABILITY` (0.85), `MIN_ENTRY_PRICE`, `MAX_ENTRY_PRICE`
+- `PROBABILITY_MIN_ENTRY_PRICE` (None) — probability-path-only entry-price floor (lock path keeps the global). `None`=use `MIN_ENTRY_PRICE`. Live `.env`=0.80 (2026-06-19): concentrate the probability path on the near-lock 0.80–1.00 band (94% realized win) and cut the < 0.80 mid/deep-value bleed (−$42/26). The model doesn't beat market (calibration-report) — the realized edge is the price band
 - `MIN_DEPTH_USD`, `MIN_ROUTINE_COUNT`, `MARKET_CLOSE_BUFFER_MINUTES`
 - Kelly caps: `KELLY_FRACTION`, `MAX_POSITION_PCT`, `MAX_POSITION_USD`, `DEPTH_POSITION_CAP_PCT`
 - `CLUSTER_STAKE_CAP_USD` (100) — total stake cap across same-day same-city bracket/exactly cluster. Outcomes are anti-correlated (only one bucket wins) so independent Kelly sizing per bucket over-allocates. Applied in probability path AND `_try_lock_rule_trade`. Set 0.0 to disable
