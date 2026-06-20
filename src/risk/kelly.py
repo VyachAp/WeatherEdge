@@ -70,6 +70,7 @@ def size_position(
     max_position_usd: float | None = None,
     orderbook_depth: float | None = None,
     floor_to_usd: float | None = None,
+    prob_cap: float | None = None,
 ) -> PositionSize:
     """Compute stake using fractional Kelly criterion with hard caps.
 
@@ -97,6 +98,13 @@ def size_position(
         ``MIN_TRADE_USD`` (e.g. a thin book) the trade still drops. ``None``
         preserves the original drop-on-sub-min behavior. Caller gates this on
         the near-peak / high-confidence threshold class.
+    prob_cap:
+        Overrides ``settings.KELLY_PROB_CAP`` — the clamp applied to
+        ``model_prob`` before computing edge. ``None`` uses the global cap.
+        Callers pass a higher value (``NEAR_LOCK_CONVICTION_PROB_CAP``) for a
+        physically near-locked threshold bet so a buy above the 0.90 global cap
+        isn't sized to $0 ("no edge"). Sizing-only; the recorded prob is
+        untouched, and the full cap cascade below still bounds the stake.
     """
     if kelly_fraction is None:
         kelly_fraction = settings.KELLY_FRACTION
@@ -110,7 +118,8 @@ def size_position(
     # halves Kelly there without affecting well-calibrated bins.
     # The recorded `model_prob` on the Signal/EvaluationLog rows is
     # untouched — this is sizing-only.
-    effective_prob = min(model_prob, settings.KELLY_PROB_CAP)
+    effective_cap = settings.KELLY_PROB_CAP if prob_cap is None else prob_cap
+    effective_prob = min(model_prob, effective_cap)
     payout = 1.0 / market_prob
     edge = effective_prob * payout - 1.0
 

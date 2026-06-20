@@ -214,3 +214,41 @@ def near_peak_floor_eligible(
         and abs(hours_until_peak) <= settings.NEAR_PEAK_FLOOR_UP_MAX_HOURS
     )
     return high_conf or near_peak
+
+
+def near_lock_conviction_eligible(
+    market,
+    *,
+    our_probability: float,
+    hours_until_peak: float | None,
+) -> bool:
+    """True if a passing edge may bypass ``KELLY_PROB_CAP`` (conviction sizing).
+
+    Gates ``NEAR_LOCK_CONVICTION_SIZING_ENABLED``. Restricted to **threshold**
+    ops (bracket-like excluded — its single-bucket NO class is a historical
+    loser and must not be sized up). The bet must be *physically* near-locked,
+    not merely forecast-confident:
+
+    - recorded prob ≥ ``NEAR_LOCK_CONVICTION_MIN_PROB`` (≈ certain — the
+      monotonicity constraint has collapsed it because the observed max already
+      satisfies the threshold), AND
+    - **at/past peak** (``hours_until_peak ≤ NEAR_LOCK_CONVICTION_MAX_HOURS``,
+      default 0) so the daily max is OBSERVED, not forecast. This is the safe
+      subset the global 0.90 cap over-tames: the 2026-05-16 audit that motivated
+      the cap saw ``prob≈1.0`` bins win only 78%, but that pool included
+      far-from-peak forecast-driven certainty. Past peak the max can no longer
+      change, so a monotonicity-locked threshold bet is genuinely near-certain
+      — the same physics as the EASY-YES lock, just inside the 2°F margin.
+    """
+    from src.config import settings
+
+    if not settings.NEAR_LOCK_CONVICTION_SIZING_ENABLED:
+        return False
+    if is_bracket_like(market):
+        return False
+    if our_probability < settings.NEAR_LOCK_CONVICTION_MIN_PROB:
+        return False
+    return (
+        hours_until_peak is not None
+        and hours_until_peak <= settings.NEAR_LOCK_CONVICTION_MAX_HOURS
+    )

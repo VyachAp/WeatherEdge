@@ -27,6 +27,7 @@ from src.execution.binary_market import (
     make_binary_buckets as _make_binary_buckets,
     market_range_f,
     market_unit as _market_unit,
+    near_lock_conviction_eligible as _near_lock_conviction_eligible,
     near_peak_floor_eligible as _near_peak_floor_eligible,
     should_skip_future_day as _should_skip_future_day,
 )
@@ -642,6 +643,16 @@ async def job_unified_pipeline() -> None:
                             )
                             else None
                         )
+                        # Near-lock conviction: a physically-locked threshold bet
+                        # (prob ≈ 1.0, past peak) bypasses KELLY_PROB_CAP so a buy
+                        # in the near-lock band (0.90–0.97) isn't sized to $0
+                        # ("no edge"). Gated off by default; the cap cascade still
+                        # bounds the stake.
+                        conviction = _near_lock_conviction_eligible(
+                            market,
+                            our_probability=edge.our_probability,
+                            hours_until_peak=state.hours_until_peak,
+                        )
                         pos = size_position(
                             bankroll=bankroll,
                             model_prob=edge.our_probability,
@@ -650,6 +661,11 @@ async def job_unified_pipeline() -> None:
                             max_position_usd=settings.MAX_POSITION_USD,
                             orderbook_depth=side_depth or None,
                             floor_to_usd=floor_to_usd,
+                            prob_cap=(
+                                settings.NEAR_LOCK_CONVICTION_PROB_CAP
+                                if conviction
+                                else None
+                            ),
                         )
                         floored_up = (pos.reason or "").startswith("floored")
 
@@ -693,6 +709,7 @@ async def job_unified_pipeline() -> None:
                                     "size_reason": pos.reason,
                                     "kelly_pct": pos.kelly_pct,
                                     "depth_usd": side_depth,
+                                    "conviction": conviction,
                                 },
                             )
                             continue
@@ -840,6 +857,7 @@ async def job_unified_pipeline() -> None:
                                     "edge": edge.edge,
                                     "is_dry_run": True,
                                     "floored_up": floored_up,
+                                    "conviction": conviction,
                                 },
                             )
                         elif order_ok and (trade.stake_usd or 0.0) > 0:
@@ -871,6 +889,7 @@ async def job_unified_pipeline() -> None:
                                     "edge": edge.edge,
                                     "fill_price": fill,
                                     "floored_up": floored_up,
+                                    "conviction": conviction,
                                 },
                             )
                         elif order_ok:

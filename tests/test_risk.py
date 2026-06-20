@@ -7,7 +7,10 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from src.config import settings
-from src.execution.binary_market import near_peak_floor_eligible
+from src.execution.binary_market import (
+    near_lock_conviction_eligible,
+    near_peak_floor_eligible,
+)
 from src.risk.drawdown import (
     CAUTION_THRESHOLD,
     PAUSE_THRESHOLD,
@@ -46,6 +49,31 @@ class TestSizePosition:
         assert pos.kelly_pct == 0
         assert not pos.capped
         assert "no edge" in pos.reason
+
+    def test_near_lock_blocked_by_default_prob_cap(self, monkeypatch):
+        """A certain bet bought at 0.95 sizes to $0 under the global 0.90 cap —
+        the near-lock band the 0.80 floor admits but Kelly forbids."""
+        monkeypatch.setattr(settings, "KELLY_PROB_CAP", 0.90)
+        pos = size_position(1000, model_prob=1.0, market_prob=0.95)
+        assert pos.stake_usd == 0
+        assert "no edge" in pos.reason
+
+    def test_prob_cap_override_unlocks_near_lock_bet(self, monkeypatch):
+        """Passing a higher prob_cap (conviction sizing) turns the same bet into
+        a positive stake — the buy at 0.95 now has positive Kelly edge."""
+        monkeypatch.setattr(settings, "KELLY_PROB_CAP", 0.90)
+        pos = size_position(1000, model_prob=1.0, market_prob=0.95, prob_cap=0.99)
+        assert pos.stake_usd > 0
+        # Still bounded by the per-trade cap (5% of bankroll under the test
+        # default), proving the cascade still applies.
+        assert pos.stake_usd <= 1000 * settings.MAX_POSITION_PCT + 0.01
+
+    def test_prob_cap_none_reproduces_global(self, monkeypatch):
+        """prob_cap=None == omitted == settings.KELLY_PROB_CAP."""
+        monkeypatch.setattr(settings, "KELLY_PROB_CAP", 0.90)
+        a = size_position(1000, model_prob=1.0, market_prob=0.95)
+        b = size_position(1000, model_prob=1.0, market_prob=0.95, prob_cap=None)
+        assert a.stake_usd == b.stake_usd == 0
 
     def test_per_trade_cap(self):
         """Huge edge gets clamped to 5% of bankroll."""
@@ -370,6 +398,49 @@ class TestNearPeakFloorEligible:
         monkeypatch.setattr(settings, "NEAR_PEAK_FLOOR_UP_ENABLED", True)
         assert not near_peak_floor_eligible(
             self._market("at_least"), our_probability=0.88, hours_until_peak=6.0
+        )
+
+
+class TestNearLockConvictionEligible:
+    @staticmethod
+    def _market(op: str):
+        m = MagicMock()
+        m.parsed_operator = op
+        return m
+
+    def test_disabled_by_default(self):
+        """Master switch off (default) → never eligible."""
+        assert not near_lock_conviction_eligible(
+            self._market("at_least"), our_probability=1.0, hours_until_peak=0.0
+        )
+
+    def test_eligible_at_peak_certain_threshold(self, monkeypatch):
+        """The blocked archetype: at_least, prob 1.0, at peak → eligible."""
+        monkeypatch.setattr(settings, "NEAR_LOCK_CONVICTION_SIZING_ENABLED", True)
+        assert near_lock_conviction_eligible(
+            self._market("at_least"), our_probability=1.0, hours_until_peak=0.0
+        )
+
+    def test_excludes_bracket_like(self, monkeypatch):
+        """exactly/range/bracket must never bypass the prob cap."""
+        monkeypatch.setattr(settings, "NEAR_LOCK_CONVICTION_SIZING_ENABLED", True)
+        assert not near_lock_conviction_eligible(
+            self._market("exactly"), our_probability=1.0, hours_until_peak=0.0
+        )
+
+    def test_rejects_pre_peak(self, monkeypatch):
+        """Before peak the max is forecast not observed → not eligible (the
+        safe-subset guard against the prob≈1.0/78%-win overconfidence)."""
+        monkeypatch.setattr(settings, "NEAR_LOCK_CONVICTION_SIZING_ENABLED", True)
+        assert not near_lock_conviction_eligible(
+            self._market("at_least"), our_probability=1.0, hours_until_peak=2.0
+        )
+
+    def test_rejects_sub_certain_prob(self, monkeypatch):
+        """Not physically locked (prob < MIN_PROB) → not eligible."""
+        monkeypatch.setattr(settings, "NEAR_LOCK_CONVICTION_SIZING_ENABLED", True)
+        assert not near_lock_conviction_eligible(
+            self._market("at_least"), our_probability=0.95, hours_until_peak=0.0
         )
 
     def test_past_peak_uses_abs_window(self, monkeypatch):
