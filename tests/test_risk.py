@@ -402,45 +402,88 @@ class TestNearPeakFloorEligible:
 
 
 class TestNearLockConvictionEligible:
+    """Rebuilt 2026-06-21: conviction sizing fires ONLY on a genuine observational
+    monotonic lock — has_forecast AND the target-day-anchored observed max already
+    clears the threshold by NEAR_LOCK_CONVICTION_MARGIN_F, in the betting-hot
+    direction. The original prob/hours proxy fired 96% on degenerate forecast-failed
+    states and amplified the σ-collapse NO direction (Seoul/Taipei)."""
+
     @staticmethod
-    def _market(op: str):
+    def _market(op: str, thr: float = 80.0):
         m = MagicMock()
         m.parsed_operator = op
+        m.parsed_threshold = thr
         return m
 
     def test_disabled_by_default(self):
         """Master switch off (default) → never eligible."""
         assert not near_lock_conviction_eligible(
-            self._market("at_least"), our_probability=1.0, hours_until_peak=0.0
+            self._market("at_least"), direction="BUY_YES",
+            anchored_max_f=90.0, has_forecast=True,
         )
 
-    def test_eligible_at_peak_certain_threshold(self, monkeypatch):
-        """The blocked archetype: at_least, prob 1.0, at peak → eligible."""
+    def test_eligible_yes_at_least_locked_by_margin(self, monkeypatch):
+        """YES on at_least with observed max already ≥ threshold+margin → eligible
+        (the genuine 'already hot, betting hot' lock)."""
         monkeypatch.setattr(settings, "NEAR_LOCK_CONVICTION_SIZING_ENABLED", True)
+        monkeypatch.setattr(settings, "NEAR_LOCK_CONVICTION_MARGIN_F", 2.0)
         assert near_lock_conviction_eligible(
-            self._market("at_least"), our_probability=1.0, hours_until_peak=0.0
+            self._market("at_least", thr=80.0), direction="BUY_YES",
+            anchored_max_f=83.0, has_forecast=True,
+        )
+
+    def test_eligible_no_at_most_symmetric(self, monkeypatch):
+        """NO on at_most with observed max already above the bound+margin →
+        eligible (NO wins when the max exceeds the bound, monotonic)."""
+        monkeypatch.setattr(settings, "NEAR_LOCK_CONVICTION_SIZING_ENABLED", True)
+        monkeypatch.setattr(settings, "NEAR_LOCK_CONVICTION_MARGIN_F", 2.0)
+        assert near_lock_conviction_eligible(
+            self._market("at_most", thr=80.0), direction="BUY_NO",
+            anchored_max_f=83.0, has_forecast=True,
+        )
+
+    def test_rejects_no_on_at_least_forecast_direction(self, monkeypatch):
+        """The Seoul/Taipei direction: NO on at_least (betting 'won't get hot') is
+        the σ-collapse/forecast side — NEVER eligible, even with a high max."""
+        monkeypatch.setattr(settings, "NEAR_LOCK_CONVICTION_SIZING_ENABLED", True)
+        assert not near_lock_conviction_eligible(
+            self._market("at_least", thr=84.2), direction="BUY_NO",
+            anchored_max_f=73.4, has_forecast=True,
+        )
+
+    def test_rejects_degenerate_no_forecast(self, monkeypatch):
+        """has_forecast=False (Open-Meteo failure) → never eligible, even if the
+        max looks locked. Kills the 96%-degenerate-state firing."""
+        monkeypatch.setattr(settings, "NEAR_LOCK_CONVICTION_SIZING_ENABLED", True)
+        assert not near_lock_conviction_eligible(
+            self._market("at_least", thr=80.0), direction="BUY_YES",
+            anchored_max_f=90.0, has_forecast=False,
+        )
+
+    def test_rejects_sub_margin_max(self, monkeypatch):
+        """Observed max over the threshold but inside the divergence margin →
+        not locked enough (hedges resolver divergence)."""
+        monkeypatch.setattr(settings, "NEAR_LOCK_CONVICTION_SIZING_ENABLED", True)
+        monkeypatch.setattr(settings, "NEAR_LOCK_CONVICTION_MARGIN_F", 2.0)
+        assert not near_lock_conviction_eligible(
+            self._market("at_least", thr=80.0), direction="BUY_YES",
+            anchored_max_f=81.0, has_forecast=True,
         )
 
     def test_excludes_bracket_like(self, monkeypatch):
         """exactly/range/bracket must never bypass the prob cap."""
         monkeypatch.setattr(settings, "NEAR_LOCK_CONVICTION_SIZING_ENABLED", True)
         assert not near_lock_conviction_eligible(
-            self._market("exactly"), our_probability=1.0, hours_until_peak=0.0
+            self._market("exactly", thr=80.0), direction="BUY_YES",
+            anchored_max_f=90.0, has_forecast=True,
         )
 
-    def test_rejects_pre_peak(self, monkeypatch):
-        """Before peak the max is forecast not observed → not eligible (the
-        safe-subset guard against the prob≈1.0/78%-win overconfidence)."""
+    def test_rejects_none_anchored_max(self, monkeypatch):
+        """No target-day max yet (market not started) → not eligible."""
         monkeypatch.setattr(settings, "NEAR_LOCK_CONVICTION_SIZING_ENABLED", True)
         assert not near_lock_conviction_eligible(
-            self._market("at_least"), our_probability=1.0, hours_until_peak=2.0
-        )
-
-    def test_rejects_sub_certain_prob(self, monkeypatch):
-        """Not physically locked (prob < MIN_PROB) → not eligible."""
-        monkeypatch.setattr(settings, "NEAR_LOCK_CONVICTION_SIZING_ENABLED", True)
-        assert not near_lock_conviction_eligible(
-            self._market("at_least"), our_probability=0.95, hours_until_peak=0.0
+            self._market("at_least", thr=80.0), direction="BUY_YES",
+            anchored_max_f=None, has_forecast=True,
         )
 
     def test_past_peak_uses_abs_window(self, monkeypatch):

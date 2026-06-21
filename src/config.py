@@ -76,17 +76,19 @@ class Settings(BaseSettings):
     # the model prob before Kelly, so a bet bought above 0.90 looks negative-edge
     # → sized to $0 ("no edge"). That structurally forbids the near-lock band the
     # PROBABILITY_MIN_ENTRY_PRICE=0.80 floor is meant to harvest (prices 0.90–0.97).
-    # When ENABLED, a passing **threshold** bet that is physically near-locked —
-    # recorded prob ≥ MIN_PROB AND at/past peak (hours_until_peak ≤ MAX_HOURS, so
-    # the max is OBSERVED not forecast: the safe subset the 0.90 cap over-tames) —
-    # sizes against PROB_CAP (0.99) instead of KELLY_PROB_CAP. The whole cap
-    # cascade (per-trade MAX_POSITION_PCT, exposure, USD, depth) still bounds it.
-    # This is the probability-path twin of LOCK_CONVICTION_SIZING for EASY-YES
-    # locks that miss the 2°F lock margin. Default off — set via env to enable.
+    # When ENABLED, a passing **threshold** bet that is a GENUINE observational
+    # monotonic lock — has_forecast AND the target-day-anchored observed max has
+    # already won the bet (max only rises) by NEAR_LOCK_CONVICTION_MARGIN_F — sizes
+    # against PROB_CAP (0.99) instead of KELLY_PROB_CAP. The whole cap cascade
+    # (per-trade MAX_POSITION_PCT, exposure, USD, depth) still bounds it. Restricted
+    # to the "already hot, betting hot" direction (YES on at_least/above, NO on
+    # at_most/below); the forecast direction is excluded — see
+    # near_lock_conviction_eligible. Rebuilt 2026-06-21 after the original
+    # prob/hours proxy fired 96% on degenerate forecast-failed states (the lock
+    # path correctly refuses those). Default off — re-enable only after validation.
     NEAR_LOCK_CONVICTION_SIZING_ENABLED: bool = False
     NEAR_LOCK_CONVICTION_PROB_CAP: float = 0.99  # Kelly prob cap for eligible bets
-    NEAR_LOCK_CONVICTION_MIN_PROB: float = 0.99  # eligibility: recorded prob ≥ this
-    NEAR_LOCK_CONVICTION_MAX_HOURS: float = 0.0  # eligibility: hours_until_peak ≤ this (at/past peak)
+    NEAR_LOCK_CONVICTION_MARGIN_F: float = 2.0  # observed max must clear threshold by this (hedges resolver divergence)
 
     # Unified pipeline
     UNIFIED_PIPELINE_INTERVAL_MINUTES: int = 5

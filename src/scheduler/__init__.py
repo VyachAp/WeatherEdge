@@ -77,7 +77,7 @@ from src.signals.decision_log import (
     log_decision,
 )
 from src.signals.evaluation_log import log_evaluation as _log_evaluation
-from src.signals.lock_rules import evaluate_lock
+from src.signals.lock_rules import _market_daily_max, evaluate_lock
 from src.execution.polymarket_client import is_live, place_order
 
 if TYPE_CHECKING:
@@ -190,7 +190,11 @@ _UNIFIED_CONCURRENCY = 8  # Max concurrent city aggregations
 # Stations whose Polymarket resolution source diverges from the routine-METAR
 # stream we consume (e.g. uses a different airport, an HKO-style city station,
 # or a different rounding convention) — skip them entirely in the pipeline.
-_EXCLUDED_ICAOS: set[str] = {"VHHH", "LLBG"}  # Hong Kong, Tel Aviv
+_EXCLUDED_ICAOS: set[str] = {"VHHH", "LLBG", "RCTP"}  # Hong Kong, Tel Aviv, Taipei
+# RCTP (Taoyuan, coastal) excluded 2026-06-21: reads systematically COOL vs the
+# Polymarket resolver (downtown Taipei) — market_resolutions shows mean −1.85°F /
+# worst −3.6°F divergence; a HARD-lock NO on "≥38°C" lost when RCTP read 35°C but
+# the resolver hit ≥38°C. Same station-mismatch class as VHHH/LLBG.
 
 
 async def job_resolve_trades() -> None:
@@ -643,15 +647,21 @@ async def job_unified_pipeline() -> None:
                             )
                             else None
                         )
-                        # Near-lock conviction: a physically-locked threshold bet
-                        # (prob ≈ 1.0, past peak) bypasses KELLY_PROB_CAP so a buy
-                        # in the near-lock band (0.90–0.97) isn't sized to $0
-                        # ("no edge"). Gated off by default; the cap cascade still
-                        # bounds the stake.
+                        # Near-lock conviction: a GENUINE observational monotonic
+                        # lock (has_forecast + target-day-anchored observed max
+                        # already clears the threshold by margin, betting-hot
+                        # direction) bypasses KELLY_PROB_CAP so a buy in the
+                        # near-lock band (0.90–0.97) isn't sized to $0 ("no edge").
+                        # Anchored max (not state.current_max_f) avoids the
+                        # cross-day leak. Gated off by default; cap cascade bounds it.
+                        anchored_max_f, _ = _market_daily_max(
+                            state, market.end_date, now_utc
+                        )
                         conviction = _near_lock_conviction_eligible(
                             market,
-                            our_probability=edge.our_probability,
-                            hours_until_peak=state.hours_until_peak,
+                            direction=edge.direction,
+                            anchored_max_f=anchored_max_f,
+                            has_forecast=state.has_forecast,
                         )
                         pos = size_position(
                             bankroll=bankroll,

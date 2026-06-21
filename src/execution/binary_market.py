@@ -219,36 +219,49 @@ def near_peak_floor_eligible(
 def near_lock_conviction_eligible(
     market,
     *,
-    our_probability: float,
-    hours_until_peak: float | None,
+    direction,
+    anchored_max_f: float | None,
+    has_forecast: bool,
 ) -> bool:
-    """True if a passing edge may bypass ``KELLY_PROB_CAP`` (conviction sizing).
+    """True if a passing edge is a genuine observational monotonic lock that may
+    bypass ``KELLY_PROB_CAP`` (conviction sizing).
 
-    Gates ``NEAR_LOCK_CONVICTION_SIZING_ENABLED``. Restricted to **threshold**
-    ops (bracket-like excluded — its single-bucket NO class is a historical
-    loser and must not be sized up). The bet must be *physically* near-locked,
-    not merely forecast-confident:
+    Gates ``NEAR_LOCK_CONVICTION_SIZING_ENABLED``. Eligible ONLY when the bet has
+    already won given the **target-day-anchored** observed max and monotonicity
+    (the daily max only rises) — the "already hot, betting hot" direction:
 
-    - recorded prob ≥ ``NEAR_LOCK_CONVICTION_MIN_PROB`` (≈ certain — the
-      monotonicity constraint has collapsed it because the observed max already
-      satisfies the threshold), AND
-    - **at/past peak** (``hours_until_peak ≤ NEAR_LOCK_CONVICTION_MAX_HOURS``,
-      default 0) so the daily max is OBSERVED, not forecast. This is the safe
-      subset the global 0.90 cap over-tames: the 2026-05-16 audit that motivated
-      the cap saw ``prob≈1.0`` bins win only 78%, but that pool included
-      far-from-peak forecast-driven certainty. Past peak the max can no longer
-      change, so a monotonicity-locked threshold bet is genuinely near-certain
-      — the same physics as the EASY-YES lock, just inside the 2°F margin.
+    - ``BUY_YES`` on ``at_least``/``above`` (YES wins when the max is high), or
+    - ``BUY_NO`` on ``at_most``/``below`` (NO wins when the max exceeds the bound),
+
+    with ``anchored_max_f`` clearing the threshold by
+    ``NEAR_LOCK_CONVICTION_MARGIN_F`` (hedges resolver/station divergence — cf. the
+    RCTP exclusion). ``has_forecast`` is required so degenerate Open-Meteo-failure
+    states (forecast_peak==current_max, hours_until_peak==0) cannot slip through —
+    those are exactly the bets the HARD-lock path refuses, and the original
+    prob/hours proxy fired 96% on them (2026-06-21 rebuild). Bracket-like excluded.
+    The forecast direction (NO-on-``at_least`` / YES-on-``at_most``) is NOT eligible:
+    it is σ-collapse overconfidence and the side resolver divergence hurts.
+
+    ``anchored_max_f`` is the caller's ``_market_daily_max`` result in °F (matching
+    ``market.parsed_threshold``); ``direction`` is a ``TradeDirection`` (or its
+    ``.value`` string).
     """
     from src.config import settings
 
     if not settings.NEAR_LOCK_CONVICTION_SIZING_ENABLED:
         return False
+    if not has_forecast:
+        return False
     if is_bracket_like(market):
         return False
-    if our_probability < settings.NEAR_LOCK_CONVICTION_MIN_PROB:
+    op = getattr(market, "parsed_operator", None)
+    thr = getattr(market, "parsed_threshold", None)
+    if thr is None or anchored_max_f is None:
         return False
-    return (
-        hours_until_peak is not None
-        and hours_until_peak <= settings.NEAR_LOCK_CONVICTION_MAX_HOURS
+    dir_val = getattr(direction, "value", direction)
+    bets_high = (dir_val == "BUY_YES" and op in ("at_least", "above")) or (
+        dir_val == "BUY_NO" and op in ("at_most", "below")
     )
+    if not bets_high:
+        return False
+    return anchored_max_f >= thr + settings.NEAR_LOCK_CONVICTION_MARGIN_F
