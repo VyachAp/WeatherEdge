@@ -367,6 +367,41 @@ async def job_unified_pipeline() -> None:
                     # by job_scan_markets every 15 min) is the durable copy.
                     price = live_price if live_price is not None else (market.current_yes_price or 0.0)
 
+                    # Phase-2 latency: T+N snapshot. Keyed to the latest routine
+                    # observation (same metar_observed_at as the fast-poll T0 row),
+                    # this is the follow-up that lets the aggregator measure how far
+                    # the market has repriced 5/10 min after the information landed.
+                    # Full state here → obs_fraction is populated. Best-effort, gated,
+                    # written regardless of whether the market is traded/skipped below.
+                    if (
+                        settings.REPRICE_SNAPSHOT_ENABLED
+                        and live_price is not None
+                        and state.routine_history
+                    ):
+                        try:
+                            from src.signals.reprice_snapshot import record_reprice_snapshot
+                            from src.signals.shadow_decision import (
+                                ShadowParams, _obs_fraction,
+                            )
+                            obs_at, obs_temp = state.routine_history[-1]
+                            await record_reprice_snapshot(
+                                session,
+                                market_id=market.id,
+                                station_icao=icao,
+                                metar_observed_at=obs_at,
+                                new_obs_temp_f=obs_temp,
+                                new_observed_max_f=state.current_max_f,
+                                obs_fraction=_obs_fraction(state, ShadowParams()),
+                                yes_bid=yes_bid,
+                                yes_ask=yes_ask,
+                                yes_mid=live_price,
+                                depth_yes_usd=mkt_depth,
+                                minutes_to_close=(end_time - now_utc).total_seconds() / 60.0,
+                                seconds_since_obs=(now_utc - obs_at).total_seconds(),
+                            )
+                        except Exception:
+                            pass
+
                     # --- Lock-rule fast path (deterministic physical lock-in) ---
                     # Evaluate before the near-resolved skip so the 0.90-0.95
                     # "we read the max on METAR before Wunderground updates" zone
@@ -1162,6 +1197,60 @@ async def job_daily_settlement() -> None:
             except Exception:
                 logger.warning("M3 straggler sweep failed (non-fatal)", exc_info=True)
 
+            # 4c. Phase-1 resolver ground truth — intersect the bounds across
+            # each station-day's market ladder into one continuous resolved-max
+            # estimate + signed divergence vs our routine max. Runs AFTER the
+            # label pass + straggler sweep so routine_metar_max_f is populated.
+            # Reads only already-labeled market_resolutions rows (no on-chain
+            # calls). Best-effort; never blocks settlement.
+            try:
+                from src.signals.station_day_resolution import resolve_station_days
+                n_days = await resolve_station_days(session)
+                if n_days:
+                    logger.info(
+                        "Phase-1 resolver ground truth: %d station-days resolved",
+                        n_days,
+                    )
+            except Exception:
+                logger.warning(
+                    "station-day resolution failed (non-fatal)", exc_info=True
+                )
+
+            # 4d. Phase-2 reprice-snapshot retention cap. The fast-poll + unified
+            # latency hooks can write thousands of rows/day, so trim beyond the
+            # configured window (mirrors the WX-retention cleanup). Best-effort.
+            try:
+                from src.signals.reprice_snapshot import sweep_reprice_retention
+                deleted = await sweep_reprice_retention(
+                    session,
+                    retention_days=settings.REPRICE_SNAPSHOT_RETENTION_DAYS,
+                )
+                if deleted:
+                    logger.info(
+                        "Reprice-snapshot retention: deleted %d old rows", deleted
+                    )
+            except Exception:
+                logger.warning(
+                    "reprice-snapshot retention failed (non-fatal)", exc_info=True
+                )
+
+            # 4e. Phase-3 forecast-error evolution — read the forecast_archive
+            # corpus + the Phase-1 station-day resolved/realized truth into the
+            # per-lead-time forecast-error dataset (the σ-vs-lead curve the
+            # deferred lead-time σ floor should be fit to). Runs AFTER step 4c so
+            # both truth columns exist. Best-effort; never blocks settlement.
+            try:
+                from src.signals.forecast_error import compute_recent_forecast_errors
+                n_fc = await compute_recent_forecast_errors(session)
+                if n_fc:
+                    logger.info(
+                        "Phase-3 forecast-error: %d station-days processed", n_fc
+                    )
+            except Exception:
+                logger.warning(
+                    "forecast-error build failed (non-fatal)", exc_info=True
+                )
+
             # (Per-station fast-lock-poll dedup is now reset at each
             # station's local-day rollover by ``_maybe_clear_per_station_caches``;
             # no global wipe at 22:00 UTC.)
@@ -1643,6 +1732,32 @@ async def job_fast_lock_poll() -> None:
                     yes_buy_px = yes_ask if yes_ask and yes_ask > 0 else yes_price
                     yes_depth = get_orderbook_depth(token_ids[0], yes_buy_px) if yes_buy_px > 0 else 0.0
                     end_time = market.end_date or now_utc + timedelta(hours=24)
+
+                    # Phase-2 latency: T0 snapshot at the instant the new routine
+                    # METAR is detected — the quote is already in hand, so this is
+                    # free. obs_fraction is left None here (the minimal fast-poll
+                    # state has no forecast); the unified-tick rows for the same
+                    # metar_observed_at carry it. Best-effort, gated.
+                    if settings.REPRICE_SNAPSHOT_ENABLED:
+                        try:
+                            from src.signals.reprice_snapshot import record_reprice_snapshot
+                            obs_at = latest_obs["observed_at"]
+                            await record_reprice_snapshot(
+                                session,
+                                market_id=market.id,
+                                station_icao=icao,
+                                metar_observed_at=obs_at,
+                                new_obs_temp_f=latest_obs.get("temp_f"),
+                                new_observed_max_f=state.current_max_f,
+                                yes_bid=yes_bid,
+                                yes_ask=yes_ask,
+                                yes_mid=yes_price,
+                                depth_yes_usd=yes_depth,
+                                minutes_to_close=(end_time - now_utc).total_seconds() / 60.0,
+                                seconds_since_obs=(now_utc - obs_at).total_seconds(),
+                            )
+                        except Exception:
+                            pass
 
                     stake = await _try_lock_rule_trade(
                         session=session, market=market, state=state,

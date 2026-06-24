@@ -219,6 +219,18 @@ class Settings(BaseSettings):
     # doesn't start pushing until the operator opts in.
     PERF_REVIEW_ENABLED: bool = False
 
+    # Information-latency measurement (Phase 2, 2026-06-24). When True, the
+    # scheduler snapshots the market YES quote + depth the instant a new routine
+    # METAR is detected (fast-poll T0) and on the following unified ticks
+    # (T+5/T+10), keyed to the METAR's observed_at, into ``metar_reprice_snapshots``.
+    # Diffing yes_mid across those rows measures how fast the market reprices
+    # toward information we already hold — the realized latency edge. Best-effort,
+    # places no orders, never touches the live paths. Default off because it adds
+    # write volume; flip after `alembic upgrade head`. Retention is capped by
+    # REPRICE_SNAPSHOT_RETENTION_DAYS at daily settlement.
+    REPRICE_SNAPSHOT_ENABLED: bool = False
+    REPRICE_SNAPSHOT_RETENTION_DAYS: int = 30
+
     # Circuit breakers
     DAILY_LOSS_STOP_USD: float = 200.0
     CONSECUTIVE_LOSS_PAUSE_COUNT: int = 3

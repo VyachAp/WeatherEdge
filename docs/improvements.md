@@ -28,6 +28,43 @@ gotchas, not here.
 
 ---
 
+## [done 2026-06-24] Self-improvement data-collection layer (3 phases shipped)
+
+**Why:** "Gym" framing — steady, measured improvement, not a profit switch.
+The telemetry foundation was strong but had three ground-truth blind spots
+that prevented the bot from learning from how markets *actually* closed.
+**What shipped (all additive, best-effort, propose-only — no flag flips):**
+- **Phase 1 `station_day_resolutions`** (migration `v2w3x4y5z6a7`): continuous
+  resolved daily-max per station-day, back-solved by **intersecting the implied
+  bounds across a station-day's whole market ladder** (a YES-above-85 + NO-above-88
+  sandwich pins `[85,88)` even though each is one-sided alone). Fixes the M3
+  "only ~33% of markets carry a measurable divergence" limitation — `divergence_point_f`
+  is now a continuous signed °F on every laddered station-day. Reads already-labeled
+  `market_resolutions` at settlement (**no new on-chain calls**). `cli resolver-truth-report`
+  + `scripts/backfill_station_day_resolutions.py`.
+- **Phase 2 `metar_reprice_snapshots`** (migration `w3x4y5z6a7b8`, **gated
+  `REPRICE_SNAPSHOT_ENABLED` default off**): event-driven price snapshot keyed to
+  METAR arrival (fast-poll T0 + unified T+N). Makes the information-latency thesis
+  **falsifiable** — group by `(market_id, metar_observed_at)`, diff `yes_mid`, bucket
+  by `obs_fraction`. `cli latency-report`. Retention sweep at settlement.
+- **Phase 3 `forecast_error_daily`** (migration `x4y5z6a7b8c9`): the long-missing
+  `forecast_archive` reader — per-`(station, day, lead_bucket)` forecast error vs
+  realized + resolved truth. The RMSE-by-lead curve is the **empirical input the
+  deferred lead-time σ floor should be fit to** (see the σ-floor backlog entry below)
+  and seeds the climate prior. `cli forecast-error-report`.
+**Follow-ups now unblocked:** (1) once Phase-2 data accrues with the flag on,
+`latency-report` either confirms or kills the latency thesis per obs_fraction bucket;
+(2) `forecast-error-report` gives the data to set `SIGMA_LEAD_TIME_SLOPE_F_PER_HR`
+instead of guessing it — the gate for re-enabling `BRACKET_LIKE_NO_DISABLED`;
+(3) Phase-1's continuous divergence supersedes the YES-pinned-only resolver audit
+(the `[backlog] °C resolver/observation divergence` entry can now be re-run on
+`resolver-truth-report` with far higher n).
+**Files:** `src/signals/{station_day_resolution,reprice_snapshot,forecast_error}.py`,
+`src/analysis/{divergence,latency,forecast_error}.py`, `src/db/models.py`,
+`src/scheduler/jobs.py` (settlement steps 4c/4d/4e + the two reprice hooks),
+`src/config.py`, `src/cli.py`, 3 migrations, `scripts/backfill_station_day_resolutions.py`,
+`tests/test_{station_day_resolution,forecast_error,cli_reports}.py`.
+
 ## [in-flight] Automated perf-review loop (Layer 1 deterministic + Layer 2 analyst)
 
 **Why:** For ~2 months the "evaluate DB/results → propose flag/code change"

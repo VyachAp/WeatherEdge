@@ -11,6 +11,7 @@ import pytest
 
 from src.cli import (
     _aggregate_divergence,
+    _aggregate_station_day_divergence,
     _aggregate_valley,
     _flags_diff,
     _flatten_shadow,
@@ -18,6 +19,8 @@ from src.cli import (
     _summarize_conviction_locks,
     _summarize_exposure,
     _summarize_floored_fills,
+    _summarize_forecast_error,
+    _summarize_reprice,
     _summarize_shadow,
     _valley_bet_won,
     _valley_ev_per_dollar,
@@ -105,6 +108,134 @@ def test_aggregate_divergence_empty():
         [{"station_icao": "K", "unit": "F", "divergence_f": None,
           "routine_metar_max_f": None}]
     ) == []
+
+
+# --- _aggregate_station_day_divergence (Phase 1) ----------------------------
+
+
+def test_aggregate_station_day_divergence_groups_sorts_and_abs_mean():
+    rows = [
+        {"station_icao": "KAUS", "unit": "F", "divergence_point_f": 1.0},
+        {"station_icao": "KAUS", "unit": "F", "divergence_point_f": 3.0},
+        {"station_icao": "KNYC", "unit": "F", "divergence_point_f": -0.5},
+        # NULL point divergence (one-sided window) → excluded.
+        {"station_icao": "KNYC", "unit": "F", "divergence_point_f": None},
+    ]
+    agg = _aggregate_station_day_divergence(rows)
+    assert [d["station_icao"] for d in agg] == ["KAUS", "KNYC"]  # |mean| desc
+    aus = agg[0]
+    assert aus["n"] == 2
+    assert aus["mean"] == 2.0
+    assert aus["abs_mean"] == 2.0
+    assert aus["min"] == 1.0
+    assert aus["max"] == 3.0
+    nyc = agg[1]
+    assert nyc["n"] == 1
+    assert nyc["mean"] == -0.5
+    assert nyc["abs_mean"] == 0.5
+
+
+def test_aggregate_station_day_divergence_empty():
+    assert _aggregate_station_day_divergence([]) == []
+    assert _aggregate_station_day_divergence(
+        [{"station_icao": "K", "unit": "F", "divergence_point_f": None}]
+    ) == []
+
+
+# --- _summarize_reprice (Phase 2 latency) -----------------------------------
+
+
+def test_summarize_reprice_empty():
+    out = _summarize_reprice([])
+    assert out == {"n_groups": 0, "n_measurable": 0, "overall": None,
+                   "by_bucket": []}
+
+
+def test_summarize_reprice_single_snapshot_not_measurable():
+    # One snapshot per METAR group → no T0→last move.
+    rows = [
+        {"market_id": "m1", "metar_observed_at": "t0", "created_at": "c0",
+         "yes_mid": 0.5, "obs_fraction": 0.8, "seconds_since_obs": 30.0},
+    ]
+    out = _summarize_reprice(rows)
+    assert out["n_groups"] == 1
+    assert out["n_measurable"] == 0
+    assert out["by_bucket"] == []
+
+
+def test_summarize_reprice_pairs_t0_and_later_and_buckets():
+    rows = [
+        # high obs_fraction group: market rose 0.50 → 0.62 toward YES.
+        {"market_id": "m1", "metar_observed_at": "t0", "created_at": "c0",
+         "yes_mid": 0.50, "obs_fraction": None, "seconds_since_obs": 30.0},
+        {"market_id": "m1", "metar_observed_at": "t0", "created_at": "c1",
+         "yes_mid": 0.62, "obs_fraction": 0.9, "seconds_since_obs": 330.0},
+        # low obs_fraction group: barely moved.
+        {"market_id": "m2", "metar_observed_at": "t9", "created_at": "c0",
+         "yes_mid": 0.40, "obs_fraction": 0.1, "seconds_since_obs": 20.0},
+        {"market_id": "m2", "metar_observed_at": "t9", "created_at": "c1",
+         "yes_mid": 0.41, "obs_fraction": 0.1, "seconds_since_obs": 320.0},
+    ]
+    out = _summarize_reprice(rows)
+    assert out["n_groups"] == 2
+    assert out["n_measurable"] == 2
+    # obs_fraction read from whichever row carries it (T0 was None for m1).
+    buckets = {b["bucket"]: b for b in out["by_bucket"]}
+    assert "high (>=0.67)" in buckets
+    assert "low (<0.34)" in buckets
+    assert buckets["high (>=0.67)"]["mean_move"] == pytest.approx(0.12)
+    assert buckets["low (<0.34)"]["mean_move"] == pytest.approx(0.01)
+    # high bucket span = 330 - 30 = 300s.
+    assert buckets["high (>=0.67)"]["mean_span_seconds"] == pytest.approx(300.0)
+    # Thesis-order: low before high.
+    assert [b["bucket"] for b in out["by_bucket"]] == [
+        "low (<0.34)", "high (>=0.67)"
+    ]
+
+
+# --- _summarize_forecast_error (Phase 3) ------------------------------------
+
+
+def test_summarize_forecast_error_empty():
+    assert _summarize_forecast_error([]) == []
+
+
+def test_summarize_forecast_error_rmse_by_lead_and_sorting():
+    rows = [
+        # lead 0: small errors → low RMSE.
+        {"lead_bucket_h": 0, "error_vs_resolved_f": 1.0,
+         "error_vs_metar_f": 1.0, "forecast_sigma_f": 2.0},
+        {"lead_bucket_h": 0, "error_vs_resolved_f": -1.0,
+         "error_vs_metar_f": -1.0, "forecast_sigma_f": 2.0},
+        # lead 24: larger errors → higher RMSE, warm bias.
+        {"lead_bucket_h": 24, "error_vs_resolved_f": 3.0,
+         "error_vs_metar_f": 3.0, "forecast_sigma_f": 4.0},
+        {"lead_bucket_h": 24, "error_vs_resolved_f": 5.0,
+         "error_vs_metar_f": 5.0, "forecast_sigma_f": 4.0},
+    ]
+    agg = _summarize_forecast_error(rows)
+    # Sorted by lead asc.
+    assert [d["lead_bucket_h"] for d in agg] == [0, 24]
+    lead0, lead24 = agg
+    assert lead0["mean_error"] == 0.0
+    assert lead0["rmse"] == 1.0
+    assert lead0["bias_sign"] == "flat"
+    assert lead24["mean_error"] == 4.0
+    assert lead24["rmse"] == pytest.approx((34.0 / 2) ** 0.5)
+    assert lead24["bias_sign"] == "warm"
+    assert lead24["mean_sigma"] == 4.0
+
+
+def test_summarize_forecast_error_falls_back_to_metar_when_no_resolved():
+    rows = [
+        {"lead_bucket_h": 6, "error_vs_resolved_f": None,
+         "error_vs_metar_f": -2.0, "forecast_sigma_f": None},
+    ]
+    agg = _summarize_forecast_error(rows)
+    assert len(agg) == 1
+    assert agg[0]["mean_error"] == -2.0
+    assert agg[0]["bias_sign"] == "cool"
+    assert agg[0]["mean_sigma"] is None
 
 
 # --- shadow helpers ---------------------------------------------------------

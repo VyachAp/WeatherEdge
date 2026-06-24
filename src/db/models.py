@@ -394,6 +394,100 @@ class MarketResolution(Base):
     )
 
 
+class StationDayResolution(Base):
+    """Continuous resolver ground-truth per station-day (Phase 1, 2026-06-24).
+
+    ``market_resolutions`` (M3) records, per *market*, the daily-max **bound**
+    one YES/NO outcome implies — but ~67% of settled markets (bracket / range
+    NO, threshold NO without a sibling) imply only a one-sided or no bound, so
+    ``divergence_f`` is unmeasurable on most rows. This table closes that gap by
+    **intersecting the bounds across a whole station-day's market ladder**: a
+    YES "above 85" (max ≥ 85) plus a NO "above 88" (max < 88) sandwich the
+    resolved max to ``[85, 88)`` even though each market alone is one-sided, and
+    a YES ``exactly 86`` pins it to ``[86, 86]``. The midpoint is a continuous
+    point estimate of how the market *actually* closed — the literal target the
+    self-improvement loop compares our routine-METAR max against.
+
+    One row per ``(station_icao, target_date_local)`` because the resolved max is
+    shared across that station-day's markets. Built at daily settlement from the
+    already-labeled ``market_resolutions`` rows (``label_resolved_markets`` +
+    the straggler sweep populate them first) — **no new on-chain calls**.
+
+    ``resolved_max_point_f`` is NULL when only one side of the interval is
+    bounded (no continuous estimate); ``divergence_point_f`` = our routine max −
+    the point estimate (positive = we read hotter), NULL when no point exists.
+    """
+
+    __tablename__ = "station_day_resolutions"
+    __table_args__ = (
+        UniqueConstraint(
+            "station_icao", "target_date_local",
+            name="uq_stationday_resolution",
+        ),
+        Index("ix_stationday_resolution_date", "target_date_local"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    station_icao = Column(String, nullable=False)
+    parsed_location = Column(String)
+    target_date_local = Column(Date, nullable=False)
+    unit = Column(String)  # 'C' | 'F' — the resolver's native unit
+    resolved_max_lower_f = Column(Float)
+    resolved_max_upper_f = Column(Float)
+    resolved_max_point_f = Column(Float)  # midpoint; NULL if one-sided
+    resolved_source = Column(String)  # 'bound_intersection'
+    n_buckets_resolved = Column(Integer)  # # markets contributing a finite bound
+    routine_metar_max_f = Column(Float)  # our side
+    divergence_point_f = Column(Float)  # ours − resolved point
+    resolved_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+
+class ForecastErrorDaily(Base):
+    """Per-station, per-lead-time forecast-error record (Phase 3, 2026-06-24).
+
+    Turns the accumulating ``forecast_archive`` corpus (~17k rows/day, no live
+    reader) into the dataset the deferred lead-time σ floor and the unpopulated
+    climate prior actually need: for each settled station-day, the forecast peak
+    at a series of lead buckets (0/6/12/18/24/36/48h before peak) joined to the
+    realized routine-METAR max AND the Phase-1 resolved max. ``error_vs_metar_f``
+    / ``error_vs_resolved_f`` = forecast − truth; aggregating their RMSE by
+    ``lead_bucket_h`` gives the empirical σ-vs-lead curve that
+    ``SIGMA_LEAD_TIME_SLOPE_F_PER_HR`` should be fit to instead of guessed.
+
+    One row per ``(station_icao, target_date_local, lead_bucket_h)``. Built at
+    daily settlement from ``forecast_archive`` + ``station_day_resolutions``.
+    """
+
+    __tablename__ = "forecast_error_daily"
+    __table_args__ = (
+        UniqueConstraint(
+            "station_icao", "target_date_local", "lead_bucket_h",
+            name="uq_fc_error_station_day_lead",
+        ),
+        Index("ix_fc_error_station_date", "station_icao", "target_date_local"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    station_icao = Column(String, nullable=False)
+    target_date_local = Column(Date, nullable=False)
+    lead_bucket_h = Column(Integer, nullable=False)
+    forecast_peak_f = Column(Float)
+    forecast_sigma_f = Column(Float)
+    realized_max_f = Column(Float)
+    resolved_max_f = Column(Float)  # Phase-1 point; NULL if no laddered window
+    error_vs_metar_f = Column(Float)
+    error_vs_resolved_f = Column(Float)
+    computed_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+
 class ShadowLedger(Base):
     """Unselected decision ledger for the redesigned four-stage shadow flow.
 
@@ -454,6 +548,60 @@ class ShadowLedger(Base):
     # Full feature snapshot (all WeatherState fields the model used) + the
     # stage reasoning trail — the "why" the legacy logs never persisted.
     feature_json = Column(JSONB)
+    created_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+
+class MetarRepriceSnapshot(Base):
+    """Event-driven market-price snapshot keyed to METAR arrival (Phase 2).
+
+    The core edge thesis is *information latency* — we read routine METARs (the
+    resolution source) before the market reprices. But that thesis was
+    unfalsifiable: ``market_snapshots`` samples prices on a fixed 15-min grid,
+    never tied to when a new observation we already hold actually lands. This
+    table captures, the instant a NEW routine METAR is detected (fast-poll T0)
+    and on the following unified ticks (T+5/T+10…), the YES quote + depth for
+    each of that station's active markets, tagged with the triggering METAR's
+    ``observed_at`` and the new observed daily max. Grouping rows by
+    ``(market_id, metar_observed_at)`` and diffing ``yes_mid`` across
+    ``created_at`` measures **how fast and how far the market moves toward the
+    information** — the realized latency edge per market state, the empirical
+    counterpart to ``shadow_ledger.info_advantage`` (which is only the model's
+    *belief*).
+
+    Append-only; pairing is done at read time (no write-time coupling), mirroring
+    how config-epochs bucket telemetry. ``obs_fraction`` is NULL on the
+    forecast-free fast-poll T0 row and populated on the full-state unified rows
+    (same ``metar_observed_at`` group), so the aggregator reads it from whichever
+    row carries it. Gated entirely by ``REPRICE_SNAPSHOT_ENABLED`` (default off)
+    to control write volume during rollout.
+    """
+
+    __tablename__ = "metar_reprice_snapshots"
+    __table_args__ = (
+        Index(
+            "ix_metar_reprice_market_obs", "market_id", "metar_observed_at"
+        ),
+        Index("ix_metar_reprice_created", "created_at"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    market_id = Column(String, ForeignKey("markets.id"), nullable=False)
+    station_icao = Column(String, nullable=False)
+    metar_observed_at = Column(DateTime(timezone=True), nullable=False)
+    new_obs_temp_f = Column(Float)
+    new_observed_max_f = Column(Float)
+    obs_fraction = Column(Float)
+    yes_bid = Column(Float)
+    yes_ask = Column(Float)
+    yes_mid = Column(Float)
+    depth_yes_usd = Column(Float)
+    depth_no_usd = Column(Float)
+    minutes_to_close = Column(Float)
+    seconds_since_obs = Column(Float)  # detection latency (now − observed_at)
     created_at = Column(
         DateTime(timezone=True),
         nullable=False,

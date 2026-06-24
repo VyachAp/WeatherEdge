@@ -33,9 +33,14 @@ from src.analysis.common import (  # noqa: E402,F401
     _valley_ev_per_dollar,
 )
 from src.analysis.conviction import _summarize_conviction_locks  # noqa: E402,F401
-from src.analysis.divergence import _aggregate_divergence  # noqa: E402,F401
+from src.analysis.divergence import (  # noqa: E402,F401
+    _aggregate_divergence,
+    _aggregate_station_day_divergence,
+)
 from src.analysis.epochs import _flags_diff  # noqa: E402,F401
 from src.analysis.exposure import _summarize_exposure  # noqa: E402,F401
+from src.analysis.forecast_error import _summarize_forecast_error  # noqa: E402,F401
+from src.analysis.latency import _summarize_reprice  # noqa: E402,F401
 from src.analysis.perf import (  # noqa: E402,F401
     _detect_calibration_squash_local,
     render_perf_digest,
@@ -4427,6 +4432,314 @@ def resolution_report(days: int, station: str | None, unit: str | None) -> None:
                     f"{d['min']:+.1f} | {d['max']:+.1f} |"
                 )
             click.echo()
+
+    asyncio.run(_run())
+
+
+@main.command("resolver-truth-report")
+@click.option("--days", default=90, show_default=True, help="Look-back window in days.")
+@click.option("--station", default=None, help="Restrict to one ICAO.")
+@click.option("--json", "as_json", is_flag=True, help="Emit JSON instead of a table.")
+def resolver_truth_report(days: int, station: str | None, as_json: bool) -> None:
+    """Continuous resolver ground-truth report from ``station_day_resolutions`` (Phase 1).
+
+    The literal answer to "our temperature observations vs how the markets
+    actually closed": per station-day, the resolved daily max is back-solved by
+    intersecting the bounds across that day's whole market ladder, and
+    ``divergence_point_f`` = our routine-METAR max − that resolved point
+    (positive = we read hotter). Unlike ``resolution-report`` (measurable on only
+    the ~33% YES-pinned markets), this gives a continuous signed °F on every
+    laddered station-day — the standing series the self-improvement loop reads.
+    """
+    import json as _json
+
+    from sqlalchemy import select
+
+    from src.db.engine import async_session
+    from src.db.models import StationDayResolution
+
+    async def _run() -> None:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+        async with async_session() as session:
+            stmt = (
+                select(StationDayResolution)
+                .where(StationDayResolution.resolved_at >= cutoff)
+                .order_by(StationDayResolution.target_date_local)
+            )
+            if station:
+                stmt = stmt.where(
+                    StationDayResolution.station_icao == station.upper()
+                )
+            res = (await session.execute(stmt)).scalars().all()
+            rows = [
+                {
+                    "station_icao": r.station_icao, "unit": r.unit,
+                    "target_date_local": (
+                        r.target_date_local.isoformat()
+                        if r.target_date_local else None
+                    ),
+                    "resolved_max_point_f": r.resolved_max_point_f,
+                    "routine_metar_max_f": r.routine_metar_max_f,
+                    "divergence_point_f": r.divergence_point_f,
+                    "n_buckets_resolved": r.n_buckets_resolved,
+                }
+                for r in res
+            ]
+            agg = _aggregate_station_day_divergence(rows)
+            n_pointed = sum(
+                1 for r in rows if r["divergence_point_f"] is not None
+            )
+
+            if as_json:
+                click.echo(_json.dumps(
+                    {"station_days": len(rows), "with_point_divergence": n_pointed,
+                     "by_station": agg},
+                    indent=2,
+                ))
+                return
+
+            if not res:
+                click.echo(
+                    f"No station_day_resolutions in the last {days}d "
+                    f"(station={station or 'any'}). Have any station-days settled "
+                    "since the Phase-1 deploy? Run "
+                    "`python -m scripts.backfill_station_day_resolutions --commit` "
+                    "to drain history."
+                )
+                return
+
+            click.echo(f"# Resolver ground-truth report — last {days}d")
+            click.echo()
+            click.echo(f"- **Station-days resolved:** {len(res):,}")
+            click.echo(
+                f"- **With a continuous point divergence:** {n_pointed:,} "
+                f"({n_pointed / len(res) * 100:.0f}% — the rest are one-sided "
+                "windows or lack a routine max)"
+            )
+            click.echo()
+
+            if not agg:
+                click.echo(
+                    "_No station-days with both a two-sided resolved window and a "
+                    "routine max yet — run after a daily settlement._"
+                )
+                return
+
+            click.echo("## Divergence by station (ours − resolved point, °F)")
+            click.echo()
+            click.echo("| Station | Unit | n | mean | abs_mean | std | min | max |")
+            click.echo("|---|---|---:|---:|---:|---:|---:|---:|")
+            for d in agg:
+                click.echo(
+                    f"| {d['station_icao'] or '?'} | {d['unit'] or '?'} | "
+                    f"{d['n']:,} | {d['mean']:+.2f} | {d['abs_mean']:.2f} | "
+                    f"{d['std']:.2f} | {d['min']:+.1f} | {d['max']:+.1f} |"
+                )
+            click.echo()
+
+    asyncio.run(_run())
+
+
+@main.command("latency-report")
+@click.option("--days", default=7, show_default=True, help="Look-back window in days.")
+@click.option("--station", default=None, help="Restrict to one ICAO.")
+@click.option("--json", "as_json", is_flag=True, help="Emit JSON instead of a table.")
+def latency_report(days: int, station: str | None, as_json: bool) -> None:
+    """Information-latency report from ``metar_reprice_snapshots`` (Phase 2).
+
+    Tests the core edge thesis empirically: when a new routine METAR lands, does
+    the market reprice toward it, and does the move grow with how much of the day
+    we've observed? Pairs snapshots sharing a ``(market_id, metar_observed_at)``
+    key, measures the T0→last YES-mid move, and buckets by ``obs_fraction``. A
+    positive ``mean_move`` rising across the buckets is the realized latency edge.
+    Requires ``REPRICE_SNAPSHOT_ENABLED`` to have been on — empty otherwise.
+    """
+    import json as _json
+
+    from sqlalchemy import select
+
+    from src.db.engine import async_session
+    from src.db.models import MetarRepriceSnapshot
+
+    async def _run() -> None:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+        async with async_session() as session:
+            stmt = (
+                select(MetarRepriceSnapshot)
+                .where(MetarRepriceSnapshot.created_at >= cutoff)
+                .order_by(MetarRepriceSnapshot.created_at)
+            )
+            if station:
+                stmt = stmt.where(
+                    MetarRepriceSnapshot.station_icao == station.upper()
+                )
+            res = (await session.execute(stmt)).scalars().all()
+            rows = [
+                {
+                    "market_id": r.market_id,
+                    "station_icao": r.station_icao,
+                    "metar_observed_at": (
+                        r.metar_observed_at.isoformat()
+                        if r.metar_observed_at else None
+                    ),
+                    "created_at": r.created_at.isoformat() if r.created_at else None,
+                    "yes_mid": r.yes_mid,
+                    "obs_fraction": r.obs_fraction,
+                    "seconds_since_obs": r.seconds_since_obs,
+                }
+                for r in res
+            ]
+            summary = _summarize_reprice(rows)
+
+            if as_json:
+                click.echo(_json.dumps(summary, indent=2))
+                return
+
+            if not res:
+                click.echo(
+                    f"No metar_reprice_snapshots in the last {days}d "
+                    f"(station={station or 'any'}). Is REPRICE_SNAPSHOT_ENABLED on "
+                    "and `alembic upgrade head` applied?"
+                )
+                return
+
+            click.echo(f"# Information-latency report — last {days}d")
+            click.echo()
+            click.echo(f"- **Snapshots:** {len(res):,}")
+            click.echo(f"- **METAR groups:** {summary['n_groups']:,}")
+            click.echo(
+                f"- **Measurable (≥2 priced snapshots):** {summary['n_measurable']:,}"
+            )
+            ov = summary["overall"]
+            if ov:
+                span = (
+                    f"{ov['mean_span_seconds'] / 60.0:.1f} min"
+                    if ov["mean_span_seconds"] is not None else "?"
+                )
+                click.echo(
+                    f"- **Overall mean YES-mid move:** {ov['mean_move']:+.4f} "
+                    f"(|move| {ov['mean_abs_move']:.4f}, mean span {span})"
+                )
+            click.echo()
+
+            if not summary["by_bucket"]:
+                click.echo(
+                    "_No measurable reprice groups yet (need ≥2 priced snapshots "
+                    "per METAR) — let it run longer with REPRICE_SNAPSHOT_ENABLED on._"
+                )
+                return
+
+            click.echo("## Move by observation fraction (market chasing our info)")
+            click.echo()
+            click.echo("| obs_fraction | n | mean move | mean |move| | mean span |")
+            click.echo("|---|---:|---:|---:|---:|")
+            for b in summary["by_bucket"]:
+                span = (
+                    f"{b['mean_span_seconds'] / 60.0:.1f}m"
+                    if b["mean_span_seconds"] is not None else "?"
+                )
+                click.echo(
+                    f"| {b['bucket']} | {b['n']:,} | {b['mean_move']:+.4f} | "
+                    f"{b['mean_abs_move']:.4f} | {span} |"
+                )
+            click.echo()
+            click.echo(
+                "_Thesis confirmed iff mean move is positive and rises with "
+                "obs_fraction (the market repricing toward observations we "
+                "already held)._"
+            )
+
+    asyncio.run(_run())
+
+
+@main.command("forecast-error-report")
+@click.option("--days", default=30, show_default=True, help="Look-back window in days.")
+@click.option("--station", default=None, help="Restrict to one ICAO.")
+@click.option(
+    "--lead", default=None, type=int,
+    help="Restrict to one lead bucket (hours before peak).",
+)
+@click.option("--json", "as_json", is_flag=True, help="Emit JSON instead of a table.")
+def forecast_error_report(
+    days: int, station: str | None, lead: int | None, as_json: bool
+) -> None:
+    """Forecast-error-by-lead-time report from ``forecast_error_daily`` (Phase 3).
+
+    The empirical σ-vs-lead curve the deferred lead-time σ floor
+    (``SIGMA_LEAD_TIME_SLOPE_F_PER_HR``) should be fit to: for each lead bucket,
+    the RMSE of forecast − truth (resolved point preferred, routine max fallback).
+    RMSE should rise with the lead bucket; ``bias_sign`` flags any systematic
+    warm/cool forecast offset per lead.
+    """
+    import json as _json
+
+    from sqlalchemy import select
+
+    from src.db.engine import async_session
+    from src.db.models import ForecastErrorDaily
+
+    async def _run() -> None:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+        async with async_session() as session:
+            stmt = (
+                select(ForecastErrorDaily)
+                .where(ForecastErrorDaily.computed_at >= cutoff)
+                .order_by(ForecastErrorDaily.target_date_local)
+            )
+            if station:
+                stmt = stmt.where(
+                    ForecastErrorDaily.station_icao == station.upper()
+                )
+            if lead is not None:
+                stmt = stmt.where(ForecastErrorDaily.lead_bucket_h == lead)
+            res = (await session.execute(stmt)).scalars().all()
+            rows = [
+                {
+                    "lead_bucket_h": r.lead_bucket_h,
+                    "error_vs_metar_f": r.error_vs_metar_f,
+                    "error_vs_resolved_f": r.error_vs_resolved_f,
+                    "forecast_sigma_f": r.forecast_sigma_f,
+                }
+                for r in res
+            ]
+            agg = _summarize_forecast_error(rows)
+
+            if as_json:
+                click.echo(_json.dumps(
+                    {"rows": len(rows), "by_lead": agg}, indent=2
+                ))
+                return
+
+            if not res:
+                click.echo(
+                    f"No forecast_error_daily in the last {days}d "
+                    f"(station={station or 'any'}, lead={lead if lead is not None else 'any'}). "
+                    "Have any station-days settled since the Phase-3 deploy?"
+                )
+                return
+
+            click.echo(f"# Forecast-error by lead time — last {days}d")
+            click.echo()
+            click.echo(f"- **Rows:** {len(res):,}")
+            click.echo()
+            click.echo("## Error by lead bucket (forecast − truth, °F)")
+            click.echo()
+            click.echo("| lead (h) | n | mean error | RMSE | bias | mean σ |")
+            click.echo("|---:|---:|---:|---:|---|---:|")
+            for d in agg:
+                sigma = (
+                    f"{d['mean_sigma']:.2f}" if d["mean_sigma"] is not None else "?"
+                )
+                click.echo(
+                    f"| {d['lead_bucket_h']} | {d['n']:,} | {d['mean_error']:+.2f} | "
+                    f"{d['rmse']:.2f} | {d['bias_sign']} | {sigma} |"
+                )
+            click.echo()
+            click.echo(
+                "_RMSE rising with lead is the σ-vs-lead curve to fit "
+                "`SIGMA_LEAD_TIME_SLOPE_F_PER_HR` to; mean σ is what the ensemble "
+                "currently claims at that lead (compare to RMSE for under/over-confidence)._"
+            )
 
     asyncio.run(_run())
 
