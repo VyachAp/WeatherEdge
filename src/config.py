@@ -86,6 +86,7 @@ class Settings(BaseSettings):
     # near_lock_conviction_eligible. Rebuilt 2026-06-21 after the original
     # prob/hours proxy fired 96% on degenerate forecast-failed states (the lock
     # path correctly refuses those). Default off — re-enable only after validation.
+    # GRAVEYARD: NEAR_LOCK_CONVICTION_SIZING_ENABLED — docs/graveyard.md#near_lock_conviction_sizing_enabled--prob-cap-bypass-for-near-lock-threshold-bets (status: suspended)
     NEAR_LOCK_CONVICTION_SIZING_ENABLED: bool = False
     NEAR_LOCK_CONVICTION_PROB_CAP: float = 0.99  # Kelly prob cap for eligible bets
     NEAR_LOCK_CONVICTION_MARGIN_F: float = 2.0  # observed max must clear threshold by this (hedges resolver divergence)
@@ -158,6 +159,7 @@ class Settings(BaseSettings):
     # margin. Exactly/threshold markets are unaffected. Re-enable via
     # `.env` once sigma + calibration changes have ≥2 weeks of paper-
     # trade evidence behind them.
+    # GRAVEYARD: BRACKET_MARKETS_ENABLED — docs/graveyard.md#bracket_markets_enabled--evaluate-bracketrange-multi-outcome-markets (status: suspended)
     BRACKET_MARKETS_ENABLED: bool = False
 
     # Station bias tracking
@@ -187,6 +189,7 @@ class Settings(BaseSettings):
     # ``signals.model_prob ∈ [0.78, 0.85)`` over the last 7+ days). Per-
     # class fitting lets the threshold band train on its own win-rate curve
     # without bracket-like's 0.99-dominated tail distorting it.
+    # GRAVEYARD: PER_OPERATOR_CALIBRATION_ENABLED — docs/graveyard.md#per_operator_calibration_enabled--split-calibration-fit-by-operator-class (status: suspended)
     PER_OPERATOR_CALIBRATION_ENABLED: bool = False
 
     # Shadow calibration telemetry (M1 / Phase 1, 2026-05-31). Pure
@@ -370,6 +373,7 @@ class Settings(BaseSettings):
     # the additive arm. Defaults preserve pre-2026-05-30 behavior
     # bit-for-bit: master flag off zeros the additive arm and the 0.5
     # multiplier matches the prior constant.
+    # GRAVEYARD: SIGMA_FLOOR_LEAD_TIME_ENABLED — docs/graveyard.md#sigma_floor_lead_time_enabled--lead-time-aware-σ-floor-probability-engine-gaussian (status: suspended)
     SIGMA_FLOOR_LEAD_TIME_ENABLED: bool = False
     SIGMA_LEAD_TIME_SLOPE_F_PER_HR: float = 0.3
     SIGMA_HOURS_FLOOR_MULTIPLIER: float = 0.5
@@ -381,6 +385,7 @@ class Settings(BaseSettings):
     # table, sanity-checking the values, then flipping this to true. The
     # `scripts/backfill_station_normals.py` loader does not exist yet — see
     # `docs/improvements.md` [climate-prior backlog] for the concrete spec.
+    # GRAVEYARD: CLIMATE_PRIOR_ENABLED — docs/graveyard.md#climate_prior_enabled--bayesian-climate-prior-blend-probability-engine (status: suspended)
     CLIMATE_PRIOR_ENABLED: bool = False
     # Floor on posterior σ after the Bayesian blend — prevents tropical
     # / oceanic stations (low climatological σ) from collapsing the
@@ -391,15 +396,6 @@ class Settings(BaseSettings):
     # std_max_c exceeds this is silently bypassed — it would dilute the
     # forecast rather than anchor it.
     CLIMATE_PRIOR_MAX_SIGMA_F: float = 8.0
-
-    # Residual-slope projection (lever A in the projection-latency redesign).
-    # When enabled and the station has at least 3 routine METARs in the 6h
-    # window with same-hour forecast cells, ``_project_daily_max`` projects
-    # the residual forward at the observed hourly slope instead of decaying
-    # the level residual with a 2h halflife. Captures "forecast falling
-    # further behind every hour" 1-2 hours earlier than the legacy path.
-    # Falls back to the halflife decay when fewer than 3 points are available.
-    PROJECTION_RESIDUAL_SLOPE_ENABLED: bool = True
 
     # ------------------------------------------------------------------
     # Forecast-exceedance alert tunables
@@ -420,9 +416,6 @@ class Settings(BaseSettings):
     EXCEEDANCE_ALERT_COOLDOWN_MINUTES: int = 30
     EXCEEDANCE_RESIDUAL_DECAY_HALFLIFE_H: float = 2.0
     EXCEEDANCE_RESIDUAL_TREND_CARRY_K: float = 0.5
-    EXCEEDANCE_RESIDUAL_SLOPE_MIN_POINTS: int = 3
-    EXCEEDANCE_RESIDUAL_SLOPE_HOURS_CAP: float = 3.0
-    EXCEEDANCE_RESIDUAL_SLOPE_MAX_F_PER_HR: float = 1.5
 
     # ------------------------------------------------------------------
     # Post-peak trend-carry tunables (shared by forecast_exceedance and
@@ -472,7 +465,7 @@ class Settings(BaseSettings):
     # 1.4°C, so the band now refuses NO on the forecast/observed bucket AND
     # its immediate °C neighbours — a hedge against the ±~1°C divergence
     # between our routine-METAR daily max and Polymarket's resolver (the same
-    # divergence that disabled `range_overshoot`). Validated via `evals-report
+    # divergence that killed the removed `range_overshoot` lock). Validated via `evals-report
     # --operator bracket-like` (the single-bucket-NO-guard-tuning section):
     # margin 2.5 / cap 0.85 gave the best survivor EV while cutting ~58% of NO
     # volume.
@@ -485,14 +478,9 @@ class Settings(BaseSettings):
     # risk/reward), pruning the marginal near-certain NO bets that bled.
     SINGLE_BUCKET_MAX_NO_PROB: float = 0.85
 
-    # The range_overshoot lock branch (NO when observed max overshoots the
-    # range high by 2× margin) lost -$57.61 across 18 trades (56% win) on
-    # exactly markets — systematic resolver/observation divergence (our
-    # routine-METAR daily max reads hotter than Polymarket's resolver), not
-    # a margin problem (2× was already applied). Disabled by default; the
-    # range_in_window (YES) branch is kept; range_undershoot is independently
-    # gated below.
-    RANGE_OVERSHOOT_LOCK_ENABLED: bool = False
+    # (The `range_overshoot` NO lock branch + its RANGE_OVERSHOOT_LOCK_ENABLED
+    # flag were removed 2026-06-24 — lost -$57.61 / 56% win on °C resolver
+    # divergence; see docs/graveyard.md.)
 
     # The range_undershoot lock branch (NO when observed max undershoots the
     # range low by 2× margin AND no-more-heating) is, like every bucket/range
@@ -506,6 +494,7 @@ class Settings(BaseSettings):
     # True preserves behavior, the live `.env` sets it False to gate the bleed.
     # Re-enable only after `SIGMA_FLOOR_LEAD_TIME_ENABLED` lands and the class
     # turns +EV. range_in_window (YES) is unaffected.
+    # GRAVEYARD: RANGE_UNDERSHOOT_LOCK_ENABLED — docs/graveyard.md#range_undershoot_lock_enabled--range_undershoot-no-lock-branch (status: suspended)
     RANGE_UNDERSHOOT_LOCK_ENABLED: bool = True
 
     # Master switch for bracket-like NO (`exactly`/`range`/`bracket` BUY_NO)
@@ -528,14 +517,13 @@ class Settings(BaseSettings):
     #
     # Scope: probability path only. The lock path (`evaluate_lock` →
     # `_evaluate_range_lock`) does NOT go through `binary_market_edge`, so
-    # `range_in_window`/`range_undershoot` YES locks keep firing.
-    # `range_overshoot` NO is independently gated by
-    # `RANGE_OVERSHOOT_LOCK_ENABLED`. Threshold ops
+    # `range_in_window`/`range_undershoot` YES locks keep firing. Threshold ops
     # (above/at_least/below/at_most) are unaffected on both sides.
     #
     # Default False = no behavior change. Flip True in `.env` to stop the
     # bleed; flip back when the σ-recalibration backlog item lands and the
     # evals-report tuner shows survivors at +EV.
+    # GRAVEYARD: BRACKET_LIKE_NO_DISABLED — docs/graveyard.md#bracket_like_no_disabled--kill-switch-for-bracket-like-exactlyrangebracket-buy_no-in-the-probability-path (status: suspended)
     BRACKET_LIKE_NO_DISABLED: bool = False
 
     # --- Price-band edge policy (2026-06-06 perf audit) -----------------
@@ -558,6 +546,7 @@ class Settings(BaseSettings):
     # Precedence: P1 (block) wins when both are set. Both default to no-op.
     VALLEY_PRICE_LOW: float = 0.60
     VALLEY_PRICE_HIGH: float = 0.85
+    # GRAVEYARD: VALLEY_BLOCK_ENABLED / VALLEY_MIN_EDGE — docs/graveyard.md#valley_block_enabled--valley_min_edge--price-band-overconfidence-valley-policy (status: suspended)
     VALLEY_BLOCK_ENABLED: bool = False
     VALLEY_MIN_EDGE: float | None = None
 

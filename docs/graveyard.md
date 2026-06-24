@@ -1,21 +1,146 @@
 # Graveyard
 
-A permanent record of features, modules, and code paths removed from
-WeatherEdge — so we don't re-attempt the same failed idea later. Append
-only; one entry per deletion.
+A permanent record of WeatherEdge decisions about hypotheses that are **dead**
+(removed) or **suspended** (gated off, code kept). The single place to answer
+"why is this gone / why is this off / what would it take to bring it back" —
+so we don't re-attempt a failed idea or rebuild a deliberately-paused one.
 
-## Entry format
+This is the **decision-mark** index. Every disabled or removed hypothesis links
+here from a one-line code sentinel:
+
+```python
+# GRAVEYARD: <name> — docs/graveyard.md#<anchor>   (status: removed | suspended)
+```
+
+## Statuses
+
+- **removed** — code deleted; lives only in git history. Re-introducing means
+  re-writing it. Use the *removed-entry format* below.
+- **suspended** — code + `.env`/Settings flag kept (an operational lever), but
+  the feature is OFF and must NOT be turned on until its **re-enable criterion**
+  is met. Use the *suspended-entry format*. Listed in [Suspended hypotheses](#suspended-hypotheses).
+
+## Entry formats
 
 ```markdown
-## YYYY-MM-DD — <feature / symbol name> (<files removed>)
-
+## YYYY-MM-DD — <feature / symbol name> (<files removed>)   [removed]
 **Removed in:** <commit SHA>
 **Why originally added:** <one paragraph or "unknown — predates audit">
 **Why removed:** <evidence: no callers / lost $X / unpopulated for N days / superseded by Y>
 **What we learned:** <so we don't re-attempt; may be "TBD" for older entries>
 ```
 
+```markdown
+### <FLAG_NAME> — <one-line what>   [suspended]
+**Suspended:** <date> · **Flag:** <env/Settings state> · **Code:** <where it lives>
+**Why off:** <evidence: lost $X / overconfident Npp / fails gate>
+**Re-enable when:** <the concrete prerequisite + how to verify> (or "permanent — do not re-enable")
+```
+
 ---
+
+## Suspended hypotheses
+
+Gated off, code retained as an operational lever. **Do not flip on** without the
+stated prerequisite. Deeper history for each lives in CLAUDE.md + `~/.claude` memory;
+this is the consolidated decision index.
+
+### BRACKET_LIKE_NO_DISABLED — kill switch for bracket-like (`exactly`/`range`/`bracket`) BUY_NO in the probability path
+**Suspended:** 2026-05-30 · **Flag:** live `.env`=`True` (Settings default `False`) · **Code:** `src/signals/edge_calculator.py::binary_market_edge`
+**Why off:** all-time −$260 / −7.4% ROI on 383 trades; surviving NO evals still −0.023 EV/$1 after the three single-bucket guards. Each single-°C bucket evaluated as an independent binary → tight Gaussian on an over-forecast peak makes every neighbour look near-impossible.
+**Re-enable when:** `SIGMA_FLOOR_LEAD_TIME_ENABLED` ships AND `evals-report --operator bracket-like` baseline (all-passing) row shows +EV. Lock-path range YES / threshold ops / `exactly` YES are unaffected and keep firing.
+
+### RANGE_UNDERSHOOT_LOCK_ENABLED — `range_undershoot` NO lock branch
+**Suspended:** 2026-06-03 · **Flag:** live `.env`=`False` (Settings default `True`, so the `.env` line is REQUIRED to gate it) · **Code:** `src/signals/lock_rules.py::_evaluate_range_lock`
+**Why off:** ~9pp model-overconfident (won 71.4% vs 80.8% price-implied break-even) → −$26.52 / 35 trades / 30d. Measurable resolver divergence is unbiased (±0.1°F), so this is a σ-collapse symptom (σ too tight on narrow windows), NOT a °C correction target.
+**Re-enable when:** `SIGMA_FLOOR_LEAD_TIME_ENABLED` lands and the class turns +EV. `range_in_window` (YES) is unaffected.
+
+### NEAR_LOCK_CONVICTION_SIZING_ENABLED — prob-cap bypass for near-lock threshold bets
+**Suspended:** 2026-06-21 · **Flag:** `.env` + DO env=`False` (Settings default `False`) · **Code:** `src/execution/binary_market.py::near_lock_conviction_eligible`, `src/risk/kelly.py::size_position(prob_cap=)`
+**Why off:** the v1 gate (`prob≥0.99 + hours_until_peak≤0`) fired 96% on degenerate Open-Meteo-failed states, amplifying the NO/forecast bets the HARD-lock path correctly refuses. Gate REBUILT 2026-06-21 (requires `has_forecast` + target-day-anchored observed max ≥ threshold + `NEAR_LOCK_CONVICTION_MARGIN_F`, betting-hot direction only).
+**Re-enable when:** the rebuilt gate is validated firing on real observational locks (`decision_logs.metadata.conviction=true` → `trade_filled` on genuine YES-`at_least` locks, settling +EV).
+
+### SIGMA_FLOOR_LEAD_TIME_ENABLED — lead-time-aware σ floor (probability-engine Gaussian)
+**Suspended:** 2026-05-30 · **Flag:** Settings default `False` · **Code:** `src/signals/probability_engine.py::_compute_sigma`
+**Why off:** addresses the bracket-like-NO / range-undershoot σ-collapse root cause but also touches the working threshold path; `backtest-v2` A/B is neutral (Brier 0.0537→0.0525, no clear win). `SHADOW_SIGMA_LEADTIME_ENABLED` (default True, pure telemetry) measures it dark.
+**Re-enable when:** `shadow-report --key sigma` shows positive `sigma.delta` concentrated on far-from-peak evals joined to bracket-like-NO outcomes; pair the flip with re-enabling `BRACKET_LIKE_NO_DISABLED=False`.
+
+### PER_OPERATOR_CALIBRATION_ENABLED — split calibration fit by operator class
+**Suspended:** 2026-05-31 · **Flag:** Settings default `False` · **Code:** `src/signals/calibration.py`
+**Why off:** the n=55 threshold-class fit was degenerate (slope +3.64 → mapped raw 0.78 to 0.04, would have destroyed threshold trading). A degenerate-fit guardrail (slope ∈ [0.2, 2.0]) now makes a bad class-fit fall back to pooled, so the flag is safe to flip — but the data still says NO.
+**Re-enable when:** `shadow-report` shows the per-class threshold fit un-squashes the 0.78–0.85 band (positive `cal.delta` in-band) on a non-degenerate sample.
+
+### VALLEY_BLOCK_ENABLED / VALLEY_MIN_EDGE — price-band "overconfidence valley" policy
+**Suspended:** 2026-06-06 · **Flag:** Settings default `False` / `None` · **Code:** `src/signals/edge_calculator.py::_in_price_valley`
+**Why off:** per-trade EV is U-shaped in the side-buy price; the [0.60,0.85) mid valley is −EV. P1 (block) and P2 (raised edge floor) were tuned in-sample on n=8 removed trades. `SHADOW_VALLEY_POLICY_ENABLED` (default True) stamps the counterfactual.
+**Re-enable when:** `valley-report` (joins `shadow_json.valley` to `market_resolutions.yes_won`) confirms the P1/P2 cohort is +EV out-of-sample on a meaningful n.
+
+### BRACKET_MARKETS_ENABLED — evaluate `bracket`/`range` multi-outcome markets
+**Suspended:** 2026-05-08 · **Flag:** Settings default `False` · **Code:** gate in `src/scheduler` `job_unified_pipeline` + `job_fast_lock_poll`
+**Why off:** live data showed −21pp model overconfidence on bracket markets. The *dead* multi-bucket evaluator (`compute_edges`) was removed 2026-05-30 (see [removed](#removed-hypotheses)); what remains is the operational kill switch that skips `bracket`/`range` markets. `exactly` markets are unaffected (handled by `binary_market_edge`'s single-bucket bracket-like branch). NOT removed because flipping/deleting the gate changes which markets trade.
+**Re-enable when:** 4 consecutive weeks of threshold-market Brier < 0.10, then a 2-week bracket measurement window with `CLUSTER_STAKE_CAP_USD` capping cluster risk (see `docs/improvements.md`).
+
+### CLIMATE_PRIOR_ENABLED — Bayesian climate-prior blend (probability engine)
+**Suspended:** planned-not-built · **Flag:** Settings default `False` · **Code:** `src/signals/probability_engine.py::_apply_climate_prior`, `src/ingestion/station_normals.py`
+**Why off:** the entire blend is wired and tested, but `station_normals` is unpopulated — `get_normal()` returns `None` and the blend no-ops. NOT cruft (the wiring is the asset); the one missing piece is the backfill loader.
+**Re-enable when:** `scripts/backfill_station_normals.py` (the ERA5/Open-Meteo archive pull, ~50–100 LOC; see `docs/improvements.md [climate-prior backlog]`) populates `station_normals`, then flip the flag.
+
+---
+
+## Removed hypotheses
+
+## 2026-06-24 — Residual-slope projection "v2" (`PROJECTION_RESIDUAL_SLOPE_ENABLED`)   [removed]
+
+**Removed in:** _(pending commit — Phase 1 of the 2026-06-24 refactor)_
+**Files:** `src/signals/projection.py` (slope branch in `project_with_residual` + the
+`prefer_slope` param — `project_with_residual` merged into `project_daily_max`),
+`src/signals/forecast_exceedance.py` (dual `legacy_projected=` A/B logging + the
+`_project_with_residual` import + the `RESIDUAL_SLOPE_*` module aliases), `src/config.py`
+(`PROJECTION_RESIDUAL_SLOPE_ENABLED` + `EXCEEDANCE_RESIDUAL_SLOPE_MIN_POINTS`/`_HOURS_CAP`/`_MAX_F_PER_HR`),
+`.env` (flag line), `tests/test_forecast_exceedance.py` (the `TestProjectDailyMaxResidualSlope`
+class → replaced by a 2-test `TestProjectDailyMaxPrePeakHalflife`).
+
+**Why originally added:** "lever A" of the projection-latency redesign — project the
+forecast residual forward at its observed hourly slope (instead of halflife-decaying the level
+residual) to catch "forecast falling further behind every hour" 1-2 hours earlier.
+
+**Why removed:** live data showed v2 **overshoots the warming concavity** at high-volume
+stations (KLAX/KJFK/RKSI/LFPG strictly worse than the raw forecast). It was disabled in the live
+`.env` (`PROJECTION_RESIDUAL_SLOPE_ENABLED=False`) "pending a v3 redesign" that never came — the
+slope branch had been dead in production for weeks while `project_with_residual` carried a
+`prefer_slope` param whose only remaining purpose was a now-redundant A/B log (both legs degenerate
+to the halflife branch when the flag is off, so `projected==legacy_projected` on every row).
+
+**What we learned:** the `forecast_residual_slope_f_per_hr` / `forecast_residual_count` fields on
+`WeatherState` (and `state_aggregator._compute_residual_slope`) are **kept** — they still feed the
+diagnostic `slope=…°F/hr n=…` reasoning trail and have independent tests. Removing a projector
+≠ removing its inputs; check who else reads the inputs before deleting them.
+
+## 2026-06-24 — `range_overshoot` NO lock branch (`RANGE_OVERSHOOT_LOCK_ENABLED`)   [removed]
+
+**Removed in:** _(pending commit — Phase 1 of the 2026-06-24 refactor)_
+**Files:** `src/signals/lock_rules.py` (`_evaluate_range_lock` overshoot branch +
+`LockDecision` docstring entry), `src/config.py` (`RANGE_OVERSHOOT_LOCK_ENABLED`),
+`src/signals/config_epoch.py` (tracked-flag entry), `tests/test_lock_rules.py`
+(`test_overshoot_*` methods + the `TestRangeOvershootFlag` class), comment refs in
+`cli.py` / `market_resolution.py` / `lock_rule_executor.py`.
+
+**Why originally added:** a deterministic NO lock for range/`exactly` markets — fire NO when the
+observed routine-METAR daily max already overshoots the range high by 2× margin (mathematically
+"can't land in the window"), gated behind a 2×-margin + rc≥4 filter.
+
+**Why removed:** won only 56% across 18 trades (−$57.61), concentrated in °C cities — our
+routine-METAR daily max reads systematically hotter than Polymarket's resolver, so the "obviously
+locked" overshoot fired on a max the resolver never recorded. The Phase-3 divergence audit
+(2026-05-31, 535 settled rows) found measurable divergence ~0.00°C/abs-mean 0.28°F — i.e. the
+hot-bias theory is **unsupported at current volume**, so there's no °C-correction path that revives
+this branch. It sat `RANGE_OVERSHOOT_LOCK_ENABLED=False` (off) with no path forward.
+
+**What we learned:** `RANGE_LOCK_MARGIN_MULTIPLIER` is **kept** — it's shared by the
+`range_undershoot` branch (suspended) and the super-margin EASY gate. `range_undershoot` stays
+(suspended, has a σ-floor re-enable path); only the overshoot twin, which has no path, was removed.
+The `lock_branch` enum comment in `models.py` keeps `'range_overshoot'` because historical `Signal`
+rows still carry it.
 
 ## 2026-05-30 — `Signal.gfs_prob` / `ecmwf_prob` / `aviation_prob` / `wx_prob` columns
 

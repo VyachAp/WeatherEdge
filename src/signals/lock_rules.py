@@ -37,9 +37,9 @@ class LockDecision:
       'easy_super'      — observed max ≥ threshold + 2×LOCK_MARGIN_F (routines≥2)
       'easy_standard'   — observed max ≥ threshold + LOCK_MARGIN_F (routines≥MIN)
       'hard'            — observed max << threshold AND no_more_heating
-      'range_overshoot' — current_max ≥ range_high + 2×LOCK_MARGIN_F (rc≥4)
       'range_undershoot'— current_max ≤ range_low - 2×LOCK_MARGIN_F (rc≥4) AND no_more_heating
       'range_in_window' — current_max in [low, high] + past peak + no upward
+    ('range_overshoot' was removed 2026-06-24; historical Signal rows keep it.)
     None when ``side is None``.
     """
 
@@ -299,52 +299,28 @@ def _evaluate_range_lock(
 ) -> LockDecision:
     """Lock evaluation for [low, high] range / single-value-exactly markets.
 
-    Three deterministic outcomes:
-      * NO overshoot — observed max already > high + 2*margin AND
-        routine_count >= RANGE_LOCK_MIN_ROUTINES.
+    Two deterministic outcomes (the `range_overshoot` NO branch was removed
+    2026-06-24 — °C resolver divergence; see docs/graveyard.md):
       * NO undershoot — observed max < low - 2*margin AND no more heating
-        possible AND routine_count >= RANGE_LOCK_MIN_ROUTINES.
+        possible AND routine_count >= RANGE_LOCK_MIN_ROUTINES. Gated off in the
+        live `.env` (`RANGE_UNDERSHOOT_LOCK_ENABLED=False`, suspended).
       * YES in-range — observed max inside [low, high] AND past peak AND
         no upward signal (solar declining + flat/falling METAR trend) AND
         forecast peak does not exceed high.
 
-    The 2x-margin + rc>=4 gates on overshoot/undershoot reflect that
-    `exactly` markets have asymmetric payoffs at LOCK_RULE_MAX_PRICE=0.95:
-    each win returns ~$1, each loss costs ~$5-10. Two LOST trades over the
-    last 30 days (rc=6 and rc=27 overshoots) cost ~$19 vs ~$17 from all
-    other wins combined. Doubling the margin and raising the routine floor
-    eliminates the borderline edge cases that produced those losses.
+    The 2x-margin + rc>=4 gate on undershoot reflects that `exactly` markets
+    have asymmetric payoffs at LOCK_RULE_MAX_PRICE=0.95: each win returns ~$1,
+    each loss costs ~$5-10, so borderline early-day fires must be filtered out.
     """
     range_min_rc = max(settings.MIN_ROUTINE_COUNT, RANGE_LOCK_MIN_ROUTINES)
 
-    # NO overshoot — require 2x margin to filter out borderline early-day fires.
-    # Gated off by default (settings.RANGE_OVERSHOOT_LOCK_ENABLED): live data
-    # (2026-05-22) shows this branch lost -$57.61 / 56% win across many °C
-    # cities — systematic resolver-vs-METAR divergence, not a margin issue.
-    # Read the flag live off `settings` so .env + monkeypatch take effect.
-    if (
-        settings.RANGE_OVERSHOOT_LOCK_ENABLED
-        and current_max_f >= high_f + RANGE_LOCK_MARGIN_MULTIPLIER * margin
-        and routine_count >= range_min_rc
-    ):
-        return LockDecision(
-            side="NO",
-            reasons=[
-                f"market-day max {current_max_f:.1f}°F >= range upper "
-                f"{high_f:.0f}°F + {RANGE_LOCK_MARGIN_MULTIPLIER * margin:.1f}°F (2x margin) ({op})",
-                f"routine_count={routine_count} (min {range_min_rc})",
-            ],
-            margin_f=current_max_f - high_f,
-            branch="range_overshoot",
-            routine_count=routine_count,
-            observed_max_f=current_max_f,
-        )
-
-    # NO undershoot — symmetric 2x margin + rc gate. Gated by
+    # NO undershoot — 2x margin + rc gate. Gated by
     # settings.RANGE_UNDERSHOOT_LOCK_ENABLED (default True; live .env sets
     # False): the branch is ~9pp model-overconfident (-$26.52/30d, 2026-06-03
-    # audit). Read the flag live off `settings` so .env + monkeypatch take
-    # effect, mirroring RANGE_OVERSHOOT_LOCK_ENABLED above.
+    # audit) — see docs/graveyard.md (suspended). Read the flag live off
+    # `settings` so .env + monkeypatch take effect.
+    # (The symmetric `range_overshoot` NO branch was removed 2026-06-24 — it lost
+    # -$57.61 / 56% win on °C resolver divergence; see docs/graveyard.md.)
     if (
         settings.RANGE_UNDERSHOOT_LOCK_ENABLED
         and current_max_f <= low_f - RANGE_LOCK_MARGIN_MULTIPLIER * margin

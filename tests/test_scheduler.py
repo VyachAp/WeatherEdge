@@ -8,13 +8,15 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from src.scheduler import (
-    _has_active_trade,
-    _log_evaluation,
-    _minimal_state_for_easy_lock,
-    _should_skip_future_day,
-    _upsert_signal,
+from src.execution.binary_market import should_skip_future_day as _should_skip_future_day
+from src.execution.lock_rule_executor import (
+    minimal_state_for_easy_lock as _minimal_state_for_easy_lock,
 )
+from src.persistence.dedup import (
+    has_active_trade as _has_active_trade,
+    upsert_signal as _upsert_signal,
+)
+from src.signals.evaluation_log import log_evaluation as _log_evaluation
 from src.signals.lock_rules import evaluate_lock
 
 
@@ -133,7 +135,7 @@ class TestBinaryMarketEdgeSideSelection:
     @staticmethod
     def _setup(*, our_prob_yes, yes_price, op="at_least", threshold=80,
                depth_yes=100.0, depth_no=100.0):
-        from src.scheduler import _binary_market_edge
+        from src.signals.edge_calculator import binary_market_edge as _binary_market_edge
         from src.signals.probability_engine import BucketDistribution
 
         market = SimpleNamespace(
@@ -201,7 +203,7 @@ class TestBinaryMarketEdgeSideSelection:
         # explicitly so that our_prob_yes for 'below' is 0.30 (model thinks
         # max-below-80 is unlikely; market overprices it at 0.55) → NO edge.
         from src.db.models import TradeDirection
-        from src.scheduler import _binary_market_edge
+        from src.signals.edge_calculator import binary_market_edge as _binary_market_edge
         from src.signals.probability_engine import BucketDistribution
 
         market = SimpleNamespace(
@@ -278,7 +280,7 @@ class TestBinaryMarketEdgeAsymmetricPricing:
     @staticmethod
     def _eval(*, our_prob_yes, yes_bid, yes_ask, op="exactly", threshold=82,
               depth_yes=100.0, depth_no=100.0):
-        from src.scheduler import _binary_market_edge
+        from src.signals.edge_calculator import binary_market_edge as _binary_market_edge
         from src.signals.probability_engine import BucketDistribution
 
         market = SimpleNamespace(
@@ -339,7 +341,7 @@ class TestBinaryMarketEdgeAsymmetricPricing:
         # legacy callers were storing). Same scenario as the Taipei one
         # but without the quote — phantom edge IS reported. This test
         # documents the fallback so we know if it ever changes.
-        from src.scheduler import _binary_market_edge
+        from src.signals.edge_calculator import binary_market_edge as _binary_market_edge
         from src.signals.probability_engine import BucketDistribution
 
         market = SimpleNamespace(
@@ -386,7 +388,7 @@ class TestBinaryMarketEdgeLeadGate:
     @staticmethod
     def _eval(*, hours_to_close, op="exactly", our_prob_yes=0.10,
               yes_bid=0.45, yes_ask=0.55, threshold=82):
-        from src.scheduler import _binary_market_edge
+        from src.signals.edge_calculator import binary_market_edge as _binary_market_edge
         from src.signals.probability_engine import BucketDistribution
 
         market = SimpleNamespace(

@@ -359,7 +359,7 @@ async def try_lock_rule_trade(
         return 0.0
 
     # Cluster cap also applies to lock-rule fires on bracket/exactly
-    # markets (range_overshoot/undershoot/in_window branches). Threshold
+    # markets (range_undershoot/in_window branches). Threshold
     # markets are unaffected because ``cluster_stake_used`` returns 0.0
     # for non-bracket-like operators.
     if settings.CLUSTER_STAKE_CAP_USD > 0:

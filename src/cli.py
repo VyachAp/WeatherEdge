@@ -8,6 +8,52 @@ from datetime import datetime, timedelta, timezone
 
 import click
 
+# Pure report aggregators were extracted to ``src.analysis`` (Phase 2a) so the
+# self-improvement loop can import them without Click. Re-exported here for
+# back-compat: tests + the CLI commands still reference ``cli._calibration_report``
+# etc. (constants too, used by the async DB-query helpers that stayed behind).
+from src.analysis.calibration import (  # noqa: E402,F401
+    _OBS_BINS,
+    _calibration_report,
+    _score_cohort,
+    _would_trade_ev,
+)
+from src.analysis.common import (  # noqa: E402,F401
+    _OP_BRACKET,
+    _OP_THRESHOLD,
+    _PERF_RESOLVED,
+    _brier,
+    _flatten_shadow,
+    _is_phantom_lost,
+    _logloss,
+    _op_class,
+    _quantiles,
+    _threshold_yes_won,
+    _valley_bet_won,
+    _valley_ev_per_dollar,
+)
+from src.analysis.conviction import _summarize_conviction_locks  # noqa: E402,F401
+from src.analysis.divergence import _aggregate_divergence  # noqa: E402,F401
+from src.analysis.epochs import _flags_diff  # noqa: E402,F401
+from src.analysis.exposure import _summarize_exposure  # noqa: E402,F401
+from src.analysis.perf import (  # noqa: E402,F401
+    _detect_calibration_squash_local,
+    render_perf_digest,
+)
+from src.analysis.pnl import (  # noqa: E402,F401
+    _GATE_MIN_N,
+    _PERF_THROTTLE_OUTCOMES,
+    _flip_gate_verdicts,
+    _loss_classes,
+    _perf_tradeable,
+    _realized_pnl,
+    _summarize_floored_fills,
+    _throttle_breakdown,
+    _window_regression,
+)
+from src.analysis.shadow import _summarize_shadow  # noqa: E402,F401
+from src.analysis.valley import _aggregate_valley  # noqa: E402,F401
+
 
 @click.group()
 def main() -> None:
@@ -193,22 +239,10 @@ def paper_trade(days: int) -> None:
 # --- Telemetry-report shared helpers -------------------------------------
 # Operator classification splits the two telemetry tables the same way the
 # trading paths treat them: the 2026-05-22/23 quality cuts (lead gate,
-# landing-band, NO-prob cap, range_overshoot) all target *bracket-like* ops,
+# landing-band, NO-prob cap) all target *bracket-like* ops,
 # while *threshold* ops are the clean class. The reports pivot on this split
 # so "expected bracket-guard cuts" can be told apart from "threshold volume
 # suppressed by the bracket-era global MIN_PROBABILITY / MIN_EDGE".
-_OP_THRESHOLD = ("above", "at_least", "below", "at_most")
-_OP_BRACKET = ("exactly", "range", "bracket")
-
-
-def _op_class(op: str | None) -> str:
-    if op in _OP_THRESHOLD:
-        return "threshold"
-    if op in _OP_BRACKET:
-        return "bracket-like"
-    return "other"
-
-
 async def _load_market_map(session, market_ids):
     """Batch-load ``market_id -> Market`` for a set of telemetry rows.
 
@@ -274,620 +308,6 @@ async def _daily_max_by_station_day(session, icaos, utc_start, utc_end):
         key = (icao, local_date)
         if key not in out or temp_f > out[key]:
             out[key] = temp_f
-    return out
-
-
-def _threshold_yes_won(op: str, threshold: float, actual_max_f: float) -> bool:
-    """Did the YES side win under real resolution semantics.
-
-    Uses the true inequality the market resolves on (not the engine's integer
-    bucket approximation): ``above`` is strict ``>``, ``at_least`` is ``>=``,
-    ``below`` strict ``<``, ``at_most`` is ``<=``. ``actual_max_f`` is the
-    routine-METAR daily max (our proxy for Polymarket's resolver max — they
-    diverge for °C cities, hence the advisory caveat). Threshold is in °F to
-    match ``actual_max_f`` (binary_market_edge treats parsed_threshold as °F).
-    """
-    if op == "above":
-        return actual_max_f > threshold
-    if op == "at_least":
-        return actual_max_f >= threshold
-    if op == "below":
-        return actual_max_f < threshold
-    # at_most
-    return actual_max_f <= threshold
-
-
-# --- Measurement-layer report helpers (Phase 0 readers) ------------------
-# These are PURE functions over plain dicts (no DB, no click) so the
-# number-crunching behind exposure-report / resolution-report /
-# shadow-report / epochs is unit-testable without mocking the async
-# session — mirroring the pure M3 logic in signals.market_resolution.
-
-
-def _quantiles(values: list[float]) -> tuple[float, float, float] | None:
-    """Nearest-rank p25/p50/p75 (module-level; shared by the reports).
-
-    Nearest-rank for tiny samples — interpolation isn't worth a numpy
-    dependency here. Returns None for an empty input.
-    """
-    if not values:
-        return None
-    s = sorted(values)
-    n = len(s)
-    p25 = s[max(0, n // 4 - 1)]
-    p50 = s[n // 2]
-    p75 = s[min(n - 1, (3 * n) // 4)]
-    return p25, p50, p75
-
-
-def _summarize_exposure(rows: list[dict], min_stake: float = 5.0) -> dict:
-    """Summarise a window of ``exposure_snapshots`` rows (as dicts).
-
-    Reports the Phase-0 capital gate: per-tick headroom quantiles + the
-    fraction of ticks where headroom fell below one minimum stake (i.e.
-    a new bet could not be funded). ``by_class`` sums the per-tick
-    ``n_open_by_class`` so the bracket-vs-threshold exposure split is
-    visible. Empty input → ``{"count": 0}``.
-    """
-    if not rows:
-        return {"count": 0}
-    headroom = [float(r["headroom"]) for r in rows]
-    by_class: dict[str, int] = {}
-    for r in rows:
-        for k, v in (r.get("n_open_by_class") or {}).items():
-            by_class[k] = by_class.get(k, 0) + int(v)
-    n_low = sum(1 for h in headroom if h < min_stake)
-    n_open_q = _quantiles([float(r.get("n_open") or 0) for r in rows])
-    return {
-        "count": len(rows),
-        "headroom": _quantiles(headroom),
-        "exposure": _quantiles([float(r["exposure"]) for r in rows]),
-        "equity": _quantiles([float(r["equity"]) for r in rows]),
-        "effective_cap": _quantiles([float(r["effective_cap"]) for r in rows]),
-        "n_open_median": n_open_q[1] if n_open_q else 0.0,
-        "by_class": by_class,
-        "low_headroom_frac": n_low / len(rows),
-    }
-
-
-def _aggregate_divergence(rows: list[dict]) -> list[dict]:
-    """Per-(station, unit) resolver-divergence stats from M3 rows (dicts).
-
-    Only rows that have both ``divergence_f`` and ``routine_metar_max_f``
-    (i.e. the daily-settlement backfill has run) contribute. Returns a
-    list of ``{station_icao, unit, n, mean, std, min, max}`` sorted by
-    ``|mean|`` desc — the worst-diverging stations first. This is the
-    Phase-3 audit surface.
-    """
-    from collections import defaultdict
-
-    groups: dict[tuple, list[float]] = defaultdict(list)
-    for r in rows:
-        if r.get("divergence_f") is None or r.get("routine_metar_max_f") is None:
-            continue
-        groups[(r.get("station_icao"), r.get("unit"))].append(float(r["divergence_f"]))
-    out: list[dict] = []
-    for (icao, unit), vals in groups.items():
-        n = len(vals)
-        mean = sum(vals) / n
-        std = (sum((v - mean) ** 2 for v in vals) / n) ** 0.5 if n else 0.0
-        out.append({
-            "station_icao": icao, "unit": unit, "n": n,
-            "mean": mean, "std": std, "min": min(vals), "max": max(vals),
-        })
-    out.sort(key=lambda d: abs(d["mean"]), reverse=True)
-    return out
-
-
-_OBS_BINS: tuple[tuple[str, float, float], ...] = (
-    ("0.00-0.25", 0.00, 0.25),
-    ("0.25-0.50", 0.25, 0.50),
-    ("0.50-0.75", 0.50, 0.75),
-    ("0.75-1.00", 0.75, 1.0001),  # include the past-peak 1.0 rows
-)
-
-
-def _brier(p: float, y: int) -> float:
-    return (p - y) ** 2
-
-
-def _logloss(p: float, y: int) -> float:
-    import math
-    eps = 1e-6
-    p = min(1.0 - eps, max(eps, p))
-    return -(y * math.log(p) + (1 - y) * math.log(1.0 - p))
-
-
-def _score_cohort(rows: list[dict]) -> dict | None:
-    """Brier/log-loss of our prob vs the market baseline for one cohort.
-
-    Each row needs ``updated_yes`` (our P(YES)), ``market_mid`` (the market's
-    implied P(YES)), and ``yes_won`` (the 0/1 label). The promotion gate is
-    ``model_beats_market``: our scores strictly lower (better) than just trusting
-    the price. Returns None for an empty cohort.
-    """
-    labeled = [r for r in rows if r.get("yes_won") is not None
-               and r.get("market_mid") is not None]
-    if not labeled:
-        return None
-    n = len(labeled)
-    mb = sum(_brier(float(r["updated_yes"]), int(r["yes_won"])) for r in labeled) / n
-    kb = sum(_brier(float(r["market_mid"]), int(r["yes_won"])) for r in labeled) / n
-    ml = sum(_logloss(float(r["updated_yes"]), int(r["yes_won"])) for r in labeled) / n
-    kl = sum(_logloss(float(r["market_mid"]), int(r["yes_won"])) for r in labeled) / n
-    return {
-        "n": n,
-        "model_brier": mb, "market_brier": kb,
-        "model_logloss": ml, "market_logloss": kl,
-        "model_beats_market": (mb < kb and ml < kl),
-    }
-
-
-def _would_trade_ev(rows: list[dict]) -> dict:
-    """Realised win-rate + EV/$1 of the shadow bets the model WOULD have placed.
-
-    A bet wins iff its chosen side matches the outcome (YES↔yes_won). Profit per
-    $1 staked = ``1/price - 1`` on a win, ``-1`` on a loss, where ``price`` is the
-    modelled all-in ``effective_cost``. Empty → ``{"n": 0}``.
-    """
-    bets = [r for r in rows if r.get("would_trade") and r.get("yes_won") is not None
-            and r.get("side") and r.get("effective_cost")]
-    if not bets:
-        return {"n": 0}
-    wins, ev = 0, 0.0
-    for r in bets:
-        won = (r["side"] == "YES") == bool(r["yes_won"])
-        price = min(0.999, max(0.001, float(r["effective_cost"])))
-        ev += (1.0 / price - 1.0) if won else -1.0
-        wins += 1 if won else 0
-    return {"n": len(bets), "win_rate": wins / len(bets), "ev_per_dollar": ev / len(bets)}
-
-
-def _calibration_report(rows: list[dict]) -> dict:
-    """Promotion-gate aggregation for the shadow ledger (pure).
-
-    Buckets every labeled shadow prediction by observation-fraction and scores
-    our probability against the market baseline (Brier + log-loss). The
-    information-latency thesis predicts ``model_beats_market`` should turn True
-    as ``obs_fraction`` rises (we know more than the market near peak) and stay
-    False far from peak (forecast disagreement = noise). Also splits by operator
-    class and reports the EV of the bets the model would have placed.
-    """
-    overall = _score_cohort(rows)
-    buckets = []
-    for label, lo, hi in _OBS_BINS:
-        cohort = [r for r in rows if lo <= float(r.get("obs_fraction") or 0.0) < hi]
-        sc = _score_cohort(cohort)
-        if sc is not None:
-            sc["bucket"] = label
-            buckets.append(sc)
-    by_class: dict[str, dict] = {}
-    for cls in ("threshold", "bracket-like"):
-        sc = _score_cohort([r for r in rows if r.get("operator_class") == cls])
-        if sc is not None:
-            by_class[cls] = sc
-    return {
-        "n_total": len(rows),
-        "overall": overall,
-        "buckets": buckets,
-        "by_class": by_class,
-        "would_trade": _would_trade_ev(rows),
-    }
-
-
-def _flatten_shadow(obj, prefix: str = "") -> dict:
-    """Flatten a nested ``shadow_json`` dict to dotted leaf keys."""
-    out: dict = {}
-    if isinstance(obj, dict):
-        for k, v in obj.items():
-            key = f"{prefix}.{k}" if prefix else str(k)
-            out.update(_flatten_shadow(v, key))
-    else:
-        out[prefix] = obj
-    return out
-
-
-def _summarize_shadow(shadow_dicts: list[dict]) -> dict:
-    """Per-leaf occupancy + numeric quantiles across shadow_json blobs.
-
-    ``{leaf_key: {"count": int, "quantiles": (p25,p50,p75)|None}}``.
-    Booleans are excluded from the numeric quantiles (they're flags, not
-    measurements). Empty / all-None input → ``{}``.
-    """
-    from collections import defaultdict
-
-    leaves: dict[str, list] = defaultdict(list)
-    for sd in shadow_dicts:
-        if not sd:
-            continue
-        for k, v in _flatten_shadow(sd).items():
-            if v is not None:
-                leaves[k].append(v)
-    out: dict = {}
-    for k, vals in leaves.items():
-        nums = [
-            float(v) for v in vals
-            if isinstance(v, (int, float)) and not isinstance(v, bool)
-        ]
-        out[k] = {"count": len(vals), "quantiles": _quantiles(nums) if nums else None}
-    return out
-
-
-def _valley_bet_won(direction: str, yes_won: bool) -> bool:
-    """Did the counterfactual valley bet win? ``BUY_NO`` wins iff the market
-    resolved NO; ``BUY_YES`` iff it resolved YES."""
-    return (yes_won is False) if direction == "BUY_NO" else (yes_won is True)
-
-
-def _valley_ev_per_dollar(price: float, won: bool) -> float:
-    """Per-$1-staked return of a binary bet at side price ``price``:
-    ``(1-p)/p`` profit on win, ``-1`` (full stake lost) on loss. Break-even
-    win rate = ``price`` — matches the trades-replay ``sum(pnl)/sum(stake)``
-    convention."""
-    if price <= 0.0:
-        return 0.0
-    return ((1.0 - price) / price) if won else -1.0
-
-
-def _aggregate_valley(rows: list[dict]) -> dict:
-    """Score resolved valley evaluations, split by the P2 decision.
-
-    Each row: ``{direction, price, yes_won, p2_would_block}``. Returns
-    ``{"all_valley", "p2_allows", "p2_blocks"}`` — each a summary
-    ``{n, won, win_pct, breakeven_pct, edge_pp, ev_per_usd}`` (rate fields are
-    ``None`` for an empty cohort). ``p2_allows`` (``p2_would_block=False``) is
-    the cohort the P2 policy keeps; the P1→P2 promotion gate is this cohort
-    being +EV (and ideally beating ``p2_blocks``).
-    """
-    def _summ(subset: list[dict]) -> dict:
-        n = len(subset)
-        if n == 0:
-            return {"n": 0, "won": 0, "win_pct": None,
-                    "breakeven_pct": None, "edge_pp": None, "ev_per_usd": None}
-        wins = [_valley_bet_won(r["direction"], r["yes_won"]) for r in subset]
-        won = sum(1 for w in wins if w)
-        be = sum(r["price"] for r in subset) / n
-        ev = sum(_valley_ev_per_dollar(r["price"], w)
-                 for r, w in zip(subset, wins)) / n
-        wp = 100.0 * won / n
-        return {"n": n, "won": won, "win_pct": wp,
-                "breakeven_pct": 100.0 * be, "edge_pp": wp - 100.0 * be,
-                "ev_per_usd": ev}
-
-    return {
-        "all_valley": _summ(rows),
-        "p2_allows": _summ([r for r in rows if not r["p2_would_block"]]),
-        "p2_blocks": _summ([r for r in rows if r["p2_would_block"]]),
-    }
-
-
-def _flags_diff(prev: dict | None, cur: dict | None) -> dict:
-    """``{key: (old, new)}`` for keys whose value changed between epochs."""
-    prev = prev or {}
-    cur = cur or {}
-    diff: dict = {}
-    for k in set(prev) | set(cur):
-        a, b = prev.get(k), cur.get(k)
-        if a != b:
-            diff[k] = (a, b)
-    return diff
-
-
-def _summarize_floored_fills(rows: list[dict]) -> dict:
-    """Win-rate / EV of near-peak floored-up fills vs normal fills.
-
-    The post-flip gate for ``NEAR_PEAK_FLOOR_UP_ENABLED`` (Phase 1): a
-    floored bet can't be shadowed (it's either placed or not), so the
-    discipline is to measure realised outcomes after the flip. ``rows``
-    are filled-trade dicts ``{floored_up: bool, status: str|None,
-    entry_price: float|None}`` where ``status`` is ``won``/``lost``/
-    ``open``/None. Returns ``{floored: {...}, normal: {...}}`` each with
-    n / resolved / won / won_pct / break_even (mean entry price) /
-    ev_per_dollar. The gate passes when the floored bucket's
-    ``won_pct >= break_even`` (equivalently ``ev_per_dollar >= 0``) over a
-    meaningful resolved count. Pure — unit-tested without a DB.
-    """
-    def _bucket(rs: list[dict]) -> dict:
-        resolved = [r for r in rs if r.get("status") in ("won", "lost")]
-        won = [r for r in resolved if r.get("status") == "won"]
-        entries = [
-            float(r["entry_price"]) for r in resolved if r.get("entry_price")
-        ]
-        evs = [
-            (1.0 / float(r["entry_price"]) - 1.0)
-            if r.get("status") == "won" else -1.0
-            for r in resolved if r.get("entry_price")
-        ]
-        return {
-            "n": len(rs),
-            "resolved": len(resolved),
-            "won": len(won),
-            "won_pct": (len(won) / len(resolved)) if resolved else None,
-            "break_even": (sum(entries) / len(entries)) if entries else None,
-            "ev_per_dollar": (sum(evs) / len(evs)) if evs else None,
-        }
-
-    return {
-        "floored": _bucket([r for r in rows if r.get("floored_up")]),
-        "normal": _bucket([r for r in rows if not r.get("floored_up")]),
-    }
-
-
-# --- Perf-review aggregators (automated daily / 3d / 7d evaluation) -------
-# Pure functions feeding the `perf-review` command + scheduler job. Same
-# dict-in/dict-out contract as the Phase-0 readers above so they unit-test
-# without a DB. The PnL helper enforces the project's phantom-LOST-safe
-# methodology: a LOST row that never filled released exposure but is NOT a
-# realised loss (see memory project_phantom_losses_2026-05-20), and dry-run
-# rows keep their requested stake so must be excluded from any $ sum.
-
-_PERF_RESOLVED = ("won", "lost")
-# Outcomes that represent a throttle / failure (vs the success branches
-# signal_written / trade_pending / trade_filled). The dominant throttle is
-# the live volume bottleneck.
-_PERF_THROTTLE_OUTCOMES = (
-    "stake_below_min", "drawdown_paused", "cluster_cap_hit", "cap_exceeded",
-    "no_fill", "order_failed", "insufficient_balance", "no_token_ids",
-    "no_client", "dup_blocked_inproc", "dup_blocked_db",
-)
-
-
-def _is_phantom_lost(row: dict) -> bool:
-    """A LOST trade whose order never filled — exposure-release cleanup, not a
-    realised loss. Excluded from every PnL / win-rate sum."""
-    return row.get("status") == "lost" and row.get("fill_price") is None
-
-
-def _perf_tradeable(rows: list[dict]) -> list[dict]:
-    """Rows representing real capital at risk: drop dry-run + phantom-LOST,
-    keep only OPEN / WON / LOST (PENDING never reached the book)."""
-    out: list[dict] = []
-    for r in rows:
-        if r.get("exchange_status") == "dry_run":
-            continue
-        if r.get("status") not in (("open",) + _PERF_RESOLVED):
-            continue
-        if _is_phantom_lost(r):
-            continue
-        out.append(r)
-    return out
-
-
-def _realized_pnl(trade_rows: list[dict]) -> dict:
-    """Phantom-LOST-safe realised P&L over a window of trade-row dicts.
-
-    Each row: ``{status, pnl, stake_usd, fill_price, exchange_status,
-    signal_kind, lock_branch}`` (``status`` lowercased: won/lost/open/...).
-    Returns ``{n, n_won, win_pct, pnl, staked, ev_per_usd, n_open, by_kind,
-    by_branch}`` where the rate fields cover *resolved* (won/lost) trades only.
-    """
-    rows = _perf_tradeable(trade_rows)
-    resolved = [r for r in rows if r.get("status") in _PERF_RESOLVED]
-    n = len(resolved)
-    won = sum(1 for r in resolved if r.get("status") == "won")
-    pnl = sum(float(r.get("pnl") or 0.0) for r in resolved)
-    staked = sum(float(r.get("stake_usd") or 0.0) for r in resolved)
-
-    def _group(key: str) -> dict:
-        groups: dict[object, list[dict]] = {}
-        for r in resolved:
-            g = r.get(key)
-            if g is None:
-                continue
-            groups.setdefault(g, []).append(r)
-        out: dict = {}
-        for g, rs in groups.items():
-            gw = sum(1 for r in rs if r.get("status") == "won")
-            gstk = sum(float(r.get("stake_usd") or 0.0) for r in rs)
-            gpnl = sum(float(r.get("pnl") or 0.0) for r in rs)
-            out[g] = {
-                "n": len(rs), "won": gw, "win_pct": gw / len(rs),
-                "pnl": gpnl, "ev_per_usd": (gpnl / gstk) if gstk else None,
-            }
-        return out
-
-    return {
-        "n": n, "n_won": won, "win_pct": (won / n) if n else None,
-        "pnl": pnl, "staked": staked,
-        "ev_per_usd": (pnl / staked) if staked else None,
-        "n_open": sum(1 for r in rows if r.get("status") == "open"),
-        "by_kind": _group("signal_kind"),
-        "by_branch": _group("lock_branch"),
-    }
-
-
-def _throttle_breakdown(decision_rows: list[dict]) -> dict:
-    """Funnel histogram over ``decision_logs`` rows + the dominant throttle.
-
-    Each row: ``{outcome, metadata_json}``. Returns ``{total, outcomes,
-    dominant_throttle, dominant_throttle_frac, n_throttled, size_reasons,
-    floored_up_n}``. ``dominant_throttle`` is the most common skip/fail
-    outcome — the live volume bottleneck (e.g. ``stake_below_min``).
-    """
-    total = len(decision_rows)
-    outcomes: dict[str, int] = {}
-    size_reasons: dict[str, int] = {}
-    floored = 0
-    for r in decision_rows:
-        oc = r.get("outcome") or "(none)"
-        outcomes[oc] = outcomes.get(oc, 0) + 1
-        md = r.get("metadata_json") or {}
-        if oc in ("stake_below_min", "drawdown_paused"):
-            sr = str(md.get("size_reason", "(none)"))
-            size_reasons[sr] = size_reasons.get(sr, 0) + 1
-        if md.get("floored_up"):
-            floored += 1
-    throttles = {k: v for k, v in outcomes.items() if k in _PERF_THROTTLE_OUTCOMES}
-    dom = max(throttles.items(), key=lambda kv: kv[1]) if throttles else None
-    return {
-        "total": total, "outcomes": outcomes,
-        "dominant_throttle": dom[0] if dom else None,
-        "dominant_throttle_frac": (dom[1] / total) if (dom and total) else None,
-        "n_throttled": sum(throttles.values()),
-        "size_reasons": size_reasons, "floored_up_n": floored,
-    }
-
-
-def _loss_classes(trade_rows: list[dict], min_n: int = 3) -> list[dict]:
-    """Per-(signal_kind, lock_branch) realised P&L, worst (most negative)
-    first. Phantom-LOST-safe; only cohorts with ``>= min_n`` resolved trades.
-    Feeds new/worsening-loss-class detection (the win-small/lose-big shapes)."""
-    rows = [r for r in _perf_tradeable(trade_rows)
-            if r.get("status") in _PERF_RESOLVED]
-    groups: dict[tuple, list[dict]] = {}
-    for r in rows:
-        groups.setdefault((r.get("signal_kind"), r.get("lock_branch")), []).append(r)
-    out: list[dict] = []
-    for (kind, branch), rs in groups.items():
-        if len(rs) < min_n:
-            continue
-        won = sum(1 for r in rs if r.get("status") == "won")
-        pnl = sum(float(r.get("pnl") or 0.0) for r in rs)
-        staked = sum(float(r.get("stake_usd") or 0.0) for r in rs)
-        out.append({
-            "signal_kind": kind, "lock_branch": branch, "n": len(rs),
-            "won": won, "win_pct": won / len(rs), "pnl": pnl,
-            "ev_per_usd": (pnl / staked) if staked else None,
-        })
-    out.sort(key=lambda d: d["pnl"])
-    return out
-
-
-def _window_regression(cur: dict, prev: dict) -> dict:
-    """Current vs prior equal-length window for higher-is-better metrics
-    (``pnl`` / ``win_pct`` / ``ev_per_usd`` / ``volume``). ``regressed`` is
-    True when the metric got worse (delta < 0). ``None`` inputs → no verdict."""
-    out: dict = {}
-    for key in ("pnl", "win_pct", "ev_per_usd", "volume"):
-        a, b = cur.get(key), prev.get(key)
-        if a is None or b is None:
-            out[key] = {"cur": a, "prev": b, "delta": None,
-                        "pct_change": None, "regressed": False}
-            continue
-        delta = a - b
-        out[key] = {"cur": a, "prev": b, "delta": delta,
-                    "pct_change": (delta / abs(b)) if b else None,
-                    "regressed": delta < 0}
-    return out
-
-
-# Minimum resolved-sample sizes before a flip-gate is judged (else
-# "insufficient-data"). Codified in CLAUDE.md + docs/improvements.md.
-_GATE_MIN_N = {
-    "BRACKET_LIKE_NO_DISABLED": 30,
-    "SIGMA_FLOOR_LEAD_TIME_ENABLED": 30,
-    "PER_OPERATOR_CALIBRATION_ENABLED": 50,
-    "VALLEY_MIN_EDGE": 8,
-    "THRESHOLD_MIN_PROBABILITY": 20,
-}
-
-
-def _flip_gate_verdicts(ctx: dict) -> list[dict]:
-    """Per-dark-flag readiness verdicts from measured telemetry. PURE.
-
-    ``ctx`` carries the current flag values + the measured inputs the
-    orchestrator gathered. Each verdict is advisory (``ready`` /
-    ``not-ready`` / ``insufficient-data``) — a human still approves the
-    ``.env`` flip (propose-only). The criteria mirror the codified gates in
-    CLAUDE.md / docs/improvements.md.
-    """
-    flags = ctx.get("flags") or {}
-    out: list[dict] = []
-
-    def add(flag, verdict, measured, threshold, proposed, evidence, n):
-        out.append({
-            "flag": flag, "current_value": flags.get(flag), "verdict": verdict,
-            "measured": measured, "threshold": threshold,
-            "proposed_value": proposed, "evidence": evidence, "sample_n": n,
-        })
-
-    # 1. BRACKET_LIKE_NO_DISABLED → False once bracket-like NO is +EV again.
-    b = ctx.get("bracket_like_no") or {}
-    bn, bev = int(b.get("n") or 0), b.get("ev_per_usd")
-    # Full readiness (sample floor AND +EV) — reused by the σ gate so a thin
-    # bracket-like fluke can't trip the conjunctive condition.
-    bracket_ready = (
-        bn >= _GATE_MIN_N["BRACKET_LIKE_NO_DISABLED"] and bev is not None and bev > 0
-    )
-    if bn < _GATE_MIN_N["BRACKET_LIKE_NO_DISABLED"] or bev is None:
-        bv = "insufficient-data"
-    elif bev > 0:
-        bv = "ready"
-    else:
-        bv = "not-ready"
-    add("BRACKET_LIKE_NO_DISABLED", bv, bev, "realised EV/$1 > 0", False,
-        "bracket-like NO realised EV/$1 over the window (kill-switch "
-        "reactivation gate; ~0 live trades while disabled → insufficient)", bn)
-
-    # 2. SIGMA_FLOOR_LEAD_TIME_ENABLED → True when the σ-arm widens
-    #    far-from-peak AND bracket-like baseline is +EV (conjunctive).
-    s = ctx.get("sigma") or {}
-    sn, sd = int(s.get("n") or 0), s.get("delta_p50")
-    if sn < _GATE_MIN_N["SIGMA_FLOOR_LEAD_TIME_ENABLED"] or sd is None:
-        sv = "insufficient-data"
-    elif sd > 0 and bracket_ready:
-        sv = "ready"
-    else:
-        sv = "not-ready"
-    add("SIGMA_FLOOR_LEAD_TIME_ENABLED", sv, sd,
-        "sigma.delta p50 > 0 (far-from-peak) AND bracket-like EV>0", True,
-        "σ lead-time arm widening on far-from-peak evals; conjunctive with "
-        "the bracket-like-NO gate", sn)
-
-    # 3. PER_OPERATOR_CALIBRATION_ENABLED → True when the threshold class fit
-    #    un-squashes the [0.78,0.85) band AND the slope is plausible.
-    c = ctx.get("cal") or {}
-    cn, cd, slope = int(c.get("n") or 0), c.get("delta_p50"), c.get("slope")
-    slope_ok = slope is not None and 0.2 <= slope <= 2.0
-    if cn < _GATE_MIN_N["PER_OPERATOR_CALIBRATION_ENABLED"] or cd is None or slope is None:
-        cv = "insufficient-data"
-    elif cd >= 0 and slope_ok:
-        cv = "ready"
-    else:
-        cv = "not-ready"
-    add("PER_OPERATOR_CALIBRATION_ENABLED", cv, cd,
-        "threshold cal.delta p50 >= 0 AND slope in [0.2,2.0]", True,
-        f"per-class fit un-squash in-band (threshold slope={slope})", cn)
-
-    # 4. VALLEY_MIN_EDGE → set when the P2-allows cohort is +EV out-of-sample
-    #    and beats P2-blocks.
-    val = ctx.get("valley") or {}
-    vn, va, vb = int(val.get("p2_allows_n") or 0), val.get("p2_allows_ev"), val.get("p2_blocks_ev")
-    if vn < _GATE_MIN_N["VALLEY_MIN_EDGE"] or va is None:
-        vv = "insufficient-data"
-    elif va > 0 and (vb is None or va > vb):
-        vv = "ready"
-    else:
-        vv = "not-ready"
-    add("VALLEY_MIN_EDGE", vv, va, "p2_allows EV/$1 > 0 and > p2_blocks",
-        val.get("p2_min_edge") or 0.15, "price-band P2 promotion gate", vn)
-
-    # 5. THRESHOLD_MIN_PROBABILITY → 0.78 only if the recoverable band is +EV
-    #    AND it isn't dead-on-arrival at the stake_below_min throttle.
-    t = ctx.get("threshold_loosen") or {}
-    tn, tev, dom = int(t.get("recoverable_n") or 0), t.get("recoverable_ev"), bool(t.get("stake_below_min_dominant"))
-    if dom:
-        tv, tevidence = "not-ready", (
-            "stake_below_min dominates the throttle — loosening only adds "
-            "passing evals that can't fund; fix the capital/depth lever first")
-    elif tn < _GATE_MIN_N["THRESHOLD_MIN_PROBABILITY"] or tev is None:
-        tv, tevidence = "insufficient-data", (
-            "recoverable threshold band EV (run `evals-report --operator threshold`)")
-    elif tev > 0:
-        tv, tevidence = "ready", "recoverable threshold band +EV and not throttle-blocked"
-    else:
-        tv, tevidence = "not-ready", "recoverable threshold band not +EV"
-    add("THRESHOLD_MIN_PROBABILITY", tv, tev,
-        "recoverable band EV/$1 > 0 AND stake_below_min not dominant", 0.78,
-        tevidence, tn)
-
-    # 6. NEAR_PEAK_FLOOR_UP_ENABLED — standing note: the real lever is the
-    #    depth cap, not the floor (memory project_floorup_inert_2026-06-03).
-    add("NEAR_PEAK_FLOOR_UP_ENABLED", "not-ready", None,
-        "floored fills win >= break-even", True,
-        "inert: depth cap (20%×book) binds tighter than the floor on <$25 "
-        "books — raise DEPTH_POSITION_CAP_PCT instead", 0)
-
     return out
 
 
@@ -4928,8 +4348,8 @@ def resolution_report(days: int, station: str | None, unit: str | None) -> None:
     De-circularises filter tuning: shows, per station, how far our
     routine-METAR daily max sits from the bound the actual resolution
     implies (``divergence_f`` = ours − resolved; positive = we read
-    hotter). The Phase-3 gate for re-enabling ``RANGE_OVERSHOOT_LOCK_ENABLED``
-    is the °C-city mean divergence shrinking toward ~0.5°C (~0.9°F).
+    hotter). Tracks the °C-city resolver divergence that killed the removed
+    ``range_overshoot`` lock (see docs/graveyard.md).
     """
     from sqlalchemy import select
 
@@ -5009,41 +4429,6 @@ def resolution_report(days: int, station: str | None, unit: str | None) -> None:
             click.echo()
 
     asyncio.run(_run())
-
-
-def _summarize_conviction_locks(rows: list[dict]) -> dict:
-    """Aggregate conviction-lock decision rows (each already joined to its
-    settled Trade, if any). Pure — unit-tested in ``tests/test_cli_reports.py``.
-
-    Each ``row`` carries: ``outcome``, ``requested_stake_usd``,
-    ``actual_stake_usd``, ``branch``, ``status`` (Trade status name or None),
-    ``pnl`` (None until settled).
-    """
-    deployed_outcomes = {"trade_filled", "trade_pending"}
-    throttle_outcomes = {
-        "stake_below_min", "drawdown_paused", "cluster_cap_hit",
-        "order_failed", "insufficient_balance",
-    }
-    filled = [r for r in rows if r["outcome"] in deployed_outcomes]
-    settled = [r for r in rows if r.get("status") in ("WON", "LOST")]
-    won = [r for r in settled if r["status"] == "WON"]
-    by_branch: dict[str, int] = {}
-    for r in rows:
-        b = r.get("branch") or "?"
-        by_branch[b] = by_branch.get(b, 0) + 1
-    return {
-        "fires": len(rows),
-        "filled": len(filled),
-        "no_fill": sum(1 for r in rows if r["outcome"] == "no_fill"),
-        "throttled": sum(1 for r in rows if r["outcome"] in throttle_outcomes),
-        "deployed_actual": sum(r.get("actual_stake_usd") or 0.0 for r in filled),
-        "deployed_requested": sum(r.get("requested_stake_usd") or 0.0 for r in filled),
-        "settled": len(settled),
-        "won": len(won),
-        "lost": len(settled) - len(won),
-        "net_pnl": sum(r.get("pnl") or 0.0 for r in settled),
-        "by_branch": by_branch,
-    }
 
 
 @main.command("lock-conviction-report")
@@ -5600,6 +4985,91 @@ def valley_report(days: int, since_epoch: int | None) -> None:
     asyncio.run(_run())
 
 
+@main.command("counterfactual-report")
+@click.option("--days", default=14, show_default=True, help="Look-back window in days.")
+@click.option(
+    "--min-resolved", "min_resolved", default=5, show_default=True,
+    help="Min resolved decisions in a cohort to headline it as a missed winner.",
+)
+def counterfactual_report(days: int, min_resolved: int) -> None:
+    """Self-improvement surface: trades we DECLINED that resolved in our favour.
+
+    Mines two cohorts against the de-circularised on-chain outcome
+    (``market_resolutions.yes_won``): (1) sides a filter REJECTED
+    (``evaluation_logs.passes=False``); (2) sides THROTTLED post-filter
+    (``decision_logs`` sizing/exposure/dedup outcomes). For each — grouped by
+    reject-reason / throttle-outcome, station, operator class, price band — it
+    scores the hypothetical win-rate and EV/$1 of the declined side and
+    HEADLINES the cohorts that were +EV in hindsight (a filter / station / band
+    leaving money). Propose-only: feed it to the analyst loop; don't auto-loosen.
+    Deduplicated to the latest decline per (market, side).
+    """
+    from src.analysis.counterfactual import mine_counterfactuals
+    from src.db.engine import async_session
+    from src.signals.knowledge_base import fetch_counterfactual_rows
+
+    async def _run() -> None:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+        async with async_session() as session:
+            rejected_rows, throttled_rows = await fetch_counterfactual_rows(session, cutoff)
+            out = mine_counterfactuals(rejected_rows, throttled_rows, min_resolved=min_resolved)
+
+            click.echo(f"# Counterfactual report — declined-but-won, last {days}d")
+            click.echo()
+            click.echo(
+                f"- **Rejected** (filter said no): {out['rejected']['total']:,} | "
+                f"**Throttled** (passed, not placed): {out['throttled']['total']:,}"
+            )
+            click.echo(
+                "- Ground truth = `market_resolutions.yes_won`; win-rate/EV are of "
+                "the *declined side*. Resolved-only cohorts scored."
+            )
+            click.echo()
+
+            def _table(title: str, cohorts: list[dict], key: str) -> None:
+                shown = [c for c in cohorts if c["n_resolved"] > 0][:8]
+                if not shown:
+                    return
+                click.echo(f"## {title}")
+                click.echo(f"| {key} | n | resolved | declined-won% | avg px | edge pp | EV/$1 |")
+                click.echo("|---|---:|---:|---:|---:|---:|---:|")
+                for c in shown:
+                    wr = f"{c['win_rate']*100:.0f}%" if c["win_rate"] is not None else "—"
+                    px = f"{c['avg_price']:.2f}" if c["avg_price"] is not None else "—"
+                    epp = f"{c['edge_pp']:+.0f}" if c["edge_pp"] is not None else "—"
+                    ev = f"{c['ev_per_dollar']:+.3f}" if c["ev_per_dollar"] is not None else "—"
+                    click.echo(
+                        f"| {c.get(key)} | {c['n']} | {c['n_resolved']} | {wr} | {px} | {epp} | {ev} |"
+                    )
+                click.echo()
+
+            head = out["headline"]
+            missed = head["rejected_by_reason"] + head["throttled_by_outcome"]
+            if missed:
+                click.echo("## 🎯 Missed winners (declined side was +EV in hindsight)")
+                click.echo("_Candidate filters/cohorts to revisit — propose-only._")
+                click.echo()
+                for c in sorted(
+                    missed, key=lambda d: (d["ev_per_dollar"] or 0) * d["n_resolved"], reverse=True
+                ):
+                    lbl = c.get("reject_reason") or c.get("outcome")
+                    click.echo(
+                        f"- **{lbl}**: declined {c['n_resolved']} resolved, "
+                        f"won {c['win_rate']*100:.0f}% @ avg {c['avg_price']:.2f} "
+                        f"→ EV/$1 {c['ev_per_dollar']:+.3f} (edge {c['edge_pp']:+.0f}pp)"
+                    )
+                click.echo()
+            else:
+                click.echo("_No +EV missed-winner cohorts at this `--min-resolved`. Filters look honest._")
+                click.echo()
+
+            _table("Rejected — by reject reason", out["rejected"]["by_reason"], "reject_reason")
+            _table("Rejected — by station", out["rejected"]["by_station"], "station_icao")
+            _table("Throttled — by outcome", out["throttled"]["by_outcome"], "outcome")
+
+    asyncio.run(_run())
+
+
 @main.command("epochs")
 @click.option("--limit", default=20, show_default=True, help="Most recent N epochs.")
 def epochs(limit: int) -> None:
@@ -5926,80 +5396,6 @@ async def perf_review_result(
         "flip_gates": flip_gates,
         "anomalies": anomalies,
     }
-
-
-def _detect_calibration_squash_local(eval_rows: list[dict], fill_count: int):
-    """Thin re-export wrapper so the orchestrator reuses the scheduler's pure
-    detector without importing it at module load (keeps `cli` light)."""
-    from src.scheduler import _detect_calibration_squash
-    return _detect_calibration_squash(eval_rows, fill_count)
-
-
-def render_perf_digest(result: dict, *, markdown: bool = True) -> str:
-    """Render a ``perf_review_result`` dict as a compact digest.
-
-    ``markdown=True`` → Telegram MarkdownV2 (dynamic values escaped via
-    ``_escape_md2``); ``markdown=False`` → plain text for the console. Leads
-    with the PnL headline, the dominant throttle, regressions, flip-ready
-    flags, then anomalies — the same shape we'd hand-write each review.
-    """
-    from src.execution.alerter import _escape_md2
-
-    e = _escape_md2 if markdown else (lambda x: str(x))
-    bold = (lambda t: f"*{t}*") if markdown else (lambda t: t)
-    bullet = "• "
-    L: list[str] = []
-
-    pnl = result.get("pnl") or {}
-    _since = result.get("since")
-    _win = str(result.get("window_days")) + "d"
-    if _since:
-        _win += " since " + str(_since)[:10]
-    L.append(f"\U0001f4ca {bold('Perf review')} — {e(_win)}")
-    wp = f"{pnl['win_pct']*100:.0f}%" if pnl.get("win_pct") is not None else "n/a"
-    ev = f"{pnl['ev_per_usd']:+.3f}" if pnl.get("ev_per_usd") is not None else "n/a"
-    pnl_s = f"${pnl.get('pnl', 0.0):+,.2f}"
-    L.append(
-        f"\U0001f4b0 PnL {e(pnl_s)} over {e(pnl.get('n', 0))} resolved "
-        f"({e(wp)} win, EV/$1 {e(ev)}); {e(pnl.get('n_open', 0))} open"
-    )
-
-    regs = [k for k, v in (result.get("regression") or {}).items() if v.get("regressed")]
-    if regs:
-        L.append(f"⚠️ Regressed vs prior {e(str(result.get('window_days'))+'d')}: {e(', '.join(regs))}")
-
-    th = result.get("throttle") or {}
-    if th.get("dominant_throttle"):
-        fr = f"{th['dominant_throttle_frac']*100:.0f}%" if th.get("dominant_throttle_frac") is not None else "n/a"
-        L.append(f"\U0001f6a6 Top throttle: {e(th['dominant_throttle'])} ({e(fr)} of decisions)")
-
-    losers = [c for c in (result.get("loss_classes") or []) if c.get("pnl", 0) < 0][:2]
-    for c in losers:
-        cls = c.get("lock_branch") or c.get("signal_kind") or "?"
-        cpnl_s = f"${c['pnl']:+,.2f}"
-        cwin_s = f"{c['win_pct']*100:.0f}%"
-        L.append(
-            f"\U0001f4c9 Loss class {e(cls)}: {e(cpnl_s)} / {e(c['n'])} "
-            f"({e(cwin_s)} win)"
-        )
-
-    gates = result.get("flip_gates") or []
-    ready = [g for g in gates if g.get("verdict") == "ready"]
-    if ready:
-        L.append(bold("Flip-ready:"))
-        for g in ready:
-            meas = g.get("measured")
-            meas_s = f" (measured {meas})" if meas is not None else ""
-            L.append(f"{bullet}{e(g['flag'])} → {e(str(g['proposed_value']))}{e(meas_s)}")
-    else:
-        insf = sum(1 for g in gates if g.get("verdict") == "insufficient-data")
-        L.append(f"No flags flip-ready ({e(insf)} awaiting data).")
-
-    for a in (result.get("anomalies") or []):
-        L.append(f"\U0001f6a8 {e(a.get('kind'))}: {e(a.get('detail'))}")
-
-    sep = "\n" if markdown else "\n"
-    return sep.join(L)
 
 
 async def _persist_perf_artifact(session, days: int, result: dict) -> None:

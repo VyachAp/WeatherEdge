@@ -28,7 +28,8 @@ You'll see `[BOOT]`-style log lines and a "bot started" Telegram ping if wired.
 | `job_scan_markets` | 15 min | Refresh market list + prices via Gamma API |
 | `job_unified_pipeline` | 5 min (`UNIFIED_PIPELINE_INTERVAL_MINUTES`) | Main loop — aggregate state, run lock rule, score markets, maybe trade |
 | `job_fast_lock_poll` | 30 s (`FAST_LOCK_POLL_INTERVAL_SECONDS`) | Bulk METAR refresh; fire EASY-direction lock trades on new routine METARs AND re-run forecast-exceedance projection from cached forecast/bias (no extra HTTP) |
-| `job_daily_settlement` | 22:00 UTC | Resolve trades, update station bias, reset fast-poll dedup + state cache, send daily summary |
+| `job_resolve_trades` | 5 min (30 s offset) | Settle expired markets (chain-gated on-chain `payoutNumerators`), push each new resolution |
+| `job_daily_settlement` | 22:00 UTC | Bankroll/drawdown bookkeeping, station-bias recording, weekly calibration, daily summary, redeem nudge, calibration-squash diagnostic, counterfactual knowledge snapshot. **Does not** resolve trades or clear caches |
 
 ## 4. Per-pipeline tick (every 5 min)
 
@@ -36,10 +37,10 @@ Logs will look like this per station:
 
 ```
 [EDDM] state: max=54°F, trend=+2.4°F/hr, forecast_peak=57°F in 2.5h, solar_declining=False, cloud_rising=False, routine_count=22
-[EDDM] exceedance row: obs=52.0°F @ ... vs forecast@11Z=48.3°F (same_hour_delta=+3.7°F) | max=54.0°F, forecast_peak=57.0°F, projected=57.2°F, legacy_projected=56.4°F (Δlive=+0.8°F), trend=+4.3°F/hr, slope=+0.45°F/hr n=4, peak_passed=False, alerted=True
+[EDDM] exceedance row: obs=52.0°F @ ... vs forecast@11Z=48.3°F (same_hour_delta=+3.7°F) | max=54.0°F, forecast_peak=57.0°F, projected=57.2°F, trend=+4.3°F/hr, slope=+0.45°F/hr n=4, peak_passed=False, alerted=True
 ```
 
-`projected` is the live value (v2 by default — see "Knobs" below). `legacy_projected` is the v1 halflife-decay path, written to the log only (not the DB) so v1/v2 can be compared during the rollout window. `slope=…` is the residual-slope fit over the last 6h; `n=…` is the routine count used. Both `legacy_projected` and `slope` may be `n/a` when the slope path was ineligible.
+`projected` is the daily-max projection (halflife-decayed residual + damped trend carry — `_project_daily_max`). `slope=…` is the residual-slope fit over the last 6h (diagnostic only — it no longer feeds the projection; the slope-based "v2" projector was removed 2026-06-24, see `docs/graveyard.md`); `n=…` is the routine count used. `slope` may be `n/a` when unavailable.
 
 For each market you'll either see a skip line (price-edge-of-book, bias runaway, circuit breaker) or a scoring line with `edge=…`, `our_prob=…`, and either a trade or a "filter X failed" reason.
 
@@ -48,7 +49,7 @@ A second log shape comes from the fast-poll loop:
 ```
 [fast-poll EDDM] new routine METAR obs=2026-04-25T15:20:00+00:00 temp=58.5°F max=58.5°F | 2 market(s)
 [EDDM] LOCK YES <market_id>: margin=2.5°F, price=0.91, stake=$15.00 (raw=$15.00, dd_mult=1.00) | market-day max 58.5°F >= threshold 56°F + 2.0°F margin (above); routine_count=12 (min 3)
-[EDDM] exceedance row: obs=58.5°F @ ... projected=60.2°F, legacy_projected=58.9°F (Δlive=+1.3°F), ..., alerted=True
+[EDDM] exceedance row: obs=58.5°F @ ... projected=60.2°F, ..., alerted=True
 ```
 
 The `exceedance row` line firing from a fast-poll tick (within the same second as the METAR landing) is the cadence-gap fix — a fresh routine triggers projection within 30s instead of waiting up to 5 min for the next unified pipeline tick. Reuses the cached forecast/bias from the last unified tick (no extra HTTP). After a process restart, expect the first 5 minutes of fast-poll alerts to be silent until the next unified tick warms the cache — by design.
@@ -69,15 +70,13 @@ With the current tuning:
 
 - **At most once per station per 30 min** (`ALERT_COOLDOWN`).
 - Fires when the projected daily max beats the forecast peak by >1°F (~0.56°C).
-- Two projection paths share the same gate:
-  - **v2 (default, ≥3 routines in last 6h):** `projected = forecast_peak + (current_residual + slope × hours_to_peak)`. The slope is `d(residual)/dt` over recent obs — captures "forecast falling further behind every hour" 1-2 hours earlier than v1.
-  - **v1 (fallback):** `α·current_residual + (1-α)·forecast_peak`, `α=exp(-h/2)`. Used when fewer than 3 routines, or when `PROJECTION_RESIDUAL_SLOPE_ENABLED=false`.
-- Both paths capped at `forecast_peak + 5°F`; observed max is always a floor.
+- Projection (`_project_daily_max`): `α·current_residual + (1-α)·forecast_peak`, `α=exp(-h/2)`, plus a damped carry of the obs-vs-forecast trend residual; falls back to a pre-residual linear blend when there's no current forecast. (The slope-based "v2" projector was removed 2026-06-24 — it overshot the warming concavity; see `docs/graveyard.md`.)
+- Capped at `forecast_peak + 5°F`; observed max is always a floor.
 - Routine count gate: `>=3` normally, but **`>=2` when same-hour residual >1°F** (the strong-residual fast path — saves 30-60 min on hot mornings when only 2 routines exist but obs is already obviously hot).
 - Won't fire after peak (short-trend-based `_peak_passed` heuristic).
 - Fast-poll runs the projection check within 30s of a fresh routine — the alert no longer waits up to 5 min for the next unified tick.
 
-Typical daily volume (10-city config): **5–15 pushes/day**, possibly slightly higher during the v2 rollout window if v2 catches more events than v1.
+Typical daily volume (10-city config): **5–15 pushes/day**.
 
 ### 💰 Trade alerts (when `AUTO_EXECUTE=true`)
 
@@ -98,12 +97,13 @@ Trades resolved, P&L, running bankroll, which stations updated bias, weekly cali
 |---|---|
 | Market list + live snapshots | `markets`, `market_snapshots` |
 | Each decision | `signals` (even if no trade placed) |
-| Every order | `trades` — status `PENDING`/`OPEN`/`RESOLVED`/`LOST` |
+| Every order | `trades` — status `PENDING`/`OPEN`/`WON`/`LOST` |
+| Declined-but-won learnings | `bot_state` `knowledge.counterfactual.latest` + `runtime/knowledge_counterfactual.json` (see `counterfactual-report`) |
 | Exceedance history | `forecast_exceedance_alerts` — every near-miss, with `alerted` flag showing which went to Telegram |
 | Per-station bias | `station_biases` |
 | Bankroll curve | `bankroll_logs` |
 
-For backtesting/analysis, `forecast_exceedance_alerts` contains both the alerted and cooldown-suppressed rows — bucket by `alerted` to see the true positive rate over time. The `projected_max_f` column reflects whichever projection path is live (v2 by default); the v1 legacy projection is only in the JSON logs (`legacy_projected=`), not the DB. To compare v1 vs v2 historically, parse logs.
+For backtesting/analysis, `forecast_exceedance_alerts` contains both the alerted and cooldown-suppressed rows — bucket by `alerted` to see the true positive rate over time. The `projected_max_f` column is the single `_project_daily_max` (halflife) value.
 
 ## 7. Failure modes to recognize
 
@@ -118,7 +118,7 @@ For backtesting/analysis, `forecast_exceedance_alerts` contains both the alerted
 | Three lock losses in 72 h → lock path inert | Auto-disable via `LOCK_RULE_LOSS_DISABLE_COUNT` | Investigate the resolved trades (`scripts/inspect_loss.py`); manually re-enable in `.env` |
 | No Telegram traffic for >30 min during a weather event | Alerter queue may be stuck | Restart; queue is in-process only |
 
-To kill the lock path in an emergency: set `LOCK_RULE_ENABLED=false` in `.env` and restart. The probability path is unaffected. To kill *just* the fast-poll loop (both 30-s lock + projection) while keeping main-pipeline locks: `FAST_LOCK_POLL_ENABLED=false`. To revert projection alerts to the legacy halflife-decay path without restarting code logic: `PROJECTION_RESIDUAL_SLOPE_ENABLED=false`.
+To kill the lock path in an emergency: set `LOCK_RULE_ENABLED=false` in `.env` and restart. The probability path is unaffected. To kill *just* the fast-poll loop (both 30-s lock + projection) while keeping main-pipeline locks: `FAST_LOCK_POLL_ENABLED=false`.
 
 ## 8. First-day checklist
 
@@ -137,8 +137,7 @@ All in `.env` (see `src/config.py`):
 - `LOCK_RULE_ENABLED`, `LOCK_MARGIN_F`, `LOCK_POSITION_PCT`, `LOCK_RULE_MIN_PRICE`, `LOCK_RULE_MAX_PRICE` — lock-path knobs (super-margin EASY at routine_count=2 triggers when overshoot ≥ 2× `LOCK_MARGIN_F`)
 - `FAST_LOCK_POLL_ENABLED`, `FAST_LOCK_POLL_INTERVAL_SECONDS` — fast-poll cadence (gates BOTH lock + projection paths)
 - `ENSEMBLE_MODELS`, `ENSEMBLE_SPREAD_MULTIPLIER`, `ENSEMBLE_MIN_MODELS` — probability-engine σ
-- `PROJECTION_RESIDUAL_SLOPE_ENABLED` — flip off to revert `_project_daily_max` to v1 halflife decay (emergency, no code change)
 - `DAILY_SPEND_CAP_USD` — hard 24h limit
 - `UNIFIED_PIPELINE_INTERVAL_MINUTES` — directional-path cadence
 
-Alert-specific constants live in `src/signals/forecast_exceedance.py` as module-level constants (`MAX_OVERSHOOT_F`, `ALERT_COOLDOWN`, `DELTA_THRESHOLD_F`, `MIN_ROUTINE_COUNT_FOR_PUSH`, `STRONG_RESIDUAL_DELTA_F`, `STRONG_RESIDUAL_MIN_ROUTINES`, `RESIDUAL_SLOPE_MIN_POINTS`, `RESIDUAL_SLOPE_HOURS_CAP`, `RESIDUAL_SLOPE_MAX_F_PER_HR`, `RESIDUAL_DECAY_HALFLIFE_H`). Edit and restart — no config plumbing for these.
+Alert-specific tunables are `Settings` fields bound at import in `src/signals/forecast_exceedance.py` (`EXCEEDANCE_MAX_OVERSHOOT_F`, `EXCEEDANCE_ALERT_COOLDOWN_MINUTES`, `EXCEEDANCE_DELTA_THRESHOLD_F`, `EXCEEDANCE_MIN_ROUTINE_COUNT`, `EXCEEDANCE_STRONG_RESIDUAL_*`, `EXCEEDANCE_RESIDUAL_DECAY_HALFLIFE_H`, `EXCEEDANCE_RESIDUAL_TREND_CARRY_K`). Set via `.env` + restart.

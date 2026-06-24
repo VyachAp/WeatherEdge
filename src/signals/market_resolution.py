@@ -3,8 +3,8 @@
 De-circularises filter tuning. ``evals-report`` today scores candidates
 against our own routine-METAR daily max — the same source that feeds our
 conviction, which is circular for °C cities (we read systematically
-hotter than Polymarket's resolver; that's what disabled
-``RANGE_OVERSHOOT_LOCK_ENABLED``). This module persists, per settled
+hotter than Polymarket's resolver; that's what killed the removed
+``range_overshoot`` lock). This module persists, per settled
 market, the resolved YES/NO outcome and the daily-max **bound** it
 implies, so Phase 3 can measure the signed per-station divergence between
 our observation and the actual resolver.

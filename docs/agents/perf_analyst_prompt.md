@@ -33,6 +33,14 @@ deterministic `perf-review` digest the bot already computed.
    sigma|cal|valley`, `valley-report`, `decisions-report`, `resolution-report`,
    `exposure-report`, `epochs`. Scope with `--since-epoch <id>` (from the
    digest's `epoch.current_id`) to get a clean after-flip window.
+4. Read the **counterfactual knowledge snapshot** — the nightly self-improvement
+   surface of "trades we DECLINED that resolved in our favour". Prefer the file
+   `runtime/knowledge_counterfactual.json` (written by `job_daily_settlement`;
+   also in `bot_state` key `knowledge.counterfactual.latest`); regenerate the
+   live view with `python -m src.cli counterfactual-report --days 30`. Its
+   `headline` lists cohorts (by reject-reason / throttle-outcome / station /
+   price-band) whose *declined side* was +EV in hindsight — candidate filters /
+   stations the bot may be over-blocking.
 
 ## Step 2 — interpret (apply the project's methodology)
 - **PnL is phantom-LOST-safe already** in the digest (`pnl.pnl`): a `LOST`
@@ -49,6 +57,15 @@ deterministic `perf-review` digest the bot already computed.
   (exposure-cap pin, stuck-OPEN, phantom-LOST, calibration-squash). For each,
   name the operator remediation (e.g. `admin reconcile-stuck --dry-run`) —
   but DO NOT run it.
+- **Counterfactual "missed winners" are leads, not proof.** A headline cohort
+  (e.g. the `edge`-floor rejections winning >break-even) means a filter *may* be
+  over-blocking — but treat it sceptically: the side price is the *latest* eval's
+  (the market may have moved), small-n cohorts are noisy, and a cohort can be
+  +EV in-sample yet not survive friction/selection. Cross-check against the
+  matching flip-gate, the relevant `shadow_json` counterfactual, and the
+  graveyard (a cohort whose class was deliberately killed is NOT a lead). When a
+  cohort looks real, propose the *smallest* validating step (e.g. "shadow-log a
+  looser `THRESHOLD_MIN_EDGE` and re-check in 2 weeks"), never a direct flip.
 
 ## Step 3 — evaluate each flip-gate
 The digest's `flip_gates` already has a per-flag verdict (`ready` /

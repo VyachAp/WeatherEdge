@@ -33,9 +33,6 @@ RESIDUAL_TREND_CARRY_K: float = settings.EXCEEDANCE_RESIDUAL_TREND_CARRY_K
 POST_PEAK_HOURS_CAP: float = settings.POST_PEAK_HOURS_CAP
 POST_PEAK_TREND_CARRY_K: float = settings.POST_PEAK_TREND_CARRY_K
 POST_PEAK_MIN_TREND_F_PER_HR: float = settings.POST_PEAK_MIN_TREND_F_PER_HR
-RESIDUAL_SLOPE_MIN_POINTS: int = settings.EXCEEDANCE_RESIDUAL_SLOPE_MIN_POINTS
-RESIDUAL_SLOPE_HOURS_CAP: float = settings.EXCEEDANCE_RESIDUAL_SLOPE_HOURS_CAP
-RESIDUAL_SLOPE_MAX_F_PER_HR: float = settings.EXCEEDANCE_RESIDUAL_SLOPE_MAX_F_PER_HR
 
 
 def c_to_f(c: float) -> float:
@@ -87,35 +84,16 @@ def peak_passed(state: WeatherState) -> bool:
 def project_daily_max(state: WeatherState) -> float:
     """Project today's final daily max, anchored on the forecast trajectory.
 
-    Two paths share the post-peak branch (and the dewpoint nudge / overshoot
-    cap / current-max floor); they differ only on the pre-peak residual term:
+    Pre-peak: exponential decay of the level residual (halflife
+    ``RESIDUAL_DECAY_HALFLIFE_H``) plus a damped carry of the
+    obs-slope-vs-forecast-forward-slope trend residual. Post-peak: damped
+    carry of the observed trend off the observed/forecast max anchor. Returns
+    ``forecast_peak_f`` exactly when obs track the forecast. Always clipped at
+    ``forecast_peak + MAX_OVERSHOOT_F`` and floored at observed max. Falls back
+    to ``legacy_project_daily_max`` when there's no current forecast.
 
-    * **v2 (slope, default when ≥3 routines)** — project the residual
-      forward at the observed slope. ``projected_residual = current_residual
-      + slope × min(hours_until_peak, RESIDUAL_SLOPE_HOURS_CAP)``, with
-      ``slope`` clipped to ``±RESIDUAL_SLOPE_MAX_F_PER_HR`` and the slope
-      contribution damped by solar_declining / cloud_rising. Captures
-      "forecast falling further behind every hour" 1-2 hours earlier than v1.
-    * **v1 (halflife decay, fallback)** — exponential decay of the level
-      residual with halflife ``RESIDUAL_DECAY_HALFLIFE_H``, plus a
-      separate damped carry of the obs-slope-vs-forecast-forward-slope
-      trend residual. Used when the slope or count fields are unavailable
-      (forecast missing or fewer than ``RESIDUAL_SLOPE_MIN_POINTS`` routines).
-
-    Returns ``forecast_peak_f`` exactly when obs track the forecast and have
-    no slope. Always clipped at ``forecast_peak + MAX_OVERSHOOT_F`` and
-    floored at observed max.
-    """
-    if state.forecast_temp_now_f is None or state.forecast_residual_f is None:
-        return legacy_project_daily_max(state)
-    return project_with_residual(state, prefer_slope=True)
-
-
-def project_with_residual(state: WeatherState, *, prefer_slope: bool) -> float:
-    """Shared body for v1 / v2. ``prefer_slope`` controls whether the slope
-    branch is taken when eligible. Setting it False forces the legacy
-    halflife-decay branch — used by the parallel-logging path so a single
-    helper can produce both projections from the same state.
+    (The residual-slope "v2" projector was removed 2026-06-24 — it overshot the
+    warming concavity at high-volume stations; see docs/graveyard.md.)
     """
     if state.forecast_temp_now_f is None or state.forecast_residual_f is None:
         return legacy_project_daily_max(state)
@@ -123,40 +101,19 @@ def project_with_residual(state: WeatherState, *, prefer_slope: bool) -> float:
     projected = state.forecast_peak_f
 
     if state.hours_until_peak > 0:
-        slope_eligible = (
-            prefer_slope
-            and settings.PROJECTION_RESIDUAL_SLOPE_ENABLED
-            and state.forecast_residual_slope_f_per_hr is not None
-            and state.forecast_residual_count >= RESIDUAL_SLOPE_MIN_POINTS
-        )
-        if slope_eligible:
-            slope = max(
-                -RESIDUAL_SLOPE_MAX_F_PER_HR,
-                min(
-                    RESIDUAL_SLOPE_MAX_F_PER_HR,
-                    state.forecast_residual_slope_f_per_hr or 0.0,
-                ),
-            )
-            hours = min(state.hours_until_peak, RESIDUAL_SLOPE_HOURS_CAP)
+        alpha = math.exp(-state.hours_until_peak / RESIDUAL_DECAY_HALFLIFE_H)
+        projected += alpha * residual
+
+        observed_slope = effective_trend(state)
+        forecast_slope = state.forecast_slope_to_peak_f_per_hr or 0.0
+        residual_trend = observed_slope - forecast_slope
+        if residual_trend > 0:
+            hours = min(state.hours_until_peak, EXTRAPOLATION_HOURS_CAP)
             if state.solar_declining:
                 hours *= max(0.0, 1.0 - state.solar_decline_magnitude)
             if state.cloud_rising:
                 hours *= max(0.0, 1.0 - state.cloud_rise_magnitude)
-            projected += residual + slope * hours
-        else:
-            alpha = math.exp(-state.hours_until_peak / RESIDUAL_DECAY_HALFLIFE_H)
-            projected += alpha * residual
-
-            observed_slope = effective_trend(state)
-            forecast_slope = state.forecast_slope_to_peak_f_per_hr or 0.0
-            residual_trend = observed_slope - forecast_slope
-            if residual_trend > 0:
-                hours = min(state.hours_until_peak, EXTRAPOLATION_HOURS_CAP)
-                if state.solar_declining:
-                    hours *= max(0.0, 1.0 - state.solar_decline_magnitude)
-                if state.cloud_rising:
-                    hours *= max(0.0, 1.0 - state.cloud_rise_magnitude)
-                projected += RESIDUAL_TREND_CARRY_K * residual_trend * hours
+            projected += RESIDUAL_TREND_CARRY_K * residual_trend * hours
     else:
         observed_slope = effective_trend(state)
         if observed_slope > POST_PEAK_MIN_TREND_F_PER_HR:

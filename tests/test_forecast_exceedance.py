@@ -360,19 +360,10 @@ class TestProjectDailyMaxResidual:
         assert _project_daily_max(s) == pytest.approx(96.8)
 
 
-class TestProjectDailyMaxResidualSlope:
-    """Lever A — slope-extrapolated residual replaces the halflife decay
-    when the slope and at least RESIDUAL_SLOPE_MIN_POINTS routines are
-    available. Captures forecast falling further behind hour-over-hour.
-
-    Note: live `.env` disables v2 via `PROJECTION_RESIDUAL_SLOPE_ENABLED`;
-    these tests force-enable it to keep covering the v2 math contract.
-    """
-
-    @pytest.fixture(autouse=True)
-    def _force_v2_enabled(self, monkeypatch):
-        from src.config import settings
-        monkeypatch.setattr(settings, "PROJECTION_RESIDUAL_SLOPE_ENABLED", True)
+class TestProjectDailyMaxPrePeakHalflife:
+    """Pre-peak projector: halflife-decayed level residual + damped
+    trend-residual carry. (The slope-extrapolated "v2" residual projector was
+    removed 2026-06-24 — see docs/graveyard.md.)"""
 
     def _slope_state(
         self,
@@ -403,88 +394,19 @@ class TestProjectDailyMaxResidualSlope:
             cloud_rise_magnitude=cloud_rise_magnitude,
         )
 
-    def test_slope_extrapolates_residual_to_peak(self):
-        # residual +3°F now, slope +0.5°F/hr, h=2 → projected residual
-        # at peak = 3 + 0.5·2 = 4 → projection = forecast_peak + 4 = 84°F.
-        s = self._slope_state(slope=0.5, count=4, residual=3.0,
-                              hours_until_peak=2.0, forecast_peak_f=80.0)
-        assert _project_daily_max(s) == pytest.approx(84.0, abs=0.01)
-
-    def test_v2_strictly_above_v1_when_slope_positive(self):
-        # Same state, run both branches via _project_with_residual: v2 > v1
-        # when slope is positive (v1 decays the level residual; v2 grows it).
-        from src.signals.forecast_exceedance import _project_with_residual
-
-        s = self._slope_state(slope=0.8, count=4, residual=2.0,
-                              hours_until_peak=2.0, forecast_peak_f=80.0)
-        v1 = _project_with_residual(s, prefer_slope=False)
-        v2 = _project_with_residual(s, prefer_slope=True)
-        assert v2 > v1
-
-    def test_falls_back_to_v1_when_count_below_min(self):
-        # 2 routines < min 3 → halflife branch (v1) runs.
-        s = self._slope_state(slope=0.5, count=2, residual=3.0,
-                              hours_until_peak=2.0, forecast_peak_f=80.0)
-        # v1: alpha=exp(-1)=0.368 → 80 + 0.368·3 ≈ 81.10. No trend-residual
-        # carry because observed_slope (1.0) == forecast_slope (1.0).
-        assert _project_daily_max(s) == pytest.approx(81.10, abs=0.05)
-
-    def test_falls_back_to_v1_when_slope_none(self):
-        # Slope unavailable → v1 path even with high count.
-        s = self._slope_state(slope=None, count=5, residual=3.0,
+    def test_halflife_decays_level_residual(self):
+        # residual +3°F now, h=2 → alpha=exp(-1)=0.368 → 80 + 0.368·3 ≈ 81.10.
+        # No trend-residual carry (observed_slope 1.0 == forecast_slope 1.0).
+        s = self._slope_state(slope=None, count=0, residual=3.0,
                               hours_until_peak=2.0, forecast_peak_f=80.0)
         assert _project_daily_max(s) == pytest.approx(81.10, abs=0.05)
 
-    def test_setting_disables_v2(self):
-        from src.signals import forecast_exceedance as fe
-
-        s = self._slope_state(slope=0.5, count=5, residual=3.0,
+    def test_residual_fields_present_do_not_change_halflife_result(self):
+        # The forecast_residual_slope/count fields are kept for the reasoning
+        # trail but no longer affect the projection — same halflife result.
+        s = self._slope_state(slope=0.8, count=5, residual=3.0,
                               hours_until_peak=2.0, forecast_peak_f=80.0)
-        # Force v2 off via the runtime setting; should match v1 result.
-        original = fe.settings.PROJECTION_RESIDUAL_SLOPE_ENABLED
-        fe.settings.PROJECTION_RESIDUAL_SLOPE_ENABLED = False
-        try:
-            assert _project_daily_max(s) == pytest.approx(81.10, abs=0.05)
-        finally:
-            fe.settings.PROJECTION_RESIDUAL_SLOPE_ENABLED = original
-
-    def test_negative_slope_pulls_projection_down(self):
-        # Residual currently +3°F but slope -1°F/hr (forecast catching up).
-        # Projection = 80 + (3 + -1·2) = 81°F (vs v1 ~81.10°F, very close
-        # by coincidence; the value matters less than the sign behavior).
-        s = self._slope_state(slope=-1.0, count=4, residual=3.0,
-                              hours_until_peak=2.0, forecast_peak_f=80.0)
-        assert _project_daily_max(s) == pytest.approx(81.0, abs=0.01)
-
-    def test_slope_clipped_at_max(self):
-        # Slope +5°F/hr clipped at RESIDUAL_SLOPE_MAX_F_PER_HR (1.5°F/hr).
-        # projected = 80 + (3 + 1.5·2) = 86°F → clipped at 80 + 5 = 85°F.
-        s = self._slope_state(slope=5.0, count=4, residual=3.0,
-                              hours_until_peak=2.0, forecast_peak_f=80.0)
-        assert _project_daily_max(s) == pytest.approx(85.0, abs=0.01)
-
-    def test_solar_decline_damps_slope_contribution(self):
-        # 50% solar decline → slope hours halved (1h instead of 2h).
-        # projected = 80 + (3 + 0.8·1) = 83.8°F.
-        s = self._slope_state(slope=0.8, count=4, residual=3.0,
-                              hours_until_peak=2.0, forecast_peak_f=80.0,
-                              solar_declining=True, solar_decline_magnitude=0.5)
-        assert _project_daily_max(s) == pytest.approx(83.8, abs=0.05)
-
-    def test_cloud_rise_damps_slope_contribution(self):
-        # 50% cloud rise → same 50% damping.
-        s = self._slope_state(slope=0.8, count=4, residual=3.0,
-                              hours_until_peak=2.0, forecast_peak_f=80.0,
-                              cloud_rising=True, cloud_rise_magnitude=0.5)
-        assert _project_daily_max(s) == pytest.approx(83.8, abs=0.05)
-
-    def test_overshoot_cap_still_applied(self):
-        # Capped slope still pushed past MAX_OVERSHOOT_F should clip.
-        s = self._slope_state(slope=1.5, count=4, residual=10.0,
-                              hours_until_peak=3.0, forecast_peak_f=80.0,
-                              current_max_f=78.0)
-        # raw = 80 + (10 + 1.5·3) = 94.5 → clipped at 80 + 5 = 85°F.
-        assert _project_daily_max(s) == pytest.approx(85.0, abs=0.01)
+        assert _project_daily_max(s) == pytest.approx(81.10, abs=0.05)
 
 
 class TestProjectDailyMaxPostPeak:

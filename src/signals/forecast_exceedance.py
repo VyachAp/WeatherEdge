@@ -53,7 +53,6 @@ from src.signals.projection import (
     peak_passed as _peak_passed,
     pick_latest_routine as _pick_latest_routine,
     project_daily_max as _project_daily_max,
-    project_with_residual as _project_with_residual,
 )
 
 if TYPE_CHECKING:
@@ -93,13 +92,6 @@ RESIDUAL_TREND_CARRY_K: float = settings.EXCEEDANCE_RESIDUAL_TREND_CARRY_K
 POST_PEAK_HOURS_CAP: float = settings.POST_PEAK_HOURS_CAP
 POST_PEAK_TREND_CARRY_K: float = settings.POST_PEAK_TREND_CARRY_K
 POST_PEAK_MIN_TREND_F_PER_HR: float = settings.POST_PEAK_MIN_TREND_F_PER_HR
-# Residual-slope projection (lever A). When ≥ RESIDUAL_SLOPE_MIN_POINTS
-# routines are available, project the residual forward at its observed
-# slope to peak hour. Cap absolute slope contribution to prevent a single
-# fast-rising morning from extrapolating into the stratosphere.
-RESIDUAL_SLOPE_MIN_POINTS: int = settings.EXCEEDANCE_RESIDUAL_SLOPE_MIN_POINTS
-RESIDUAL_SLOPE_HOURS_CAP: float = settings.EXCEEDANCE_RESIDUAL_SLOPE_HOURS_CAP
-RESIDUAL_SLOPE_MAX_F_PER_HR: float = settings.EXCEEDANCE_RESIDUAL_SLOPE_MAX_F_PER_HR
 
 
 async def check_and_record_daily_max_alert(
@@ -137,17 +129,6 @@ async def check_and_record_daily_max_alert(
     peak_passed = _peak_passed(state)
     projected_max_f = _project_daily_max(state)
     projection_delta_f = projected_max_f - state.forecast_peak_f
-
-    # Parallel-log the legacy halflife projection alongside the live value
-    # so the calibration table can be reconstructed offline from the JSON
-    # logs while v2 is being validated. No-op (same value) when the slope
-    # path was ineligible — both helpers degenerate to the v1 branch.
-    legacy_projected_f: float | None = None
-    if (
-        state.forecast_temp_now_f is not None
-        and state.forecast_residual_f is not None
-    ):
-        legacy_projected_f = _project_with_residual(state, prefer_slope=False)
 
     min_routines = (
         STRONG_RESIDUAL_MIN_ROUTINES
@@ -214,18 +195,12 @@ async def check_and_record_daily_max_alert(
         if state.forecast_residual_slope_f_per_hr is not None
         else "slope=n/a"
     )
-    legacy_desc = (
-        f", legacy_projected={legacy_projected_f:.1f}°F"
-        f" (Δlive={projected_max_f - legacy_projected_f:+.1f}°F)"
-        if legacy_projected_f is not None
-        else ""
-    )
     logger.info(
         "[%s] exceedance row: obs=%.1f°F @ %s vs forecast@%02dZ=%.1f°F "
         "(same_hour_delta=+%.1f°F) | max=%.1f°F, forecast_peak=%.1f°F, "
-        "projected=%.1f°F%s, trend=%+.1f°F/hr, %s, peak_passed=%s, alerted=%s",
+        "projected=%.1f°F, trend=%+.1f°F/hr, %s, peak_passed=%s, alerted=%s",
         icao, obs_temp_f, observed_at.isoformat(), hour_idx, forecast_temp_f,
         same_hour_delta_f, state.current_max_f, state.forecast_peak_f,
-        projected_max_f, legacy_desc, state.metar_trend_rate, slope_desc,
+        projected_max_f, state.metar_trend_rate, slope_desc,
         peak_passed, push,
     )
