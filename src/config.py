@@ -219,6 +219,10 @@ class Settings(BaseSettings):
     # doesn't start pushing until the operator opts in.
     PERF_REVIEW_ENABLED: bool = False
 
+    # Daily "why no trade" funnel digest (universe → evaluated → passed →
+    # traded). Propose-only; default off until the operator opts in.
+    NO_TRADE_REVIEW_ENABLED: bool = False
+
     # Information-latency measurement (Phase 2, 2026-06-24). When True, the
     # scheduler snapshots the market YES quote + depth the instant a new routine
     # METAR is detected (fast-poll T0) and on the following unified ticks
@@ -508,6 +512,31 @@ class Settings(BaseSettings):
     # turns +EV. range_in_window (YES) is unaffected.
     # GRAVEYARD: RANGE_UNDERSHOOT_LOCK_ENABLED — docs/graveyard.md#range_undershoot_lock_enabled--range_undershoot-no-lock-branch (status: suspended)
     RANGE_UNDERSHOOT_LOCK_ENABLED: bool = True
+
+    # Master switch for the HARD lock branch (observed max << threshold AND
+    # `_no_more_heating` ⇒ NO for above/at_least, YES for below/at_most). Read
+    # live off `settings` (like RANGE_UNDERSHOOT). Default True preserves
+    # behavior; the live env sets it False.
+    #
+    # Why suspend: the HARD branch is the #1 active lock bleed (2026-06-30 prod
+    # audit, workflow wf_3496e753-f0b). All 10 fills ever are BUY_NO: wins are
+    # tiny (+$0.7–1.9; the one big win was a cheap NO@0.29), losses are large
+    # (−$5.3 to −$9.3). Every loss carried a 14–20°F lock margin yet still lost
+    # — the deterministic forecast missed the actual max by >14°F, a forecast
+    # catastrophe that no margin/σ-floor tweak fixes (the lead-time σ-floor only
+    # touches the probability engine, not `_no_more_heating`). Net −$16.97/30d
+    # (−$7.63/30d even excluding the now-_EXCLUDED Taipei/RCTP). Same
+    # win-small/lose-big shape as the killed range_undershoot / bracket-like NO.
+    # Re-enable only after the >14°F forecast-miss class is explained (resolver
+    # station verification at e.g. LTFM/OEJN) and the branch turns +EV.
+    HARD_LOCK_ENABLED: bool = True
+
+    # Minimum YES buy-price for the `range_in_window` (YES) lock branch. The
+    # only realized fill ever was a 0.40-priced "exactly 27°C" YES gamble that
+    # LOST −$9.28 (2026-06-30 audit) — a low-conviction cheap bet, not a lock.
+    # Gating it to near-certain prices keeps the branch honest. Read live off
+    # `settings`; 0.0 disables the gate (pre-audit behavior).
+    RANGE_IN_WINDOW_MIN_YES_PRICE: float = 0.80
 
     # Master switch for bracket-like NO (`exactly`/`range`/`bracket` BUY_NO)
     # in the PROBABILITY path. When True, `binary_market_edge` rejects any

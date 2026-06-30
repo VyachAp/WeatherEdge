@@ -262,6 +262,11 @@ def evaluate_lock(
 
     # HARD: max is well below threshold AND no more heating possible.
     # Forecast-dependent — requires the standard MIN_ROUTINE_COUNT.
+    # Gated by settings.HARD_LOCK_ENABLED (default True; live env sets False) —
+    # the branch is the #1 active lock bleed, losing on >14°F forecast misses
+    # that no margin/σ tweak fixes (2026-06-30 audit). Read live off `settings`.
+    if not settings.HARD_LOCK_ENABLED:
+        return _NO_LOCK
     if routine_count < settings.MIN_ROUTINE_COUNT:
         return _NO_LOCK
     if current_max_f >= threshold_f - margin:

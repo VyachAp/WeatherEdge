@@ -533,6 +533,38 @@ async def test_floor_up_excluded_for_bracket_like_lock(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# range_in_window (YES) min-price gate — cheap YES gambles are rejected
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_range_in_window_yes_below_min_price_rejected(monkeypatch):
+    """YES range_in_window below RANGE_IN_WINDOW_MIN_YES_PRICE → no sizing."""
+    monkeypatch.setattr(lre.settings, "RANGE_IN_WINDOW_MIN_YES_PRICE", 0.80)
+    market = _market(operator="range")
+    result, c = await _invoke(
+        decision=_yes_decision(branch="range_in_window"),
+        market=market,
+        yes_price=0.40,
+    )
+    assert result == 0.0
+    assert c["size_locked_position"].call_args is None
+
+
+@pytest.mark.asyncio
+async def test_range_in_window_yes_above_min_price_sizes(monkeypatch):
+    """YES range_in_window at/above the min price still sizes normally."""
+    monkeypatch.setattr(lre.settings, "RANGE_IN_WINDOW_MIN_YES_PRICE", 0.80)
+    market = _market(operator="range")
+    _, c = await _invoke(
+        decision=_yes_decision(branch="range_in_window"),
+        market=market,
+        yes_price=0.90,
+    )
+    assert c["size_locked_position"].call_args is not None
+
+
+# ---------------------------------------------------------------------------
 # Conviction-weighted sizing wiring — only EASY-YES on a whitelisted station,
 # only with the master flag on, gets the Kelly params + a widened walk budget.
 # ---------------------------------------------------------------------------

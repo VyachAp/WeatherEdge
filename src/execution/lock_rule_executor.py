@@ -205,6 +205,27 @@ async def try_lock_rule_trade(
         )
         return 0.0
 
+    # range_in_window (YES) min-price gate: the only realized fill ever was a
+    # 0.40-priced "exactly" YES gamble that lost (2026-06-30 audit). Require a
+    # near-certain YES price so the branch stops firing cheap low-conviction
+    # bets. effective_price == yes_price for a YES side here.
+    if (
+        decision.branch == "range_in_window"
+        and decision.side == "YES"
+        and effective_price < settings.RANGE_IN_WINDOW_MIN_YES_PRICE
+    ):
+        logger.info(
+            "[%s] lock %s %s: range_in_window price %.2f < min %.2f",
+            icao, decision.side, market.id[:12], effective_price,
+            settings.RANGE_IN_WINDOW_MIN_YES_PRICE,
+        )
+        await _log_lock_eval(
+            False,
+            f"range_in_window price {effective_price:.2f} < min {settings.RANGE_IN_WINDOW_MIN_YES_PRICE}",
+            None,
+        )
+        return 0.0
+
     # Depth against the side we're actually buying.
     if decision.side == "YES":
         buy_depth = yes_depth

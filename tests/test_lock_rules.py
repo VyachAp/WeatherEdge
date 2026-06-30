@@ -418,6 +418,39 @@ class TestBranchTagging:
         assert decision.branch == "hard"
         assert decision.observed_max_f == 72.0
 
+    def test_hard_lock_disabled_returns_no_lock(self, monkeypatch):
+        # Same setup as test_hard_branch_tagged, but HARD_LOCK_ENABLED=False
+        # (the live env gate) suppresses the HARD branch entirely.
+        monkeypatch.setattr(
+            "src.signals.lock_rules.settings.HARD_LOCK_ENABLED", False
+        )
+        mkt = _FakeMarket(parsed_threshold=80.0, parsed_operator="above")
+        state = _state(
+            current_max_f=72.0,
+            forecast_peak_f=75.0,
+            metar_trend=-0.5,
+            solar_declining=True,
+        )
+        decision = _eval(state, mkt)
+        assert decision.side is None
+        assert decision.branch is None
+
+    def test_hard_lock_enabled_default_fires(self, monkeypatch):
+        # Symmetric guard: with the flag True the HARD branch still fires.
+        monkeypatch.setattr(
+            "src.signals.lock_rules.settings.HARD_LOCK_ENABLED", True
+        )
+        mkt = _FakeMarket(parsed_threshold=80.0, parsed_operator="above")
+        state = _state(
+            current_max_f=72.0,
+            forecast_peak_f=75.0,
+            metar_trend=-0.5,
+            solar_declining=True,
+        )
+        decision = _eval(state, mkt)
+        assert decision.side == "NO"
+        assert decision.branch == "hard"
+
     def test_no_lock_carries_no_branch(self):
         # Below threshold but no_more_heating evidence missing → no lock.
         mkt = _FakeMarket(parsed_threshold=80.0, parsed_operator="above")
