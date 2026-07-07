@@ -2109,3 +2109,42 @@ async def job_perf_review(days: int) -> None:
     except Exception as exc:
         logger.exception("Perf-review job failed (%dd)", days)
         await alerter.send_system_error(exc, f"perf review {days}d")
+
+
+async def job_no_trade_review(days: int) -> None:
+    """Daily "why no trade" funnel digest.
+
+    Computes the window funnel (``cli.no_trade_result``), persists the JSON
+    artifact for the Layer-2 analyst, and pushes a Telegram summary — throttled
+    via a ``bot_state`` cooldown so a coalesced/late run still fires but a
+    same-day double-trigger is suppressed. Propose-only: never changes config.
+    Registered (gated by ``NO_TRADE_REVIEW_ENABLED``) for the daily cadence in
+    ``setup_scheduler``.
+    """
+    # Lazy import: the CLI module is only needed when this job runs, and
+    # importing it at module load would create a scheduler⇄cli cycle.
+    from src.cli import (
+        _persist_no_trade_artifact,
+        no_trade_result,
+        render_no_trade_digest,
+    )
+
+    alerter = get_alerter()
+    try:
+        async with async_session() as session:
+            key = f"no_trade_review.last_pushed_at.{days}d"
+            now = datetime.now(timezone.utc)
+            last = await _load_alert_cooldown(session, key)
+            cooldown = timedelta(
+                hours={1: 20, 3: 68, 7: 164}.get(days, max(1, days * 24 - 4))
+            )
+            if last is not None and (now - last) < cooldown:
+                return
+            result = await no_trade_result(session, days)
+            await _persist_no_trade_artifact(session, days, result)
+            await alerter._enqueue(render_no_trade_digest(result, markdown=True))
+            await _persist_alert_cooldown(session, key, now)
+            await session.commit()
+    except Exception as exc:
+        logger.exception("No-trade-review job failed (%dd)", days)
+        await alerter.send_system_error(exc, f"no-trade review {days}d")

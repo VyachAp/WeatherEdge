@@ -41,6 +41,11 @@ from src.analysis.epochs import _flags_diff  # noqa: E402,F401
 from src.analysis.exposure import _summarize_exposure  # noqa: E402,F401
 from src.analysis.forecast_error import _summarize_forecast_error  # noqa: E402,F401
 from src.analysis.latency import _summarize_reprice  # noqa: E402,F401
+from src.analysis.no_trade import (  # noqa: E402,F401
+    _reject_rollup,
+    aggregate_no_trade_funnel,
+    render_no_trade_digest,
+)
 from src.analysis.perf import (  # noqa: E402,F401
     _detect_calibration_squash_local,
     render_perf_digest,
@@ -5819,6 +5824,196 @@ def perf_review(days: int, since_str: str | None, as_json: bool, push: bool,
             click.echo(render_perf_digest(result, markdown=False))
         if push:
             await _push_one(render_perf_digest(result, markdown=True), markdown=True)
+
+    asyncio.run(_run())
+
+
+async def no_trade_result(
+    session, days: int, *, since: "datetime | None" = None,
+) -> dict:
+    """Assemble the daily "why no trade" funnel as a JSON-serialisable dict.
+
+    The only DB-touching part: batch-reads the binary-market universe active in
+    the window, ``evaluation_logs`` (reject reasons), and ``decision_logs``
+    (post-filter outcomes), dedups the telemetry to one row per
+    ``(market_id, direction)`` (latest by ``created_at`` — counts market-sides,
+    not the ~288 ticks/day of raw rows), then composes
+    :func:`aggregate_no_trade_funnel`.
+
+    ``universe`` = distinct binary markets whose ``end_date`` falls in
+    ``[start, now + 2d]`` (tradeable during the window). ``since`` overrides the
+    rolling ``days`` window with an absolute start (mirrors ``perf_review_result``).
+    """
+    from datetime import timedelta
+
+    from sqlalchemy import select
+
+    from src.db.models import DecisionLog, EvaluationLog, Market
+    from src.execution.binary_market import is_binary_market, operator_class
+
+    now = datetime.now(timezone.utc)
+    if since is not None:
+        if since.tzinfo is None:
+            since = since.replace(tzinfo=timezone.utc)
+        start = since
+        window = now - since
+        days = max(1, int(window.total_seconds() // 86400))
+    else:
+        start = now - timedelta(days=days)
+
+    # --- L0 universe: binary markets active during the window.
+    universe_rows = (
+        await session.execute(
+            select(Market).where(
+                Market.end_date >= start,
+                Market.end_date <= now + timedelta(days=2),
+            )
+        )
+    ).scalars().all()
+    universe_n = sum(1 for m in universe_rows if is_binary_market(m))
+
+    # --- L1 evals: collapse to one row per (market_id, direction). ``passes``
+    #     is sticky — a candidate that passed on ANY tick counts as passed (it
+    #     may have traded then been rejected by a later tick when the price
+    #     moved), so the funnel stays monotonic (passed ≤ evaluated, traded ≤
+    #     passed). The reject reason kept is the latest non-passing one.
+    ev_rows = (
+        await session.execute(
+            select(
+                EvaluationLog.market_id, EvaluationLog.direction,
+                EvaluationLog.signal_kind, EvaluationLog.passes,
+                EvaluationLog.reject_reason,
+            ).where(EvaluationLog.created_at >= start)
+            .order_by(EvaluationLog.created_at)
+        )
+    ).all()
+    ev_latest: dict[tuple, dict] = {}
+    for (mid, direction, skind, passes, rr) in ev_rows:
+        d = getattr(direction, "value", str(direction))
+        entry = ev_latest.setdefault(
+            (mid, d),
+            {"market_id": mid, "direction": d, "signal_kind": skind,
+             "passes": False, "reject_reason": None},
+        )
+        entry["signal_kind"] = skind
+        if passes:
+            entry["passes"] = True
+        else:
+            entry["reject_reason"] = rr
+
+    # --- L2 decisions: dedup to latest per (market_id, direction); capture the
+    #     drawdown gate in force from the most recent decision overall.
+    dl_rows = (
+        await session.execute(
+            select(
+                DecisionLog.market_id, DecisionLog.direction,
+                DecisionLog.outcome, DecisionLog.metadata_json,
+                DecisionLog.dd_level, DecisionLog.dd_multiplier,
+            ).where(DecisionLog.created_at >= start)
+            .order_by(DecisionLog.created_at)
+        )
+    ).all()
+    dl_latest: dict[tuple, dict] = {}
+    dd_state: dict = {}
+    for (mid, direction, outcome, md, dd_level, dd_mult) in dl_rows:
+        d = getattr(direction, "value", str(direction))
+        dl_latest[(mid, d)] = {"outcome": outcome, "metadata_json": md}
+        if dd_level is not None:
+            dd_state = {"dd_level": dd_level, "dd_multiplier": dd_mult}
+
+    # --- Operator class per evaluated market (for the rejected-by-op_class split).
+    market_map = await _load_market_map(session, (k[0] for k in ev_latest))
+    for row in ev_latest.values():
+        m = market_map.get(row["market_id"])
+        row["op_class"] = operator_class(m) if m is not None else None
+
+    result = aggregate_no_trade_funnel(
+        universe_n=universe_n,
+        eval_rows=list(ev_latest.values()),
+        decision_rows=list(dl_latest.values()),
+        dd_state=dd_state,
+    )
+    result["window_days"] = days
+    result["since"] = since.isoformat() if since is not None else None
+    result["generated_at"] = now.isoformat()
+    return result
+
+
+async def _persist_no_trade_artifact(session, days: int, result: dict) -> None:
+    """Persist the no-trade funnel for Layer 2: a ``bot_state`` row + a
+    gitignored ``runtime/no_trade_<days>d.json`` file. Best-effort; never
+    raises into the caller (mirrors ``_persist_perf_artifact``)."""
+    import json
+    from pathlib import Path
+
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+    from sqlalchemy.exc import ProgrammingError
+
+    from src.db.models import BotState
+
+    now = datetime.now(timezone.utc)
+    key = f"no_trade.latest.{days}d"
+    try:
+        await session.execute(
+            pg_insert(BotState)
+            .values(key=key, value=result, updated_at=now)
+            .on_conflict_do_update(
+                index_elements=["key"],
+                set_={"value": result, "updated_at": now},
+            )
+        )
+    except ProgrammingError:
+        await session.rollback()
+    try:
+        out = Path("runtime")
+        out.mkdir(exist_ok=True)
+        (out / f"no_trade_{days}d.json").write_text(
+            json.dumps(result, indent=2, default=str)
+        )
+    except OSError:
+        pass
+
+
+@main.command("no-trade-report")
+@click.option("--days", default=1, show_default=True, help="Window length in days.")
+@click.option("--since", "since_str", default=None,
+              help="Absolute window start (YYYY-MM-DD), overrides --days.")
+@click.option("--json", "as_json", is_flag=True, help="Emit the raw result dict as JSON.")
+@click.option("--push/--no-push", default=False, show_default=True,
+              help="Push the digest to Telegram.")
+@click.option("--write-artifact/--no-write-artifact", default=True, show_default=True,
+              help="Persist the bot_state row + runtime JSON for the Layer-2 analyst.")
+def no_trade_report(days: int, since_str: str | None, as_json: bool, push: bool,
+                    write_artifact: bool) -> None:
+    """Daily "why no trade" funnel: universe → evaluated → passed → traded.
+
+    Reuses ``evaluation_logs`` (reject reasons) + ``decision_logs`` (post-filter
+    outcomes) + the per-day binary-market universe to show where every candidate
+    fell out. Propose-only — feed it to the analyst loop, it changes nothing.
+
+    ``--since`` runs skip the artifact write so an ad-hoc read doesn't clobber
+    the daily artifact (mirrors ``perf-review``).
+    """
+    import json as _json
+
+    from src.db.engine import async_session
+
+    since = None
+    if since_str:
+        since = datetime.strptime(since_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+
+    async def _run() -> None:
+        async with async_session() as session:
+            result = await no_trade_result(session, days, since=since)
+            if write_artifact and since is None:
+                await _persist_no_trade_artifact(session, days, result)
+                await session.commit()
+        if as_json:
+            click.echo(_json.dumps(result, indent=2, default=str))
+        else:
+            click.echo(render_no_trade_digest(result, markdown=False))
+        if push:
+            await _push_one(render_no_trade_digest(result, markdown=True), markdown=True)
 
     asyncio.run(_run())
 

@@ -61,9 +61,9 @@ this is the consolidated decision index.
 **Re-enable when:** the rebuilt gate is validated firing on real observational locks (`decision_logs.metadata.conviction=true` → `trade_filled` on genuine YES-`at_least` locks, settling +EV).
 
 ### SIGMA_FLOOR_LEAD_TIME_ENABLED — lead-time-aware σ floor (probability-engine Gaussian)
-**Suspended:** 2026-05-30 · **Flag:** Settings default `False` · **Code:** `src/signals/probability_engine.py::_compute_sigma`
-**Why off:** addresses the bracket-like-NO / range-undershoot σ-collapse root cause but also touches the working threshold path; `backtest-v2` A/B is neutral (Brier 0.0537→0.0525, no clear win). `SHADOW_SIGMA_LEADTIME_ENABLED` (default True, pure telemetry) measures it dark.
-**Re-enable when:** `shadow-report --key sigma` shows positive `sigma.delta` concentrated on far-from-peak evals joined to bracket-like-NO outcomes; pair the flip with re-enabling `BRACKET_LIKE_NO_DISABLED=False`.
+**Suspended:** 2026-05-30 · **Re-enabled (standalone):** 2026-06-27 (prod env `true`, slope at default 0.3) · **Flag:** Settings default `False` · **Code:** `src/signals/probability_engine.py::_compute_sigma`
+**Why off:** addressed the bracket-like-NO / range-undershoot σ-collapse root cause but also touches the working threshold path; `backtest-v2` A/B is neutral (Brier 0.0537→0.0525, no clear win). `SHADOW_SIGMA_LEADTIME_ENABLED` (default True, pure telemetry) measured it dark.
+**Re-enabled because (2026-06-27, see playbook §5):** gates 1/3/4 green — `forecast-error-report` shows RMSE 1.49× the effective engine σ at 12h lead (calibrated at peak); `shadow-report --key sigma` positive far-from-peak (+1.81°F at 12h+, dormant near peak); `backtest-v2` neutral (no regression). Flipped **standalone** — this *corrects* the original "pair with `BRACKET_LIKE_NO_DISABLED=False`" criterion below: the σ-floor is the low-risk **prerequisite** that must land first; it only widens σ far from peak. The killed classes stay killed (their gate 5 — `evals-report --operator bracket-like` baseline +EV — is unsamplable until the forward-forecast-archive code task lands; see playbook Iteration 2). Kill criterion: revert if it suppresses the working at/past-peak +EV book (should be dormant there).
 
 ### PER_OPERATOR_CALIBRATION_ENABLED — split calibration fit by operator class
 **Suspended:** 2026-05-31 · **Flag:** Settings default `False` · **Code:** `src/signals/calibration.py`

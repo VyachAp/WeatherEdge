@@ -16,6 +16,7 @@ from src.cli import (
     _flags_diff,
     _flatten_shadow,
     _quantiles,
+    _reject_rollup,
     _summarize_conviction_locks,
     _summarize_exposure,
     _summarize_floored_fills,
@@ -24,6 +25,8 @@ from src.cli import (
     _summarize_shadow,
     _valley_bet_won,
     _valley_ev_per_dollar,
+    aggregate_no_trade_funnel,
+    render_no_trade_digest,
 )
 
 
@@ -423,3 +426,99 @@ def test_summarize_conviction_locks_funnel_and_settlement():
     assert s["settled"] == 2 and s["won"] == 1 and s["lost"] == 1
     assert s["net_pnl"] == pytest.approx(9.5 - 55.0)
     assert s["by_branch"] == {"easy_super": 4, "easy_standard": 1}
+
+
+# --- no-trade funnel --------------------------------------------------------
+
+def test_reject_rollup_empty():
+    r = _reject_rollup([])
+    assert r["total"] == 0
+    assert r["by_reason"] == {} and r["by_kind"] == {} and r["by_op_class"] == {}
+
+
+def test_reject_rollup_buckets_by_prefix_kind_op_class():
+    rows = [
+        {"passes": True, "reject_reason": None, "signal_kind": "probability",
+         "op_class": "threshold"},  # passing → ignored
+        {"passes": False, "reject_reason": "edge 0.03 < 0.05",
+         "signal_kind": "probability", "op_class": "threshold"},
+        {"passes": False, "reject_reason": "edge 0.01 < 0.05",
+         "signal_kind": "probability", "op_class": "threshold"},
+        {"passes": False, "reject_reason": "bracket-like NO disabled (x)",
+         "signal_kind": "probability", "op_class": "bracket-like"},
+        {"passes": False, "reject_reason": None,
+         "signal_kind": "lock", "op_class": None},
+    ]
+    r = _reject_rollup(rows)
+    assert r["total"] == 4
+    # prefix bucketing + descending sort (edge=2 first)
+    assert list(r["by_reason"].items())[0] == ("edge", 2)
+    assert r["by_reason"]["bracket-like"] == 1
+    assert r["by_reason"]["(unknown)"] == 1
+    assert r["by_kind"] == {"probability": 3, "lock": 1}
+    assert r["by_op_class"]["threshold"] == 2
+
+
+def test_aggregate_no_trade_funnel_arithmetic():
+    eval_rows = [
+        {"market_id": "m1", "direction": "BUY_YES", "passes": True,
+         "reject_reason": None, "signal_kind": "probability", "op_class": "threshold"},
+        {"market_id": "m1", "direction": "BUY_NO", "passes": False,
+         "reject_reason": "edge 0.0 < 0.05", "signal_kind": "probability",
+         "op_class": "threshold"},
+        {"market_id": "m2", "direction": "BUY_YES", "passes": False,
+         "reject_reason": "depth $3 < $10", "signal_kind": "probability",
+         "op_class": "threshold"},
+    ]
+    decision_rows = [
+        {"outcome": "trade_filled", "metadata_json": None},
+        {"outcome": "stake_below_min",
+         "metadata_json": {"size_reason": "depth cap"}},
+        {"outcome": "stake_below_min",
+         "metadata_json": {"size_reason": "depth cap"}},
+    ]
+    res = aggregate_no_trade_funnel(
+        universe_n=5, eval_rows=eval_rows, decision_rows=decision_rows,
+        dd_state={"dd_level": "NORMAL", "dd_multiplier": 1.0},
+    )
+    assert res["universe_n"] == 5
+    assert res["evaluated_n"] == 3
+    # distinct evaluated markets = {m1, m2} = 2 → never = 5 - 2 = 3
+    assert res["never_evaluated_n"] == 3
+    assert res["passed_n"] == 1
+    assert res["rejected_n"] == 2
+    assert res["traded_n"] == 1
+    assert res["throttle"]["dominant_throttle"] == "stake_below_min"
+    assert res["throttle"]["size_reasons"] == {"depth cap": 2}
+    # funnel monotonicity over the evaluated set
+    assert res["universe_n"] >= res["evaluated_n"] >= res["passed_n"] >= res["traded_n"]
+
+
+def test_aggregate_no_trade_funnel_empty():
+    res = aggregate_no_trade_funnel(
+        universe_n=0, eval_rows=[], decision_rows=[], dd_state=None,
+    )
+    assert res["universe_n"] == 0 and res["evaluated_n"] == 0
+    assert res["never_evaluated_n"] == 0 and res["traded_n"] == 0
+    assert res["dd"] == {}
+
+
+def test_render_no_trade_digest_markdown_and_plain():
+    res = aggregate_no_trade_funnel(
+        universe_n=10,
+        eval_rows=[
+            {"market_id": "m1", "direction": "BUY_NO", "passes": False,
+             "reject_reason": "price 0.30 < 0.40", "signal_kind": "probability",
+             "op_class": "threshold"},
+        ],
+        decision_rows=[{"outcome": "drawdown_paused",
+                        "metadata_json": {"size_reason": "exposure"}}],
+        dd_state={"dd_level": "PAUSED", "dd_multiplier": 0.0},
+    )
+    res["window_days"] = 1
+    plain = render_no_trade_digest(res, markdown=False)
+    assert "No-trade funnel" in plain and "10 markets" in plain
+    assert "PAUSED" in plain
+    md = render_no_trade_digest(res, markdown=True)
+    # MarkdownV2 escapes the '.' and '-' in dynamic values / headline
+    assert md and "\\" in md

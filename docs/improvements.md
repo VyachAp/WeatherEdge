@@ -28,6 +28,16 @@ gotchas, not here.
 
 ---
 
+## [backlog] Itemize silent pre-evaluation drops in the no-trade funnel
+**Why:** the daily `no-trade-report` / `job_no_trade_review` (shipped 2026-06-25, gated by `NO_TRADE_REVIEW_ENABLED`) reconstructs the funnel from `evaluation_logs` + `decision_logs` + the binary-market universe. But ~21 drop points skip a market *before* any telemetry row is written (`_EXCLUDED_ICAOS` grouping, `should_skip_future_day`, bias-runaway, near-resolved price ≥0.99, no-token-ids, lock-fires-first, circuit-breaker halt, **all** of fast-poll). So the report's "never evaluated" bucket is a *count*, not a per-reason breakdown — the deliberately-accepted limitation when we chose "reuse existing data only".
+**Success criteria:** every market in the daily universe has an attributable disposition (rejected / throttled / traded / *specific* silent-skip reason).
+**Effort:** ~half a day + a migration.
+**Leverage:** observability.
+**Files:** a lightweight skip-reason writer (new table, OR a tagged `evaluation_logs` row with `reject_reason="skipped:<reason>"` + `passes=False`); instrument the drop points in `src/scheduler/jobs.py::job_unified_pipeline` and `::job_fast_lock_poll`; teach `analysis.no_trade._reject_rollup` / `aggregate_no_trade_funnel` to surface a `skips` section.
+**Notes:** the silent drop points were mapped during the 2026-06-25 planning pass. Tagging `evaluation_logs` avoids a migration but pollutes the eval pass-rate denominators — prefer a separate `skip_logs` table if/when this is built.
+
+---
+
 ## [done 2026-06-24] Self-improvement data-collection layer (3 phases shipped)
 
 **Why:** "Gym" framing — steady, measured improvement, not a profit switch.
@@ -64,6 +74,10 @@ instead of guessing it — the gate for re-enabling `BRACKET_LIKE_NO_DISABLED`;
 `src/scheduler/jobs.py` (settlement steps 4c/4d/4e + the two reprice hooks),
 `src/config.py`, `src/cli.py`, 3 migrations, `scripts/backfill_station_day_resolutions.py`,
 `tests/test_{station_day_resolution,forecast_error,cli_reports}.py`.
+**Next phase ("mastering"):** the plan for *using* this data — dashboard, the
+dark-flag→gate map, and the first three iterations (Edge Map → σ-honesty →
+latency verdict, sequenced by data readiness) — lives in
+`docs/mastering_playbook.md`. Append cycle findings to its §5.
 
 ## [in-flight] Automated perf-review loop (Layer 1 deterministic + Layer 2 analyst)
 

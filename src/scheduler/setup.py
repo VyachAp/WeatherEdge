@@ -27,6 +27,7 @@ from src.scheduler import runtime
 from src.scheduler.jobs import (
     job_daily_settlement,
     job_fast_lock_poll,
+    job_no_trade_review,
     job_perf_review,
     job_reconcile_orders,
     job_resolve_trades,
@@ -128,6 +129,17 @@ def setup_scheduler() -> AsyncIOScheduler:
                 coalesce=True,
             )
         logger.info("Perf-review jobs enabled (daily / 3d / 7d)")
+
+    if settings.NO_TRADE_REVIEW_ENABLED:
+        # Daily "why no trade" funnel, staggered after the perf-review daily.
+        scheduler.add_job(
+            functools.partial(job_no_trade_review, 1),
+            CronTrigger(hour=22, minute=35, timezone="UTC"),
+            id="no_trade_review_daily",
+            max_instances=1,
+            coalesce=True,
+        )
+        logger.info("No-trade-review job enabled (daily)")
 
     return scheduler
 
