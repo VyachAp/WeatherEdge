@@ -94,7 +94,7 @@ class TestBucketEdgeDirection:
 def _eval_binary(
     *, question, threshold_f, op, our_prob_in_window,
     yes_bid, yes_ask, forecast_peak_f, current_max_f, hours_until_peak,
-    end_hours=5, routine_count=5,
+    end_hours=5, routine_count=5, has_forecast=None,
 ):
     """Drive `binary_market_edge` for a single market with the new
     forecast/observation context kwargs that feed the single-bucket NO
@@ -132,7 +132,7 @@ def _eval_binary(
         depth_yes=100.0, depth_no_fn=lambda: 100.0,
         yes_bid=yes_bid, yes_ask=yes_ask,
         forecast_peak_f=forecast_peak_f, current_max_f=current_max_f,
-        hours_until_peak=hours_until_peak,
+        hours_until_peak=hours_until_peak, has_forecast=has_forecast,
     )
 
 
@@ -515,6 +515,61 @@ class TestBracketLikeNoMasterSwitch:
             our_prob_in_window=0.05, yes_bid=0.20, yes_ask=0.25,
             forecast_peak_f=70.0, current_max_f=65.0, hours_until_peak=-1.0,
         )
+        assert edge.direction == TradeDirection.BUY_NO
+        assert edge.passes is True
+        assert edge.reject_reason is None
+
+
+class TestThresholdNoRequireForecast:
+    """`PROBABILITY_THRESHOLD_NO_REQUIRE_FORECAST=True` rejects a probability-
+    path above/at_least BUY_NO produced from a degenerate no-forecast state
+    (Open-Meteo failure → has_forecast False). The 2026-07-07 audit root-cause
+    fix for the forecast-cool-NO drag (Shanghai −$27.52). No-op by default and
+    when has_forecast isn't False (True or None).
+    """
+
+    Q = "Will the highest temperature in Shanghai be 85F or higher"
+
+    def _at_least_no(self, has_forecast):
+        # yes_bid=0.20 → NO buy price 0.80; forecast context supplied but the
+        # guard keys on has_forecast, not peak vs obs.
+        return _eval_binary(
+            question=self.Q, threshold_f=85.0, op="at_least",
+            our_prob_in_window=0.05, yes_bid=0.20, yes_ask=0.25,
+            forecast_peak_f=70.0, current_max_f=65.0, hours_until_peak=-1.0,
+            has_forecast=has_forecast,
+        )
+
+    def test_off_by_default_passes_without_forecast(self, monkeypatch):
+        from src.config import settings
+        from src.db.models import TradeDirection
+
+        monkeypatch.setattr(
+            settings, "PROBABILITY_THRESHOLD_NO_REQUIRE_FORECAST", False
+        )
+        edge = self._at_least_no(has_forecast=False)
+        assert edge.direction == TradeDirection.BUY_NO
+        assert edge.passes is True
+        assert edge.reject_reason is None
+
+    def test_enabled_blocks_no_forecast_threshold_no(self, monkeypatch):
+        from src.config import settings
+
+        monkeypatch.setattr(
+            settings, "PROBABILITY_THRESHOLD_NO_REQUIRE_FORECAST", True
+        )
+        edge = self._at_least_no(has_forecast=False)
+        assert edge.passes is False
+        assert edge.reject_reason == "threshold NO without forecast (degenerate state)"
+
+    def test_enabled_passes_with_live_forecast(self, monkeypatch):
+        from src.config import settings
+        from src.db.models import TradeDirection
+
+        monkeypatch.setattr(
+            settings, "PROBABILITY_THRESHOLD_NO_REQUIRE_FORECAST", True
+        )
+        edge = self._at_least_no(has_forecast=True)
         assert edge.direction == TradeDirection.BUY_NO
         assert edge.passes is True
         assert edge.reject_reason is None

@@ -481,6 +481,7 @@ async def job_unified_pipeline() -> None:
                         forecast_peak_f=state.forecast_peak_f,
                         current_max_f=state.current_max_f,
                         hours_until_peak=state.hours_until_peak,
+                        has_forecast=state.has_forecast,
                     )
                     if edge_result is None:
                         logger.info(

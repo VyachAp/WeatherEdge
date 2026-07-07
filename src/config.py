@@ -113,6 +113,23 @@ class Settings(BaseSettings):
     # LOCK path keeps firing cheap-but-certain bets (it has its own
     # LOCK_RULE_MIN_PRICE gate and never wants a high floor). None = no change.
     PROBABILITY_MIN_ENTRY_PRICE: float | None = None
+    # Require a live forecast (`state.has_forecast`) for probability-path
+    # above/at_least BUY_NO ("forecast-cool NO"). Default False preserves
+    # behavior; the live env sets True. Read live off `settings`.
+    #
+    # Why (2026-07-07 mastering audit, workflow wf_beb30c80-6a3): the remaining
+    # post-HARD-lock-kill drag is the probability-path above/at_least BUY_NO
+    # cohort — the SAME forecast-cool bet as the killed HARD-lock, still firing
+    # because the probability path lacks the `has_forecast` guard the HARD-lock
+    # path enforces. 3 of the 4 big losses (Sao Paulo −$6.92, Moscow −$6.20,
+    # Shanghai −$27.52) are degenerate Open-Meteo-FAILED states (has_forecast
+    # False → forecast_peak_f == current_max_f, σ NULL) where the model prob
+    # collapses to ~1.0 and Kelly sizes the max — betting a forecast signal when
+    # there is no forecast. σ-NULL subset −$14.61/60d incl. the −$27.52 tail;
+    # the live-forecast subset is ~flat. Same class as the conviction-gate
+    # degenerate-state bug (see memory project_conviction_degenerate_state_bug_2026-06-21).
+    # NOT "require past-peak" — the data shows past-peak is the *losing* subset.
+    PROBABILITY_THRESHOLD_NO_REQUIRE_FORECAST: bool = False
     # Operator-aware overrides for the two filters that were globally
     # tightened during the 2026-05-08 bracket-overconfidence crisis
     # (MIN_PROBABILITY 0.50→0.85, MIN_EDGE→0.10). Threshold markets

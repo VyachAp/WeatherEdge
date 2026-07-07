@@ -73,6 +73,7 @@ def binary_market_edge(
     forecast_peak_f: float | None = None,
     current_max_f: float | None = None,
     hours_until_peak: float | None = None,
+    has_forecast: bool | None = None,
 ) -> BucketEdge | None:
     """Pick the best side (YES or NO) of a binary market and gate it.
 
@@ -306,6 +307,25 @@ def binary_market_edge(
         and op in ("exactly", "range", "bracket")
     ):
         reason = "bracket-like NO disabled (sigma recalibration pending)"
+
+    # Forecast-required guard for threshold above/at_least BUY_NO — don't bet a
+    # forecast-cool NO when there is no forecast. On an Open-Meteo failure the
+    # WeatherState degenerates (has_forecast False → forecast_peak_f ==
+    # current_max_f, σ NULL), the model prob collapses to ~1.0 and Kelly sizes
+    # the max — the exact degenerate state holding 3 of the 4 big post-06-30
+    # losses (Shanghai −$27.52). Mirrors the guard the HARD-lock path already
+    # enforces (which the probability path lacked). Applied under the `reason is
+    # None` guard so a more specific reject reason wins in `evaluation_logs`.
+    # No-op when has_forecast is None (legacy callers / tests). See settings
+    # entry + memory project_conviction_degenerate_state_bug_2026-06-21.
+    if (
+        reason is None
+        and settings.PROBABILITY_THRESHOLD_NO_REQUIRE_FORECAST
+        and direction == TradeDirection.BUY_NO
+        and op in ("above", "at_least")
+        and has_forecast is False
+    ):
+        reason = "threshold NO without forecast (degenerate state)"
 
     # Price-band edge policy — the bot's per-trade EV is U-shaped in the
     # effective price of the side bought: -EV in the mid "overconfidence
