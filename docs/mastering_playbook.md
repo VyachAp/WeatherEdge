@@ -224,6 +224,120 @@ obs_fraction-bucketed calibration (not raw moves) is the decisive test.
 
 ## 5. Findings log (append-only — this is what future cycles rely on)
 
+### 2026-07-09 — Post-A1 monitoring cycle: A1 live+biting (unscored), A3 CANCELLED (armed not dead), config drift reconciled
+
+**Thin-data monitoring cycle, 2 days after the 07-07 close.** Ran the dashboard + two custom
+splits (A1 live-forecast subset, V1 threshold-NO band) against prod. Every post-07-07 cohort is
+single-digit n — all verdicts are directional/provisional by principle #7. Central conclusion
+unchanged: **no proven edge; minimize losses.** The one hard action this cycle was a **config-reality
+correction** that cancelled the planned A3.
+
+**A1 is LIVE and BITING, but unscored (n=0 settled).** `doctl apps spec get` (app 4b020323,
+authoritative) confirms `PROBABILITY_THRESHOLD_NO_REQUIRE_FORECAST=true` in prod — commit `ff7f6bc`
+IS deployed, despite there being **no A1 ConfigEpoch boundary** (the flag wasn't epoch-tracked — a
+telemetry gap, not a deploy miss). Post-07-07 the guard fired **3** `threshold NO without forecast
+(degenerate state)` rejects and admitted **0** σ-NULL `above`/`at_least` BUY_NO fills — exactly the
+design. But settled post-07-07 trades of this class = **0**, so A1's go-forward EV is unmeasurable
+this cycle. **Verdict: PROVISIONAL** (deployed + biting confirmed; not yet scored). Re-check after
+~1–2 weeks of settlements.
+- **Wrinkle worth recording:** on the 06-05 book (phantom-safe), the σ-NULL degenerate cohort A1 now
+  kills was only mildly −EV (−0.091 EV/$, **n=11**), while the *live-forecast* above/at_least NO
+  subset A1 lets through is the deeper bleeder (−0.44 to −0.53 EV/$, **n=2+2, directional**). Read
+  honestly: the **whole** above/at_least NO class looks −EV forecast-or-not, but every cohort is n<10.
+  A1 removes the clearly-broken degenerate tail; it does **not** by itself make the class +EV. Points
+  toward V1, pending volume.
+
+**V1 (disable all prob-path threshold BUY_NO) → HOLD.** Post-06-27 threshold BUY_NO is entirely in
+the 0.80+ band (**n=4**, 50% win, avg NO px 0.872, −0.55 EV/$), **zero** <0.80 fills —
+`PROBABILITY_MIN_ENTRY_PRICE=0.80` is fully binding, no cheap-NO leakage. The 0.80+ band does **not**
+rescue threshold-NO, and directional evidence leans toward tightening, but n=4 is 25× short of the
+n≥100 kill bar. HOLD.
+
+**A2 (per-trade stake sub-cap on above/at_least BUY_NO) → HOLD (would be inert).** No new post-07-07
+live-forecast pre-peak tail loss appeared (n=0), AND `decisions-report` (30d, n=354) proves per-trade
+`MAX_POSITION_PCT` is **not** the binding constraint — **zero** `cap_exceeded`, zero
+MAX_POSITION_PCT-limited rows. A per-trade sub-cap as specced would throttle nothing. If a tail loss
+appears, the correct lever is the `KELLY_PROB_CAP`/$5-min mechanics, not the per-trade cap. HOLD.
+
+**A3 (retire the "inert" LOCK_CONVICTION whitelist) → CANCELLED. Premise refuted — the path is
+ARMED, not dead.** The plan assumed doubly-dead (flag False + empty whitelist, per code defaults +
+stale docs). `doctl` shows the **opposite live**: `LOCK_CONVICTION_SIZING_ENABLED=true` and
+`LOCK_BIG_SIZE_STATIONS=CYYZ,SBGR,RKSI,KATL`. The conviction-lock path is **dormant-but-armed** — it
+has never fired (0 EASY-YES fires/14d) only because EASY-YES locks price to ~1.00, outside the
+[0.05,0.95] band ("the certain locks price away", confirmed again). **Do NOT retire it** — that would
+disable a live feature on a false premise. Instead, a **new recommendation for the operator** (a
+*de-arming* env change, outside the "apply gated-green flips" mandate — needs an explicit decision):
+the armed path is a latent black-swan large-size surface (Kelly-by-price up to 15% of bankroll on one
+fill) with **zero demonstrated benefit** (0 fires) and includes **KATL (n=2, unverified** in the trust
+map). Minimal move: **trim KATL** from the whitelist; conservative move consistent with
+"don't amplify, minimize losses": **disarm entirely** (`LOCK_CONVICTION_SIZING_ENABLED=false`) until a
+station-trust map finds EASY-YES locks systematically filling *below* ~0.95 (a real discount to a
+verified-monotonic outcome — none exists today).
+**Action taken 2026-07-09 (operator-directed):** trimmed **KATL** from the live whitelist via
+`doctl apps update` → `LOCK_BIG_SIZE_STATIONS=CYYZ,SBGR,RKSI` (the three trust-map-clean stations);
+`LOCK_CONVICTION_SIZING_ENABLED` left `true`. The path stays armed on verified stations but still won't
+fire until an EASY-YES lock prices below ~0.95. Full disarm remains the fallback if that never happens.
+
+**Shadow-decision → RETIRE-as-promotion-candidate stands, but on STALE evidence.** The 07-07 fork
+(edge = price band, not the model) holds; the last clean `calibration-report` (07-07) had
+`model_beats_market` in **0/5** obs buckets, worst near peak, no n≥500 winner. But **this cycle's
+`calibration-report` (60d) and `latency-report` (14d) were both killed 2× under prod-DB contention**,
+and `counterfactual-report` hangs at prod scale (0 bytes, pathological join). So the retirement rests
+on 07-07 data, not a fresh run. Keep `shadow_ledger`/`shadow-report` σ telemetry (still healthy). The
+only sanctioned revival route remains an **isotonic-recal refinement test** (not yet run).
+
+**σ-floor is healthy and stays ON.** `shadow-report --key sigma` (n=218,869): `sigma.delta`
+p25/p50/p75 = 0/0/0 — firing only on the <25% far-from-peak tail (>~10h) at ~+0.1°F, dormant near
+peak, as designed. `forecast-error-report` (30d) confirms genuine under-dispersion (RMSE **1.74–2.29×**
+mean σ at n≥746) and, crucially, the miss is a **LEVEL cool bias (~−0.75°F, flat across 0/6/12h lead),
+NOT a SLOPE** (the 18/24h warm flip is n<30 — ignore). → do **not** grow the lead-time slope; the
+empirically-supported candidate (separate, validate-first) is a small **warm level correction**
+(~+0.7°F) to `forecast_peak_f`, which would tighten the whole above/at_least-NO class the honest way.
+
+**Clean book (since 06-05, phantom-safe) still mildly −EV, shallow.** Overall **n=37**, 73% win,
+−$34.40, **−0.102 EV/$**. Prob path **n=29, −0.052** (borderline); Lock path **n=8, −0.326** — the
+worse drag, from 4 legacy HARD fills opened before the 06-30 gate (−$12.02) + `range_in_window`
+(n=4, −$8.03). Post-σ-floor (since 06-27) is n=8 total, too thin. The σ arm did not suppress
+prob-path volume.
+
+**Binding throttle = capital-sizing, not filters/cap (unchanged).** `decisions-report` (30d, n=354):
+`stake_below_min`=51.7%; sizing stalls split "no edge" 94 (the `KELLY_PROB_CAP` dead-zone zeroing the
+>0.90 near-lock band) + "below $5 min" 89. Exposure 99% idle (median headroom $593/$600, 0.0% of ticks
+below $5). The bot barely trades because Kelly can't size the near-lock band it's concentrated onto —
+same story as 06-24/06-26.
+
+**Resolver truth: no new exclusions.** `resolver-truth-report` (120d, 914 point-divergences): no
+station crosses |signed mean|≥1.0°F at n≥10. Closest real one is **UUEE −0.66 mean / abs 1.19 / std
+1.40 / n26 — WATCH, not exclude**. RCTP (−1.57, n9) already excluded. Whitelist stations CYYZ/SBGR/RKSI
+read clean; **KATL is n=2, unverified** (feeds the A3 de-arm recommendation above).
+
+**Config drift reconciled (doctl = ground truth).** Live prod diverges from the docs on two knobs —
+now fixed in CLAUDE.md: **`MIN_EDGE=0.05`** (docs said 0.10) and **`THRESHOLD_MIN_PROBABILITY=0.75`**
+(docs said 0.78). All other tracked flags match docs (A1 true, σ-floor true, HARD_LOCK false,
+RANGE_UNDERSHOOT false, NEAR_PEAK_FLOOR_UP false, PROBABILITY_MIN_ENTRY_PRICE 0.80).
+
+**SHIPPED this cycle (code/docs; no live-config change needed — A1 + σ-floor already live):**
+- Made **A1 epoch-tracked** — added `PROBABILITY_THRESHOLD_NO_REQUIRE_FORECAST` to
+  `config_epoch._TRACKED_FLAGS`, so the next scheduler startup writes a ConfigEpoch boundary and
+  future flips get `--since-epoch` scoping instead of date-only windowing.
+- Reconciled the two **CLAUDE.md config drifts** to the doctl-authoritative values.
+- **Cancelled the A3 code removal** (armed feature, see above) — instead, **trimmed KATL** (n=2,
+  unverified) from the live `LOCK_BIG_SIZE_STATIONS` whitelist via `doctl` per operator direction
+  (now `CYYZ,SBGR,RKSI`); the conviction path stays enabled on the trust-clean stations.
+
+**Next-cycle TODO:**
+1. **Fix the report tooling that failed at prod scale** — `calibration-report` + `latency-report`
+   were killed 2× under DB contention; `counterfactual-report` hangs (pathological join, 0 bytes at
+   30d/60d). Run against a replica / off-peak, or profile+shrink the join. The shadow-retire and
+   latency verdicts are blocked on this.
+2. **Score A1** once ~n≥10 post-07-07 threshold-NO settle — apply the CONFIRM gate (live-forecast
+   subset EV/$ ≥ 0). If the live-forecast subset stays −EV, escalate toward **V1**.
+3. **Armed conviction-lock path** — KATL trimmed (done 07-09); whitelist now `CYYZ,SBGR,RKSI`. Open
+   question: fully disarm (`LOCK_CONVICTION_SIZING_ENABLED=false`) if EASY-YES locks keep pricing to
+   ~1.00 and never fire, since it's a large-size risk surface with no demonstrated benefit.
+4. **Evaluate the warm level-correction** (~+0.7°F to `forecast_peak_f`) as the σ-honesty follow-up —
+   it's the LEVEL fix the forecast-error data actually supports (the σ-floor was the width fix).
+
 ### 2026-07-07 — Iteration 3 close: the fork is decided — edge is the PRICE BAND, not the model
 
 **Iteration 3 fork VERDICT — thesis REFUTED, decisively.** The information-latency
