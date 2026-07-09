@@ -176,6 +176,12 @@ class EvaluationLog(Base):
     __tablename__ = "evaluation_logs"
     __table_args__ = (
         Index("ix_eval_logs_market_created", "market_id", "created_at"),
+        # Bare created_at range/sort index for time-window reports
+        # (perf-review, evals-report, decisions-report, no-trade-report).
+        # The composite above leads with market_id, so it cannot serve a
+        # `created_at >= ? ORDER BY created_at` window scan on this ~2M-row
+        # table — that forced a full index scan + external sort (~18s/7d).
+        Index("ix_eval_logs_created", "created_at"),
     )
 
     id = Column(Integer, primary_key=True, autoincrement=True)

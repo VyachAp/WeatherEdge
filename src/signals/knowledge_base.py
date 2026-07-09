@@ -40,6 +40,11 @@ async def fetch_counterfactual_rows(session, cutoff: datetime) -> tuple[list[dic
     from src.analysis.counterfactual import THROTTLE_OUTCOMES
     from src.db.models import DecisionLog, EvaluationLog, Market, MarketResolution
 
+    # DISTINCT ON (market_id, direction) keeping the latest row per side does the
+    # dedup in Postgres, so we transfer ~one row per market-side instead of every
+    # passes=False eval since cutoff (~30k/day on a ~2M-row table). The read-path
+    # was the "reports hang at prod scale" bottleneck — it was O(raw rows) over the
+    # wire, not a bad plan. ORDER BY must lead with the DISTINCT ON columns.
     rej = (await session.execute(
         select(
             EvaluationLog.market_id, EvaluationLog.direction,
@@ -48,7 +53,11 @@ async def fetch_counterfactual_rows(session, cutoff: datetime) -> tuple[list[dic
         ).where(
             EvaluationLog.passes.is_(False),
             EvaluationLog.created_at >= cutoff,
-        ).order_by(EvaluationLog.created_at)
+        ).distinct(EvaluationLog.market_id, EvaluationLog.direction)
+        .order_by(
+            EvaluationLog.market_id, EvaluationLog.direction,
+            EvaluationLog.created_at.desc(),
+        )
     )).all()
     latest_rej: dict[tuple, dict] = {}
     for mid, direction, reason, price, htp in rej:
@@ -66,7 +75,11 @@ async def fetch_counterfactual_rows(session, cutoff: datetime) -> tuple[list[dic
         ).where(
             DecisionLog.outcome.in_(THROTTLE_OUTCOMES),
             DecisionLog.created_at >= cutoff,
-        ).order_by(DecisionLog.created_at)
+        ).distinct(DecisionLog.market_id, DecisionLog.direction)
+        .order_by(
+            DecisionLog.market_id, DecisionLog.direction,
+            DecisionLog.created_at.desc(),
+        )
     )).all()
     latest_thr: dict[tuple, dict] = {}
     for mid, direction, outcome in thr:

@@ -28,6 +28,210 @@ gotchas, not here.
 
 ---
 
+## [in-flight] Nightly orchestrator agent (stand up the Layer-2/mastering schedule)
+
+**Why:** The perf-review loop below shipped Layer 1 + the Layer-2 analyst prompt,
+but **nothing actually runs Layer 2 on a schedule** — its own success criteria
+left "stand up the Layer-2 schedule (mechanism TBD: routines vs host cron — needs
+prod-DB reachability)" open. This entry closes that: a nightly, token-heavy,
+**propose-only** orchestrator that drives the whole `docs/mastering_playbook.md`
+(not just the perf digest), enforces a per-night **value contract**, and advances
+one dark-flag gate per night. Formulated 2026-07-09.
+**What shipped (docs only, propose-only):**
+- `docs/agents/nightly_orchestrator_prompt.md` — the nightly prompt. Reuses the
+  perf-analyst HARD RULES verbatim (never edit `.env`/`src`, no trades/admin/
+  redeem; writable sinks = `docs/*` + memory; exit `git diff -- .env src/` empty).
+  Steps: Orient (re-read playbook/backlog/graveyard/memory) → dashboard ritual
+  (self-regenerates the digest via `perf-review --since --json --no-push`, so it
+  does *not* need prod `PERF_REVIEW_ENABLED`) → advance one gate → value contract
+  → verify.
+- `docs/mastering_playbook.md` "Mission & nightly charter" — the durable goal:
+  consistency not jackpot, the value contract, Track A now / Track B gated, the
+  stability→monitoring trigger.
+**Success criteria:** (a) a manual dry-run of the prompt runs the dashboard
+reports against prod DB, advances one gate, writes ≥1 durable sink (or a
+named null-result), pushes a Telegram digest, and leaves `git diff -- .env src/`
+empty; (b) the value contract fires on an empty night (null-result + which wall,
+never silence); (c) the schedule fires nightly without spam.
+**Effort:** docs shipped; remaining = the schedule wiring (below) + one dry-run.
+**Leverage:** iteration-velocity + observability.
+**Files:** `docs/agents/nightly_orchestrator_prompt.md`,
+`docs/mastering_playbook.md`, this file; the schedule artifact (cloud routine or
+`~/Library/LaunchAgents/com.weatheredge.nightly.plist`).
+**Notes — runtime (Phase-0 decided 2026-07-09 → LOCAL launchd):** verified the
+operator Mac reaches the prod DB today (`python -m src.cli epochs` returns live
+epochs; note a transient asyncpg SSL-connect error on the first attempt that
+retries and succeeds — the nightly job tolerates it). **Chosen path: local
+`launchd`** (`deploy/com.weatheredge.nightly.plist` → `scripts/nightly_agent.sh`
+→ `claude -p <prompt> --settings scripts/nightly_agent.settings.json --max-turns
+80`, **default permission mode, NOT `--dangerously-skip-permissions`**). A
+**cloud routine** (via the `schedule` skill) was *not* chosen: it would require
+exposing the DO managed-Postgres to Anthropic's cloud IPs + injecting
+`DATABASE_URL`/`TELEGRAM_BOT_TOKEN` as routine secrets — a security expansion
+that's the operator's call; revisit if the Mac's "must be awake" caveat
+(`pmset repeat wakeorpoweron`) proves annoying.
+**Guardrail (3 layers, all verified 2026-07-09):** `scripts/nightly_agent.settings.json`
+carries, scoped to the nightly run only, (1) `permissions.deny` hard-blocks on
+Write/Edit to `.env`/`src/`/`alembic/`; (2) a `permissions.allow` surface (read
+tools + `python -m src.cli:*` + read utils + `docs/`+memory writes) — in default
+headless mode anything **not** allowed is denied-and-continues (probed: `echo`
+ran, a `runtime/` write blocked, session exited 0, no hang); (3) a PreToolUse
+deny-hook as defense-in-depth for compound Bash (`bet`/`admin`/`redeem`/`reconcile`/
+`git commit`/`alembic upgrade`). Probed live: docs write ✓, memory write ✓, src
+write blocked ✓. `--dangerously-skip-permissions` was rejected because
+`claude-code-guide` could not confirm deny rules/hooks fire under it. Supersedes
+the "mechanism TBD" open item in the perf-review entry below.
+**Remaining before it's live (operator, one-time):** run the controlled first
+dry-run — `bash scripts/nightly_agent.sh` — watch it produce a Telegram digest +
+docs/memory writes with `git diff -- .env src/` clean, then
+`cp deploy/com.weatheredge.nightly.plist ~/Library/LaunchAgents/ && launchctl load
+~/Library/LaunchAgents/com.weatheredge.nightly.plist`. (Not auto-run here: the
+first run is token-heavy and outward-facing — sends Telegram + edits the planning
+docs — so it's best watched.)
+
+**🚨 BLOCKER found on the 2026-07-09 (late) dry-run — Telegram sink is a silent no-op.**
+`TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` are **present but EMPTY** in the operator Mac's
+local `.env` (they live only in the DO app spec, where the *bot* runs). So
+`perf-propose-push` printed `[no Telegram credentials — not pushed]`, **exit 0**, and the
+nightly digest was never delivered. `scripts/nightly_agent.sh` sets no `TELEGRAM_*` either.
+This is the project's recurring **silent-silencer** class — the loop would appear healthy while
+the operator-facing sink is dead.
+
+**✅ Code half fixed 2026-07-09:** `_push_one` (src/cli.py) now takes `require: bool`; when a
+push is explicitly requested and creds are missing/empty it raises `click.ClickException`
+(stderr + **exit 1**) instead of returning False and exiting 0. Wired `require=True` at all
+three explicit-push sites (`perf-propose-push`, `perf-review --push`, `no-trade-report --push`).
+Verified: `perf-propose-push` with empty keys exits 1. See memory
+`project_telegram_readpath_fixes_2026-07-09`.
+
+**⏳ Still needs the operator:** populate the two keys in the Mac's `.env` (or export them in
+`scripts/nightly_agent.sh`) — the nightly runs locally and reads local `.env`. Until then the
+nightly digest **hard-fails loudly** (which is the point); its durable sinks remain docs + memory.
+
+---
+
+## [backlog] Whole-Polymarket opportunity discovery (Track B)
+
+**Why:** The bot's market universe is hardcoded to "highest temperature in
+[city]" daily markets (`src/ingestion/polymarket.py` event-slug enumeration over
+`mapper.CITY_ICAO`). The longer-term goal is to monitor *all* of Polymarket —
+events/markets/trade flow — for new automated-betting edges the weather template
+can't see. **Gated:** only spin up once Track A (mastering the weather bot) hits
+the stability trigger (`docs/mastering_playbook.md` charter).
+**Success criteria:** a read-only reconnaissance surface that enumerates active
+Polymarket events beyond weather, scores them for a *tradeable, defensible* edge
+(liquidity, resolution-source latency/asymmetry like the METAR edge, mispricing),
+and proposes candidate market classes to the operator — without placing a single
+order until a class clears the same measure-before-flip discipline as weather.
+**Effort:** week+ (research + a generic Gamma/CLOB enumerator; the current scanner
+is weather-specific — `is_weather_market` filter, temperature-bracket parser, the
+whole signals stack).
+**Leverage:** new-edge discovery (the only path to a second revenue stream).
+**Files (speculative):** a generic event/market enumerator reusing the Gamma HTTP
+scaffolding in `src/ingestion/polymarket.py`; a new discovery/analysis module; the
+`deep-research` skill drives the exploration.
+**Notes:** the 2026-07-09 ultracode GitHub-skills audit evaluated 13 real
+Polymarket/trading/orchestration CC skills and recommended **installing none** —
+every candidate was redundant with the native Gamma/CLOB integration + the
+in-house loop, immature, or a safety negative (e.g. `mjunaidca/polymarket-skills`'
+live-executor bypasses the Kelly/drawdown/circuit-breaker stack). Build this
+in-house against our own primitives, not a wrapper.
+
+## [in-flight] Make `counterfactual-report` cohorts trustworthy (it produced a 2×-recurring false lead)
+
+**Why:** On 2026-07-09 the `edge`-floor "#1 missed-winner" cohort (flagged 06-24 *and*
+07-09) was traced to **four compounding methodology defects**, not to a real filter
+mis-tune. See `docs/mastering_playbook.md` §5 "2026-07-09 (late)". It would have driven a
+`MIN_EDGE` loosening that recovers ≈none of the cohort, and what little it admits is the
+**losing** half. Four fixes, all pure/read-path:
+1. **First-failing-filter attribution.** `_check_filters` tests `edge` FIRST, so
+   `reject_reason="edge"` is the catch-all bucket for every side the model saw nothing on —
+   never tested against `MIN_PROBABILITY` / `PROBABILITY_MIN_ENTRY_PRICE`. A cohort is only
+   "recoverable by loosening filter X" if the *remaining* filters are re-run on it. Add a
+   `filters_rerun` pass before any cohort is labelled a missed winner.
+2. **Cluster the noise floor by station-day.** Rows are per-`(market, direction)`, but all of
+   a station-day's markets are deterministic functions of one number (that day's max), so
+   ρ≈1 within a cluster. 7d window: 642 "independent" rows ⇄ **≤255 station-days**. Report
+   `n_clusters` beside `n_resolved`; suppress headlines below `n_clusters ≥ 30`.
+3. **Kill the silent max-of-N.** `cli.py::_table` prints `[:8]` sorted by
+   `ev_per_dollar × n_resolved` desc with no truncation note → it structurally renders the
+   **winning tail** (07-09: MPTO `+1.316 EV/$1` on 7 station-days). Label the cap; §1 already
+   forbids silent caps.
+4. **Render the splits we already compute.** `mine_rejected` builds `by_op_class` and
+   `by_price_band`; `counterfactual_report` renders neither — so killed-bracket-like-vs-threshold
+   and the valley price band never reach the operator.
+**Success criteria:** the report emits `n_clusters`; no cohort is headlined below the cluster
+minimum; `by_op_class` + `by_price_band` render; a `filters_rerun` column shows how many of a
+cohort would survive the *other* filters. Re-run 30d: the `edge` cohort must stop being
+headlined.
+**Effort:** ~1 day (pure `src/analysis/counterfactual.py` + render).
+**Leverage:** validation-rigor (this class of artifact has already cost two cycles).
+**Files:** `src/analysis/counterfactual.py`, `src/cli.py::counterfactual_report`,
+`tests/test_counterfactual.py`.
+
+## [backlog] Noise-floor variance gate for cohort/flip validation
+
+**Why:** Measure-before-flip currently checks a cohort's in-sample EV vs a fixed
+threshold. Small-n cohorts (calibration buckets have been n≈8) are noisy, so a
+cohort can look +EV purely from run-to-run variance. Borrowed from the
+`autoresearch` CC plugin's design (the one technique worth stealing from the
+skills audit — the plugin itself was rejected for fighting propose-only).
+**2026-07-09 update — this is no longer hypothetical.** The `counterfactual-report`
+by-station table is a live example: it selects the top-8 of ~50 cohorts by EV, each backed by
+~5–7 station-days, so its headline EVs are max-order-statistics of noise. The clustered unit
+must be the **station-day**, not the market-side row (within a station-day every market's
+outcome is a deterministic function of one number). See the entry above.
+**Success criteria:** a reusable check that only treats a cohort/flip as "real"
+when it beats a shuffled/placebo/label-permuted baseline by more than the
+measured run-to-run noise floor **on station-day-clustered resamples**; the nightly
+orchestrator cites it in Step 3.
+**Effort:** ~half a day (a pure helper + a `--noise-floor` flag on the relevant
+report aggregators).
+**Leverage:** validation-rigor (fewer false-positive flips).
+**Files:** a pure helper in `src/analysis/common.py`; wire into
+`_calibration_report` / `counterfactual` cohort scoring; reference from
+`docs/mastering_playbook.md` §1.
+**Notes:** slots alongside §1's small-n discipline; complements, doesn't replace,
+the codified per-gate minimum-n.
+
+## [DONE 2026-07-09] Report read-path is O(raw rows) — the "reports hang at prod scale" wall
+
+**✅ Shipped 2026-07-09** (all three fixes below). Measured after: `counterfactual-report --days 7`
+**151s → 16.9s** (client CPU 0.37s); `calibration-report --days 7` 76.8s with client CPU 1.78s
+(the `feature_json` JSONB drag is gone — remaining cost is the DB join, not transfer);
+`latency-report` runs correct. Also shipped the `ix_eval_logs_created (created_at)` index
+(migration `y5z6a7b8c9d0`, built CONCURRENTLY on prod — the "un-authored models.py index" noted
+below was authored in the same operator session that owns this fix). Follow-up if latency digs
+stay slow: `metar_reprice_snapshots` (702k rows) may lack a `created_at` index. See memory
+`project_telegram_readpath_fixes_2026-07-09` + `project_perf_review_eval_index_2026-07-09`.
+
+**Why:** The 07-09 cycle recorded `calibration-report` / `latency-report` as "killed under DB
+contention" and `counterfactual-report` as "hangs (pathological join)". **Neither is true** —
+they are plain client-side transfer bombs and they complete if you wait. Measured 2026-07-09:
+`counterfactual-report` 1d = 38s, 7d = 151s (⇒ 30d ≈ 10 min, 60d ≈ 20 min);
+`perf-review --since 2026-06-05` completed in **~22 min**. Root causes:
+- `signals/knowledge_base.py::fetch_counterfactual_rows` streams **every**
+  `evaluation_logs.passes=False` row since cutoff (~30k/day, ~2M-row table) into Python and
+  dedups in a dict. → push to SQL: `DISTINCT ON (market_id, direction) … ORDER BY market_id,
+  direction, created_at DESC`. Same for the `decision_logs` half.
+- `cli.py::calibration_report` (~:4932) does `select(ShadowLedger, …)` — the **whole ORM
+  entity**, including the `feature_json` JSONB WeatherState snapshot + `decision_reason` — while
+  using 8 scalar columns. → column projection.
+- `cli.py::latency_report` (~:4573) does `select(MetarRepriceSnapshot)` whole-entity, uses 7.
+**Success criteria:** `calibration-report --days 60` and `latency-report --days 14` complete in
+< 60s and the stale (07-07) shadow-retire + latency verdicts get a fresh read.
+**Effort:** ~half a day; pure read-path, no schema, no behavior change.
+**Leverage:** observability (these three reports gate two of the project's biggest open verdicts).
+**Files:** `src/signals/knowledge_base.py`, `src/cli.py`.
+**Notes (2026-07-09):** an **uncommitted, un-authored** `Index("ix_eval_logs_created",
+"created_at")` appeared in `src/db/models.py` during the nightly run, targeting exactly this
+slowness. ⚠ A bare `models.py` index with **no Alembic migration** is the documented
+`bot_state` / `gfs_prob` failure class (`create_all` is not a substitute on managed Postgres) —
+and on a ~2M-row live table it needs `CREATE INDEX CONCURRENTLY`. Needs an operator decision +
+a migration before it means anything in prod.
+
+---
+
 ## [backlog] Itemize silent pre-evaluation drops in the no-trade funnel
 **Why:** the daily `no-trade-report` / `job_no_trade_review` (shipped 2026-06-25, gated by `NO_TRADE_REVIEW_ENABLED`) reconstructs the funnel from `evaluation_logs` + `decision_logs` + the binary-market universe. But ~21 drop points skip a market *before* any telemetry row is written (`_EXCLUDED_ICAOS` grouping, `should_skip_future_day`, bias-runaway, near-resolved price ≥0.99, no-token-ids, lock-fires-first, circuit-breaker halt, **all** of fast-poll). So the report's "never evaluated" bucket is a *count*, not a per-reason breakdown — the deliberately-accepted limitation when we chose "reuse existing data only".
 **Success criteria:** every market in the daily universe has an attributable disposition (rejected / throttled / traded / *specific* silent-skip reason).

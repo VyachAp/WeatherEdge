@@ -4569,8 +4569,18 @@ def latency_report(days: int, station: str | None, as_json: bool) -> None:
     async def _run() -> None:
         cutoff = datetime.now(timezone.utc) - timedelta(days=days)
         async with async_session() as session:
+            # Project only the 7 columns the pairing/summary uses, not the whole
+            # entity — read-path fix for prod-scale transfer cost.
             stmt = (
-                select(MetarRepriceSnapshot)
+                select(
+                    MetarRepriceSnapshot.market_id,
+                    MetarRepriceSnapshot.station_icao,
+                    MetarRepriceSnapshot.metar_observed_at,
+                    MetarRepriceSnapshot.created_at,
+                    MetarRepriceSnapshot.yes_mid,
+                    MetarRepriceSnapshot.obs_fraction,
+                    MetarRepriceSnapshot.seconds_since_obs,
+                )
                 .where(MetarRepriceSnapshot.created_at >= cutoff)
                 .order_by(MetarRepriceSnapshot.created_at)
             )
@@ -4578,7 +4588,7 @@ def latency_report(days: int, station: str | None, as_json: bool) -> None:
                 stmt = stmt.where(
                     MetarRepriceSnapshot.station_icao == station.upper()
                 )
-            res = (await session.execute(stmt)).scalars().all()
+            res = (await session.execute(stmt)).all()
             rows = [
                 {
                     "market_id": r.market_id,
@@ -4928,8 +4938,17 @@ def calibration_report(days: int, station: str | None, as_json: bool) -> None:
     async def _run() -> None:
         cutoff = datetime.now(timezone.utc) - timedelta(days=days)
         async with async_session() as session:
+            # Project only the 8 scalar columns the scorer uses — NOT the whole
+            # ShadowLedger entity, which drags the large feature_json JSONB
+            # WeatherState snapshot across the wire for every row (shadow_ledger is
+            # ~1.2GB). Column projection is the read-path fix for the report's
+            # prod-scale slowness.
             stmt = (
-                select(ShadowLedger, MarketResolution.yes_won,
+                select(ShadowLedger.updated_yes, ShadowLedger.prior_yes,
+                       ShadowLedger.market_mid, ShadowLedger.obs_fraction,
+                       ShadowLedger.would_trade, ShadowLedger.side,
+                       ShadowLedger.effective_cost,
+                       MarketResolution.yes_won,
                        MarketResolution.parsed_operator)
                 .join(MarketResolution,
                       MarketResolution.market_id == ShadowLedger.market_id)
@@ -4948,17 +4967,17 @@ def calibration_report(days: int, station: str | None, as_json: bool) -> None:
 
             rows = [
                 {
-                    "updated_yes": sl.updated_yes,
-                    "prior_yes": sl.prior_yes,
-                    "market_mid": sl.market_mid,
-                    "obs_fraction": sl.obs_fraction,
-                    "yes_won": (1 if yes_won else 0) if yes_won is not None else None,
-                    "would_trade": sl.would_trade,
-                    "side": sl.side,
-                    "effective_cost": sl.effective_cost,
-                    "operator_class": operator_class(op),
+                    "updated_yes": r.updated_yes,
+                    "prior_yes": r.prior_yes,
+                    "market_mid": r.market_mid,
+                    "obs_fraction": r.obs_fraction,
+                    "yes_won": (1 if r.yes_won else 0) if r.yes_won is not None else None,
+                    "would_trade": r.would_trade,
+                    "side": r.side,
+                    "effective_cost": r.effective_cost,
+                    "operator_class": operator_class(r.parsed_operator),
                 }
-                for sl, yes_won, op in res
+                for r in res
             ]
             report = _calibration_report(rows)
 
@@ -5751,18 +5770,32 @@ async def _persist_perf_artifact(session, days: int, result: dict) -> None:
         pass
 
 
-async def _push_one(text: str, *, markdown: bool = True) -> bool:
+async def _push_one(text: str, *, markdown: bool = True, require: bool = False) -> bool:
     """Send a single Telegram message and exit (no polling apparatus).
 
     Used by ``perf-review --push`` and the standalone ``perf-propose-push``
-    that Layer 2 calls. Returns False (and prints) when no credentials are
-    configured. ``markdown=False`` sends as plain text — safe for arbitrary
-    analyst-generated content that isn't MarkdownV2-escaped."""
+    that Layer 2 calls. ``markdown=False`` sends as plain text — safe for
+    arbitrary analyst-generated content that isn't MarkdownV2-escaped.
+
+    When ``require`` is True (a push was explicitly requested), missing
+    credentials raise ``click.ClickException`` (stderr + exit 1) instead of
+    silently returning False and exiting 0 — otherwise the nightly loop looks
+    healthy while its operator-facing sink is dead (the recurring
+    "silent silencer" failure class). When ``require`` is False the caller only
+    wants a best-effort push, so we print and return False.
+    """
     from src.config import settings
 
     token = settings.TELEGRAM_BOT_TOKEN
     chat = settings.TELEGRAM_CHAT_ID
     if not (token and chat):
+        if require:
+            raise click.ClickException(
+                "Telegram push requested but TELEGRAM_BOT_TOKEN / "
+                "TELEGRAM_CHAT_ID are unset or empty — refusing to exit 0 on a "
+                "silent no-send. Populate them in .env (local nightly) or the "
+                "prod app config."
+            )
         click.echo("[no Telegram credentials — not pushed]")
         return False
     from telegram import Bot
@@ -5823,7 +5856,8 @@ def perf_review(days: int, since_str: str | None, as_json: bool, push: bool,
         else:
             click.echo(render_perf_digest(result, markdown=False))
         if push:
-            await _push_one(render_perf_digest(result, markdown=True), markdown=True)
+            await _push_one(render_perf_digest(result, markdown=True),
+                            markdown=True, require=True)
 
     asyncio.run(_run())
 
@@ -6013,7 +6047,8 @@ def no_trade_report(days: int, since_str: str | None, as_json: bool, push: bool,
         else:
             click.echo(render_no_trade_digest(result, markdown=False))
         if push:
-            await _push_one(render_no_trade_digest(result, markdown=True), markdown=True)
+            await _push_one(render_no_trade_digest(result, markdown=True),
+                            markdown=True, require=True)
 
     asyncio.run(_run())
 
@@ -6032,7 +6067,9 @@ def perf_propose_push(text: str | None, markdown: bool) -> None:
     if not text.strip():
         click.echo("Nothing to push (empty text).")
         return
-    asyncio.run(_push_one(text, markdown=markdown))
+    # This command exists only to push, so a missing-creds no-send is a hard
+    # failure (exit 1), not a silent success.
+    asyncio.run(_push_one(text, markdown=markdown, require=True))
 
 
 if __name__ == "__main__":
