@@ -142,3 +142,58 @@ def test_ignores_observations_outside_the_market_local_day():
     st = WeatherState(**{**st.__dict__, "routine_history": stale + st.routine_history})
     d = evaluate_lock(st, _C20, now_utc=_NOW)
     assert d.side is None, "yesterday's 95°F must not kill today's 20°C bucket"
+
+
+# ---------------------------------------------------------------------------
+# Startup guard: a malformed signing key must never fail silently
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_startup_alerts_when_signing_key_is_unusable(monkeypatch):
+    """Prod ran 2026-07-10 with a 39-byte key: every order path was dead while
+    the rest of the bot kept writing telemetry and looked healthy."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from src.scheduler import jobs
+
+    monkeypatch.setattr(jobs.settings, "AUTO_EXECUTE", True)
+    monkeypatch.setattr(jobs.settings, "POLYMARKET_PRIVATE_KEY", "0x" + "ab" * 39)
+    alerter = MagicMock()
+    alerter._enqueue = AsyncMock()
+    monkeypatch.setattr(jobs, "get_alerter", lambda: alerter)
+
+    await jobs._assert_signing_key_usable()
+
+    alerter._enqueue.assert_awaited_once()
+    msg = alerter._enqueue.await_args.args[0]
+    assert "NO ORDER CAN BE PLACED" in msg
+    assert "ab" * 39 not in msg, "key material must never be logged or alerted"
+
+
+@pytest.mark.asyncio
+async def test_startup_guard_silent_on_valid_key(monkeypatch):
+    from unittest.mock import AsyncMock, MagicMock
+
+    from src.scheduler import jobs
+
+    monkeypatch.setattr(jobs.settings, "AUTO_EXECUTE", True)
+    monkeypatch.setattr(jobs.settings, "POLYMARKET_PRIVATE_KEY", "0x" + "11" * 32)
+    alerter = MagicMock(); alerter._enqueue = AsyncMock()
+    monkeypatch.setattr(jobs, "get_alerter", lambda: alerter)
+    await jobs._assert_signing_key_usable()
+    alerter._enqueue.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_startup_guard_noop_when_not_auto_executing(monkeypatch):
+    from unittest.mock import AsyncMock, MagicMock
+
+    from src.scheduler import jobs
+
+    monkeypatch.setattr(jobs.settings, "AUTO_EXECUTE", False)
+    monkeypatch.setattr(jobs.settings, "POLYMARKET_PRIVATE_KEY", "garbage")
+    alerter = MagicMock(); alerter._enqueue = AsyncMock()
+    monkeypatch.setattr(jobs, "get_alerter", lambda: alerter)
+    await jobs._assert_signing_key_usable()
+    alerter._enqueue.assert_not_awaited()

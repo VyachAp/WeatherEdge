@@ -1394,10 +1394,43 @@ async def job_daily_settlement() -> None:
         await alerter.send_system_error(exc, "daily settlement")
 
 
+async def _assert_signing_key_usable() -> None:
+    """Fail LOUDLY at boot when live trading is on but the wallet key is unusable.
+
+    A malformed `POLYMARKET_PRIVATE_KEY` disables every order path (`place_order`,
+    `get_current_bankroll` → `get_wallet_usdc_balance`, the chain-gated resolver)
+    while `job_scan_markets` / the unified pipeline keep writing telemetry — so the
+    bot *looks* healthy and silently stops trading. Exactly what happened on
+    2026-07-10 (the prod key was 39 bytes; a valid key is 32). Same silent-silencer
+    family as the exposure-cap and bot_state-migration outages.
+
+    Never logs or alerts the key material itself.
+    """
+    if not settings.AUTO_EXECUTE or not settings.POLYMARKET_PRIVATE_KEY:
+        return
+    try:
+        from eth_account import Account
+
+        Account.from_key(settings.POLYMARKET_PRIVATE_KEY)
+    except Exception as exc:  # noqa: BLE001 — we re-raise a redacted summary
+        msg = (
+            "POLYMARKET_PRIVATE_KEY is unusable — NO ORDER CAN BE PLACED. "
+            f"({type(exc).__name__}: {exc}). AUTO_EXECUTE=true. "
+            "Expected 32 bytes (64 hex chars, optional 0x)."
+        )
+        logger.critical(msg)
+        try:
+            await get_alerter()._enqueue(f"🚨 *Signing key unusable*\n{msg}")
+        except Exception:  # noqa: BLE001 — alerting must not mask the cause
+            logger.warning("could not push signing-key alert", exc_info=True)
+
+
 async def job_startup() -> None:
     """Run once on startup — initial data load and Telegram status."""
     alerter = get_alerter()
     await alerter.start()
+
+    await _assert_signing_key_usable()
 
     await _get_drawdown_monitor()
     logger.info("Drawdown monitor loaded")
