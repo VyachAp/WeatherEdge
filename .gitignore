@@ -14,3 +14,7 @@ build/
 debug_pipeline.py
 # perf-review JSON artifacts (Layer-1 → Layer-2 analyst handoff)
 runtime/
+
+# local research artifacts (large, regenerable)
+research_data/
+scratch_db.py

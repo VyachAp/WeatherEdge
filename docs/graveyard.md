@@ -142,6 +142,27 @@ this branch. It sat `RANGE_OVERSHOOT_LOCK_ENABLED=False` (off) with no path forw
 The `lock_branch` enum comment in `models.py` keeps `'range_overshoot'` because historical `Signal`
 rows still carry it.
 
+> ### ⚠ 2026-07-10 — THIS REMOVAL WAS A MISTAKE. Superseded by `bucket_overshoot`.
+>
+> The "56% / 18 trades / −$57.61" figure is **not reproducible from the phantom-safe book**. The
+> branch's real realized book was **9 filled trades, 8 W / 1 L (88.9%), −$3.70** — the rest were
+> NULL-fill phantom rows (see `project_phantom_recovery_pnl_shift_2026-05-30`). The single real loss
+> (Buenos Aires, −$10.22) was caused by the **pre-2026-05-26 wrong-day bug**: `resolve_target_local_day`
+> returned *title-day − 1* for −UTC cities, so the bot read **May 19's** max (17°C) and fired NO on a
+> "14°C" bucket for **May 20**, whose true max was 14°C. Not °C resolver divergence. Every real trade
+> of this branch fired 2026-05-17..21, i.e. entirely before that fix. The branch also bought NO at an
+> **average price of 0.901** (break-even 90.1%) — it paid the edge away.
+>
+> The underlying rule is sound and is the bot's only verified edge. Re-validated 2026-07-10 on 3,580
+> rule-triggered candidates priced from real CLOB 1-min history at the bot's true METAR arrival time,
+> scored against on-chain resolution: on trusted stations the "dead" bucket wins **3 / 3580 = 0.08%**
+> of the time. Restored as **`bucket_overshoot`** with the three fixes the old branch lacked: a °C-aware
+> certainty boundary, an ex-ante station-divergence exclusion, and a **max-cost gate** (0.93) so it
+> never again buys certainty at 0.90+. See `src.config.Settings.BUCKET_OVERSHOOT_*`.
+>
+> **Generalized lesson:** before killing a branch, (a) filter `fill_price NOT NULL`, and (b) check
+> whether its losses predate a known input bug. A rule can be correct while its *inputs* are wrong.
+
 ## 2026-05-30 — `Signal.gfs_prob` / `ecmwf_prob` / `aviation_prob` / `wx_prob` columns
 
 **Removed in:** _(pending commit — first entry of the audit pass)_

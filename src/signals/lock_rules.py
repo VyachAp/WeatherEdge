@@ -39,7 +39,10 @@ class LockDecision:
       'hard'            — observed max << threshold AND no_more_heating
       'range_undershoot'— current_max ≤ range_low - 2×LOCK_MARGIN_F (rc≥4) AND no_more_heating
       'range_in_window' — current_max in [low, high] + past peak + no upward
-    ('range_overshoot' was removed 2026-06-24; historical Signal rows keep it.)
+      'bucket_overshoot'— market-day max already exceeds the bucket top by
+                          BUCKET_OVERSHOOT_MARGIN_C °C ⇒ the bucket can never win
+    ('range_overshoot' was removed 2026-06-24 and superseded 2026-07-10 by
+    'bucket_overshoot'; historical Signal rows keep the old branch name.)
     None when ``side is None``.
     """
 
@@ -60,6 +63,11 @@ class LockDecision:
 
 
 _NO_LOCK = LockDecision(side=None)
+
+# Float slack when comparing a °F running max against a °C-derived boundary
+# (68.0 vs 67.99999). Well under the 1.8°F METAR quantum, so it cannot admit a
+# max that is genuinely below the boundary.
+_EPS_F = 0.05
 
 
 # Range/`exactly` lock-rule gates. Range branches (overshoot/undershoot) sit
@@ -291,6 +299,26 @@ def evaluate_lock(
     )
 
 
+def _bucket_dead_threshold_f(market, high_f: float) -> float | None:
+    """Running-max (°F) at or above which this bucket can never be the day's max.
+
+    Routine METARs report whole °C, so for a °C market the bucket "exactly T°C"
+    is dead once the max reaches T+1°C. `parsed_threshold` already holds that
+    bucket's exact °F value (e.g. 20°C → 68.0), so we step up from it directly
+    rather than from `market_range_f`'s rounded integer window, whose width does
+    not correspond to a whole °C step.
+    """
+    from src.execution.binary_market import market_unit
+
+    step_f = 1.8 if market_unit(market) == "°C" else 1.0
+    margin_steps = settings.BUCKET_OVERSHOOT_MARGIN_C
+    if market.parsed_operator == "exactly" and market.parsed_threshold is not None:
+        return float(market.parsed_threshold) + step_f * margin_steps
+    if high_f is None:
+        return None
+    return float(high_f) + step_f * margin_steps
+
+
 def _evaluate_range_lock(
     *,
     state: WeatherState,
@@ -318,6 +346,37 @@ def _evaluate_range_lock(
     each loss costs ~$5-10, so borderline early-day fires must be filtered out.
     """
     range_min_rc = max(settings.MIN_ROUTINE_COUNT, RANGE_LOCK_MIN_ROUTINES)
+
+    # ---- NO overshoot ('bucket_overshoot') --------------------------------
+    # The daily max is monotonic, so once it has climbed a full
+    # BUCKET_OVERSHOOT_MARGIN_C degrees above this bucket's top, the bucket can
+    # never be the day's max. Certainty, not forecast — the only loss mode is
+    # resolver divergence, which is why high-divergence stations are excluded.
+    # Evaluated BEFORE `range_in_window` (the two are mutually exclusive) and
+    # before undershoot (disjoint). See settings.BUCKET_OVERSHOOT_* for the
+    # validation record.
+    if settings.BUCKET_OVERSHOOT_LOCK_ENABLED:
+        station = (state.station_icao or "").upper()
+        if station not in settings.bucket_overshoot_excluded:
+            dead_f = _bucket_dead_threshold_f(market, high_f)
+            if dead_f is not None and current_max_f >= dead_f - _EPS_F:
+                if routine_count >= settings.MIN_ROUTINE_COUNT:
+                    return LockDecision(
+                        side="NO",
+                        reasons=[
+                            f"market-day max {current_max_f:.1f}°F >= bucket top "
+                            f"{high_f:.0f}°F + {settings.BUCKET_OVERSHOOT_MARGIN_C:.0f}°C "
+                            f"(dead at {dead_f:.1f}°F) ({op})",
+                            "daily max is monotonic ⇒ bucket cannot win",
+                            f"routine_count={routine_count} "
+                            f"(min {settings.MIN_ROUTINE_COUNT})",
+                        ],
+                        margin_f=current_max_f - dead_f,
+                        branch="bucket_overshoot",
+                        routine_count=routine_count,
+                        observed_max_f=current_max_f,
+                    )
+                return _NO_LOCK
 
     # NO undershoot — 2x margin + rc gate. Gated by
     # settings.RANGE_UNDERSHOOT_LOCK_ENABLED (default True; live .env sets

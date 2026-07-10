@@ -648,3 +648,68 @@ async def test_conviction_skipped_for_hard_branch(monkeypatch):
     _enable_conviction(monkeypatch)
     _, c = await _invoke(decision=_yes_decision(branch="hard"))
     assert c["size_locked_position"].call_args.kwargs.get("win_prob") is None
+
+
+# ---------------------------------------------------------------------------
+# bucket_overshoot max-cost gate
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_bucket_overshoot_rejected_above_max_cost(monkeypatch):
+    """The dead-bucket rule is certain, but paying 0.95 for it is not +EV.
+
+    Break-even at cost c needs a resolver-divergence loss rate below (1-c).
+    Above BUCKET_OVERSHOOT_MAX_COST the market has already repriced. This is
+    precisely the mistake the old `range_overshoot` branch made — it bought NO
+    at an average 0.901 and its edge vanished.
+    """
+    from src.config import settings as _s
+
+    monkeypatch.setattr(_s, "BUCKET_OVERSHOOT_MAX_COST", 0.93)
+    # yes_bid=0.05 → NO buyer pays 0.95, inside LOCK_RULE_MAX_PRICE but above
+    # the bucket_overshoot cap.
+    result, c = await _invoke(
+        decision=_no_decision(branch="bucket_overshoot"),
+        yes_price=0.50,
+        yes_bid=0.05,
+        yes_ask=0.55,
+    )
+
+    assert result == 0.0
+    reason = c["log_evaluation"].await_args.kwargs["reject_reason"]
+    assert "bucket_overshoot cost" in reason
+    c["upsert_signal"].assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_bucket_overshoot_allowed_below_max_cost(monkeypatch):
+    """A cheap NO on a dead bucket is the whole strategy — it must get through."""
+    from src.config import settings as _s
+
+    monkeypatch.setattr(_s, "BUCKET_OVERSHOOT_MAX_COST", 0.93)
+    # yes_bid=0.30 → NO buyer pays 0.70, well under the cap.
+    result, c = await _invoke(
+        decision=_no_decision(branch="bucket_overshoot"),
+        yes_price=0.50,
+        yes_bid=0.30,
+        yes_ask=0.35,
+    )
+
+    assert result != 0.0
+    c["upsert_signal"].assert_called()
+
+
+@pytest.mark.asyncio
+async def test_max_cost_gate_does_not_touch_other_branches(monkeypatch):
+    """The cap is scoped to bucket_overshoot; EASY locks keep LOCK_RULE_MAX_PRICE."""
+    from src.config import settings as _s
+
+    monkeypatch.setattr(_s, "BUCKET_OVERSHOOT_MAX_COST", 0.50)
+    result, c = await _invoke(
+        decision=_no_decision(branch="easy_super"),
+        yes_price=0.50,
+        yes_bid=0.30,
+        yes_ask=0.35,
+    )
+    assert result != 0.0

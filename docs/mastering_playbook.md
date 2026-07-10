@@ -8,6 +8,41 @@
 
 ---
 
+## Mission & nightly charter (added 2026-07-09)
+
+The nightly orchestrator agent (`docs/agents/nightly_orchestrator_prompt.md`)
+runs this playbook every night. Its charter:
+
+- **Mission:** drive WeatherEdge to a **consistently profitable autonomous
+  service**, one *data-proven* step per night, **propose-only** (a human flips
+  every `.env`/trading change). Success is consistency, not a jackpot.
+- **Per-night value contract:** each session yields **≥1** of
+  { a flip-ready proposal with evidence · a validated-or-killed hypothesis · a
+  new loss-class / station-trust / cohort insight · a new backlog experiment } —
+  **or** an explicit *null-result* note naming *what was checked, why nothing
+  moved, and which data / sample-n is the wall*. **No silent empty nights.**
+  Tokens must always buy at least the location of the wall.
+- **Tracks (phased):**
+  - **Track A — now.** Master the weather bot by walking the §3 dark-flag→gate
+    map to *proven-flip or explicitly-killed*, one gate per night, per §4.
+  - **Track B — gated, later.** Whole-Polymarket reconnaissance (survey all
+    events/markets for new automated-betting edges). **Do not start** until
+    Track A hits the stability trigger. Build it in-house against the existing
+    Gamma/CLOB primitives + the `deep-research` skill — *not* a third-party
+    skill (see `docs/improvements.md` "[backlog] Whole-Polymarket opportunity
+    discovery"; the 2026-07-09 ultracode skills audit found nothing worth
+    installing).
+- **Stability trigger (noted, not built):** when phantom-safe realized PnL is
+  positive for N consecutive days on the clean book, downgrade the loop to
+  monitoring-only and consider spinning up Track B. Design deferred.
+- **Skills stance:** add no GitHub Claude Code skills. Rely on built-ins
+  (`deep-research`, `schedule`/`loop`, `dataviz`+Artifact, `code-review`/
+  `verify`/`simplify`) layered on this in-house loop. Steal *techniques* into
+  §1 (e.g. the noise-floor variance gate), never install wrappers that fight the
+  propose-only / measure-before-flip discipline.
+
+---
+
 ## 0. What "mastering" means here
 
 Enrichment gave us instruments; mastering is using them to walk a specific
@@ -223,6 +258,192 @@ obs_fraction-bucketed calibration (not raw moves) is the decisive test.
 ---
 
 ## 5. Findings log (append-only — this is what future cycles rely on)
+
+### 2026-07-10 — THE EDGE IS FOUND, PROVED, AND SHIPPED (default-off): `bucket_overshoot`
+
+**The central fork of this playbook is settled. The edge is neither the model nor the price band —
+it is MATHEMATICAL CERTAINTY + SPEED.** Three months of tuning a forecast model chased an edge that
+never existed, while the one real edge sat gated off in `docs/graveyard.md`.
+
+**What was ruled out (each with data, not argument):**
+1. **No model edge.** The market's mid beats `shadow_decision`'s posterior on Brier in *every*
+   `obs_fraction` bucket, including 0.8–1.0 (0.1224 vs 0.1698, n=243k ticks). Do not promote the
+   shadow model. Ever, on this evidence.
+2. **No taker edge anywhere.** One bet per market, event-clustered, 906 station-days: buying YES is
+   −9% to −17%/$1 in every price band; buying NO is −1% to −2.5%. The overround + spread is the house.
+3. **No dutch book.** Full 11-market ladders sum to a median **1.019** at mid (~2% overround). Any
+   spread destroys it.
+4. **A textbook favorite–longshot bias exists** (bucket at ask 0.20–0.30 wins 20.9%; at 0.60–0.70
+   wins 66.0% vs 63.3% priced) but it is not harvestable: depth collapses exactly where the edge is
+   (median $5.59 at ask 0.60–0.70, $1.20 at 0.80–0.90).
+
+**What IS the edge.** The daily max is monotonic. Once the running routine-METAR max for the market's
+station-local day climbs a full °C above a bucket's top, that bucket **can never win**. On trusted
+stations that rule is right **3577 / 3580 times (99.92%)**. The market agrees — eventually. It
+collapses the dead bucket to ~0.005 a **median 2.07 min after the METAR's observation time**. We hold
+that METAR at a **median 2.70 min**. We lose the race 59% of the time; the other 41% is the business.
+
+**Validated properly** (the first three attempts were wrong — see the methodology notes):
+3,580 rule-triggered candidates → priced from **`clob.polymarket.com/prices-history` (1-min)** at the
+bot's **real `fetched_at`** → scored against **on-chain resolution** → **event-clustered** bootstrap.
+
+| policy | bets | events | losses | EV/$1 | 95% CI |
+|---|---|---|---|---|---|
+| ship (max_cost 0.93, trusted stations, d≥1°C, rc≥3) | 63 | 52 | 2 | **+0.911** | [+0.532, +1.463] |
+| …out-of-sample (target day > 2026-06-05) | 55 | 45 | **0** | **+1.013** | [+0.613, +1.632] |
+
+Survives: leave-one-station-out (+0.28…+0.49), a +5¢ slippage haircut (+0.56), and a 5× worse
+resolver-divergence rate (+0.73). Dies at a 60 s decision delay (+0.10, CI spans 0) — **speed IS the
+edge.** Capacity is not binding: live books offer a median **$685** within 3¢ of top for the
+0.20–0.40 bucket prices. Sizing sim ($500 bankroll, 5%/trade, quarter-Kelly, depth-capped):
+**+$25/day, max DD 9.8%.**
+
+**Three methodology traps this cycle burned, all now in memory + CLAUDE.md:**
+- **`market_snapshots.yes_price` (Gamma) is stale in the repricing window** — corr **0.31**, bias
+  **+0.142** vs the real book (the bot's own `shadow_ledger` bid/ask tracks it at corr 0.974). Pooled
+  over a market's life they agree at 0.99 — *that pooled check is the trap*. It made a fake **+98%
+  EV** appear. Never price execution from snapshots.
+- **`shadow_ledger` is censored** at `yes_bid≥0.99 / yes_ask≤0.01`, so post-collapse rows vanish and a
+  naive `merge_asof` silently matches a *pre-collapse* quote.
+- **`market_resolutions` only labels shadow-evaluated markets** (57% of the ladder). Select bets by the
+  rule, then fetch ground truth from Gamma directly.
+
+**The graveyard was wrong.** `range_overshoot` was killed 2026-06-24 on "56% / 18 trades / −$57.61".
+Its real phantom-safe book: **9 fills, 8W/1L (88.9%), −$3.70**. The single loss was Buenos Aires under
+the **pre-2026-05-26 wrong-day bug** (`resolve_target_local_day` returned title-day−1 for −UTC cities),
+not °C resolver divergence. It also bought NO at an average **0.901** — it paid the edge away.
+*Generalized lesson: before killing a branch, filter `fill_price NOT NULL` and check whether its losses
+predate a known input bug. A rule can be correct while its inputs are wrong.*
+
+**Also fixed: `job_fast_lock_poll` was structurally dead.** `fetch_latest_metars` returns only each
+station's most recent METAR → 1-point `routine_history` → `evaluate_lock`'s `routine_count < 2` floor →
+**no fast-poll lock has ever fired.** (This, not price, is why the conviction-lock path shows 0 fires.)
+Now merges the day's history from `state_aggregator._state_cache`.
+
+**Shipped (default-off, awaiting operator flip):** `BUCKET_OVERSHOOT_LOCK_ENABLED=false`,
+`BUCKET_OVERSHOOT_MARGIN_C=1.0`, `BUCKET_OVERSHOOT_MAX_COST=0.93`,
+`BUCKET_OVERSHOOT_EXCLUDED_STATIONS="ZGSZ,MPTO,EGLL,UUEE"` (the four stations with
+`P(divergence ≥ 1°C) > 5%`; every other station with n≥15 is ≤4.2% — a clean natural break).
+823 tests pass; mypy unchanged; branch verified to fire on 274/274 historical opportunities and, on
+live data, to flag 118 dead buckets and correctly refuse all 118 as already-repriced.
+
+**Next lever, in priority order:**
+1. **Cut METAR ingestion lag.** At a 1-min lag the opportunity set is **682 bets** (vs 136) — a 5×.
+   Poll several providers concurrently and take the earliest; drop `FAST_LOCK_POLL_INTERVAL_SECONDS`.
+   AWC's own publication floor is 0.95–8 min, staggered per station, so provider choice is the lever.
+2. Place the order within ~15 s of detection (EV +0.43 at 15 s, +0.28 at 30 s, dead at 60 s).
+3. Re-check the station-exclusion list monthly from `station_day_resolutions` (it is ex-ante and
+   walk-forward computable; do not tune it on bet outcomes).
+
+
+### 2026-07-09 (late) — The `MIN_EDGE` mini-investigation is CLOSED: the "#1 missed-winner" cohort is a **first-failing-filter attribution artifact**. Do NOT lower `MIN_EDGE`.
+
+**Gate advanced tonight: the recurring `counterfactual-report` `edge`-floor lead → KILLED (not
+"insufficient data" — structurally invalid as measured).** This lead has topped the report twice
+(06-24 Edge Map "#1 missed-winner", 1447 resolved / 75% won / +0.149 EV/$1; and again tonight at 7d:
+642 resolved / 82% won @ avg px 0.72 / **+0.195 EV/$1**, edge +10pp). It has never converted because
+the metric cannot support the inference. Four independent defects, each verified against source +
+prod this cycle:
+
+1. **First-failing-filter attribution (the fatal one).** `_check_filters`
+   (`src/signals/edge_calculator.py:435`) tests **`edge` FIRST**, before `probability` and `price`.
+   So `reject_reason="edge"` is not "trades only `MIN_EDGE` blocked" — it is the **catch-all bucket for
+   every side the model saw nothing on**, never tested against the downstream floors. An edge-reject
+   implies `our_prob ≤ side_price + MIN_EDGE` = `≤ 0.77` at the cohort's avg price 0.72. Those rows
+   would then be re-rejected by `MIN_PROBABILITY=0.85` (bracket-like) / `THRESHOLD_MIN_PROBABILITY=0.75`
+   (threshold), and by `PROBABILITY_MIN_ENTRY_PRICE=0.80` (avg px 0.72 < 0.80). **Lowering `MIN_EDGE`
+   recovers ≈none of this cohort.** The report's counterfactual ("this filter left money") is only
+   valid if the *remaining* filters are re-run on the cohort — they are not.
+2. **…and what little it WOULD admit is the losing half.** Back-solving the reported aggregates
+   (n_resolved=642, win 82%, EV/$1 +0.195 ⇒ ~526 wins / ~116 losses): mean winner return 0.459 ⇒
+   **winners' avg price ≈ 0.686**; losers' avg price ≈ **0.876**. The winners sit *below* the 0.80
+   entry-price floor and the losers *above* it. So relaxing `MIN_EDGE` while `PROBABILITY_MIN_ENTRY_PRICE
+   =0.80` stands would admit predominantly the **losing** sub-cohort. (Arithmetic from rounded printed
+   aggregates — directional, but the sign is robust.)
+3. **Rows are not independent; effective n is station-days.** Cohort rows are per-`(market, direction)`,
+   but every market on a station-day is a deterministic function of **one** number (that day's resolved
+   max). `resolver-truth-report --days 7` (run tonight): **255 station-days resolved**. So the 642
+   "independent" rows collapse to **≤255 clusters** (~2.5 rows/cluster, within-cluster ρ≈1).
+   `cohort_stats` treats them as 642 independent equal-stake bets → SE understated.
+4. **The by-station table is a silent max-of-N selection.** `cli.py::_table` renders
+   `[:8]` of cohorts **sorted by `ev_per_dollar × n_resolved` desc** with no note that ~40+ stations were
+   dropped. So it structurally displays the *winning tail*. Tonight it printed **MPTO +1.316 EV/$1** —
+   on n=33 rows = **7 station-days** (7 independent draws), and **CYYZ +0.286 on 6**. That is exactly the
+   max-order-statistic of ~50 noisy small-n cohorts, not a signal. Violates §1's own "no silent caps".
+
+**Also found: `by_op_class` and `by_price_band` are computed and thrown away.** `mine_rejected` builds
+all four cohorts but `counterfactual_report` renders only `by_reason` / `by_station` / `by_outcome`. The
+two most decision-relevant splits (killed bracket-like vs threshold; the valley price band) never reach
+the operator. Cheap fix, high value.
+
+**Verdict:** `MIN_EDGE` stays **0.05**. Close the "MIN_EDGE mini-investigation" (open since 06-24) as
+**rejected on methodology**, not as unproven. Treat *every* counterfactual "missed winner" cohort as
+**non-actionable until re-run through the downstream filters** and given a station-day-clustered noise
+floor. This is the generalized lesson: **a reject-reason cohort names the first gate that fired, not the
+only gate that would.**
+
+**Smallest validating step (if ever revisited), propose-only:** (a) report `n_clusters` (distinct
+station-days) beside `n_resolved`, and suppress "missed winner" headlines below `n_clusters ≥ 30`;
+(b) add the station-day-clustered bootstrap / label-permutation baseline from
+`docs/improvements.md [backlog] Noise-floor variance gate`; (c) add a `filters_rerun` pass that replays
+the surviving `_check_filters` chain on a cohort before calling it recoverable; (d) render `by_op_class`
++ `by_price_band`, and label the top-8 truncation.
+
+**Report tooling wall (last cycle's TODO #1) — DIAGNOSED, and it is NOT a pathological join.** The three
+"hangs" are plain **O(raw rows) client-side transfers**; they complete if you wait:
+- `counterfactual-report`: `knowledge_base.fetch_counterfactual_rows` streams **every**
+  `evaluation_logs.passes=False` row since cutoff (~30k/day) into Python and dedups there
+  (`latest_rej[(mid,dir)] = …`). Measured tonight: **1d = 38s, 7d = 151s** ⇒ 30d ≈ 10 min, 60d ≈ 20 min.
+  Fix: `DISTINCT ON (market_id, direction) … ORDER BY market_id, direction, created_at DESC` in SQL.
+- `calibration-report` (`cli.py:4932`): `select(ShadowLedger, …)` fetches the **whole ORM entity** —
+  including the `feature_json` JSONB WeatherState snapshot + `decision_reason` — for every row in the
+  window, while using **8 scalar columns**. Fix: column projection.
+- `latency-report` (`cli.py:4573`): `select(MetarRepriceSnapshot)` whole entity, uses 7 columns.
+- `perf-review --since 2026-06-05`: **completed in ~22 min** tonight (0 bytes for 20 of them). Slow, not broken.
+All four are pure read-path changes — no schema, no behavior. This unblocks the shadow-retire +
+latency verdicts that have been stale since 07-07.
+
+**⚠ `perf-review`'s `flip_gates[].current_value` reads the LOCAL `Settings`, not prod.** Tonight's
+artifact reports `SIGMA_FLOOR_LEAD_TIME_ENABLED=false`, `THRESHOLD_MIN_PROBABILITY=0.78`,
+`NEAR_PEAK_FLOOR_UP_ENABLED=true` — **all three contradict doctl-authoritative prod** (true / 0.75 /
+false). An analyst trusting the digest would propose flipping a flag that is already on. Always reconcile
+against `doctl apps spec get`. (Related: `VALLEY_MIN_EDGE` again reads "ready" — it is **redundant**, P1
+block is live and wins precedence. Do not set P2.)
+
+**A1 epoch boundary now EXISTS.** `epoch.current_id=7`, started **2026-07-09T09:42 UTC**, `flags_diff =
+{PROBABILITY_THRESHOLD_NO_REQUIRE_FORECAST: null→true}` — last cycle's `config_epoch._TRACKED_FLAGS`
+change is deployed and the boundary was written. Future A1 scoring should use `--since-epoch 7` rather
+than date-only windowing. **A1 remains PROVISIONAL/unscored:** book unchanged since last cycle
+(clean book since 06-05 still **n=37, 73% win, −$34.40, −0.102 EV/$**; prob path n=29 −0.052; lock
+n=8 −0.326 from legacy `hard` n=4 −$12.02 + `range_in_window` n=4 −$8.03). **Zero** new settled
+post-07-07 threshold-NO fills. Wall: need ~10; at the current ~1 fill/day overall that is **~2–3 more
+weeks**.
+
+**Binding throttle unchanged:** `dup_blocked_inproc` 431/790 (54.6%), `stake_below_min` 283, size_reasons
+"below $5 minimum" 175 + "no edge" 110 (the `KELLY_PROB_CAP` dead-zone). Exposure **99% idle**
+(headroom p50 $592.9 / $600, `low_headroom_frac` 0.0). Same story as 06-24 → 07-09.
+
+**🚨 The nightly Telegram sink is a silent no-op.** `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` exist
+but are **empty** in the operator Mac's `.env` (they're only in the DO app spec, where the *bot*
+runs). `perf-propose-push` printed `[no Telegram credentials — not pushed]` and **exited 0**. The
+nightly loop would look healthy while its operator-facing sink is dead — the project's recurring
+silent-silencer class. This cycle's durable sinks are docs + memory only. Fix: populate the keys on
+the Mac **and** make `perf-propose-push --push` exit non-zero without credentials.
+
+**⚠ Un-authored `src/` edit during this run.** An uncommitted `Index("ix_eval_logs_created",
+"created_at")` appeared in `src/db/models.py` mid-session (not written by the agent; left in place).
+It targets exactly the slowness diagnosed above — but a bare `models.py` index with **no Alembic
+migration** is the documented `bot_state` / `gfs_prob` failure class, and on a ~2M-row live table it
+needs `CREATE INDEX CONCURRENTLY`. Needs an operator decision + a migration.
+
+**Next-cycle TODO:**
+1. **Propose-and-apply (operator) the 4 read-path report fixes** above — they are the prerequisite for
+   re-running `calibration-report --days 60` / `latency-report --days 14` and closing the stale
+   shadow-retire + latency verdicts.
+2. **Score A1 with `--since-epoch 7`** once ~n≥10 post-07-07 threshold-NO settle (~2–3 weeks).
+3. **Warm level-correction (~+0.7°F to `forecast_peak_f`)** — still the empirically-supported σ-honesty
+   follow-up (the miss is a LEVEL cool bias, not a slope). Unstarted.
+4. Armed conviction-lock path (`CYYZ,SBGR,RKSI`): still 0 fires. Open question to disarm entirely.
 
 ### 2026-07-09 — Post-A1 monitoring cycle: A1 live+biting (unscored), A3 CANCELLED (armed not dead), config drift reconciled
 

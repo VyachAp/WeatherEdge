@@ -226,6 +226,28 @@ async def try_lock_rule_trade(
         )
         return 0.0
 
+    # bucket_overshoot max-cost gate. The rule is certain; the *price* decides
+    # whether the residual edge still covers resolver-divergence risk. Above
+    # BUCKET_OVERSHOOT_MAX_COST the market has already repriced and break-even
+    # needs a lower divergence rate than we can guarantee. (This is the mistake
+    # the old range_overshoot branch made: it bought NO at an average 0.901.)
+    if (
+        decision.branch == "bucket_overshoot"
+        and effective_price > settings.BUCKET_OVERSHOOT_MAX_COST
+    ):
+        logger.info(
+            "[%s] lock %s %s: bucket_overshoot cost %.3f > max %.2f (already repriced)",
+            icao, decision.side, market.id[:12], effective_price,
+            settings.BUCKET_OVERSHOOT_MAX_COST,
+        )
+        await _log_lock_eval(
+            False,
+            f"bucket_overshoot cost {effective_price:.3f} > max "
+            f"{settings.BUCKET_OVERSHOOT_MAX_COST}",
+            None,
+        )
+        return 0.0
+
     # Depth against the side we're actually buying.
     if decision.side == "YES":
         buy_depth = yes_depth

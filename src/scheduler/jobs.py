@@ -1661,13 +1661,28 @@ async def job_fast_lock_poll() -> None:
 
                 _last_routine_seen[icao] = max(m["observed_at"] for m in new_routine)
 
-                routine_points = [
-                    (m["observed_at"], float(m["temp_f"]))
-                    for m in station_metars
-                    if not m.get("is_speci")
-                    and isinstance(m.get("observed_at"), datetime)
-                    and m.get("temp_f") is not None
-                ]
+                # `fetch_latest_metars` returns only the station's MOST RECENT
+                # METAR, so on its own it yields a 1-point history — and
+                # `evaluate_lock` hard-floors at routine_count >= 2, which made
+                # every fast-poll lock a silent no-op. Merge in the day's routine
+                # history from the last unified tick's cache (30-min TTL, already
+                # in-process, no HTTP) so the market-day max and routine count are
+                # real. Dedup on observed_at; the fresh METAR wins.
+                from src.signals.state_aggregator import (
+                    get_cached_aggregation_inputs as _cached_inputs_for,
+                )
+
+                by_obs: dict[datetime, float] = {}
+                cached_inputs = _cached_inputs_for(icao)
+                cached_history = cached_inputs.history if cached_inputs else []
+                for obs_row in [*cached_history, *station_metars]:
+                    if (
+                        not obs_row.get("is_speci")
+                        and isinstance(obs_row.get("observed_at"), datetime)
+                        and obs_row.get("temp_f") is not None
+                    ):
+                        by_obs[obs_row["observed_at"]] = float(obs_row["temp_f"])
+                routine_points = sorted(by_obs.items())
                 if not routine_points:
                     continue
 

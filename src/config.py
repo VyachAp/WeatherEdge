@@ -555,6 +555,63 @@ class Settings(BaseSettings):
     # `settings`; 0.0 disables the gate (pre-audit behavior).
     RANGE_IN_WINDOW_MIN_YES_PRICE: float = 0.80
 
+    # ------------------------------------------------------------------
+    # `bucket_overshoot` — buy NO on a temperature bucket the day's max has
+    # already passed. Restores (correctly) the `range_overshoot` branch that was
+    # removed 2026-06-24 on a mis-attributed loss: its real phantom-safe book was
+    # −$3.70 / 9 trades / 89% win, and its single loss was the **pre-2026-05-26
+    # wrong-day bug** on a −UTC city, not °C resolver divergence. See
+    # docs/graveyard.md + memory `project_dead_bucket_edge_2026-07-10`.
+    #
+    # The rule is mathematically certain, not a forecast: the daily max is
+    # monotonic, so once the running routine-METAR max for the market's
+    # station-local day exceeds the bucket top by `BUCKET_OVERSHOOT_MARGIN_C`
+    # degrees C, that bucket can never win. The only way to lose is resolver
+    # divergence (our station reads hotter than Polymarket's resolver), measured
+    # at P(div >= 1°C) = 4.1% globally and ~0-3% on trusted stations.
+    #
+    # Validated 2026-07-10 on 3,580 rule-triggered candidates priced off real
+    # CLOB 1-min history (`clob.polymarket.com/prices-history`) at the bot's real
+    # METAR arrival time, scored against on-chain resolution, event-clustered:
+    #   63 bets / 52 station-days, 2 losses, EV +0.91/$1 [95% CI +0.53, +1.46]
+    #   out-of-sample (target day > 2026-06-05): 55 bets, 0 losses, EV +1.01/$1
+    # NOTE: `market_snapshots.yes_price` (Gamma) is STALE in the repricing window
+    # and must never be used to backtest this — see
+    # memory `project_gamma_snapshot_stale_2026-07-10`.
+    #
+    # SPEED IS THE EDGE. The market reprices a median 2.1 min after the METAR's
+    # observation time; we receive it at a median 2.7 min. EV survives a ~30 s
+    # decision delay and dies by ~60 s, so this branch must fire from
+    # `job_fast_lock_poll` (30 s), never from the 5-min unified tick.
+    BUCKET_OVERSHOOT_LOCK_ENABLED: bool = False
+
+    # Degrees C the running max must exceed the bucket top by. 1.0 == "the max is
+    # already a full °C above this bucket" — the minimal certainty condition,
+    # since routine METARs report whole °C.
+    BUCKET_OVERSHOOT_MARGIN_C: float = 1.0
+
+    # Max price paid for the NO side. Above this the market has already
+    # repriced and the residual edge no longer covers resolver-divergence risk:
+    # at cost 0.93 break-even needs a 7% loss rate vs the ~1.5% observed, and
+    # the policy stays +EV (+0.73/$1) even if divergence were 5x worse. Raising
+    # it to 0.99 adds volume but makes >1/3 of bets -EV under that stress.
+    BUCKET_OVERSHOOT_MAX_COST: float = 0.93
+
+    # Stations whose resolver diverges from our METAR feed too often to bet
+    # certainty on. Chosen ex-ante from `station_day_resolutions`:
+    # P(divergence >= 1°C) — ZGSZ 34.5%, MPTO 30.8%, EGLL 26.9%, UUEE 14.8%;
+    # every other station with n>=15 is <= 4.2% (a clean natural break).
+    # These four produced 11 of the 16 rule violations observed.
+    BUCKET_OVERSHOOT_EXCLUDED_STATIONS: str = "ZGSZ,MPTO,EGLL,UUEE"
+
+    @property
+    def bucket_overshoot_excluded(self) -> set[str]:
+        return {
+            s.strip().upper()
+            for s in (self.BUCKET_OVERSHOOT_EXCLUDED_STATIONS or "").split(",")
+            if s.strip()
+        }
+
     # Master switch for bracket-like NO (`exactly`/`range`/`bracket` BUY_NO)
     # in the PROBABILITY path. When True, `binary_market_edge` rejects any
     # otherwise-passing bracket-like NO edge with reason
