@@ -328,9 +328,15 @@ Now merges the day's history from `state_aggregator._state_cache`.
 live data, to flag 118 dead buckets and correctly refuse all 118 as already-repriced.
 
 **Next lever, in priority order:**
-1. **Cut METAR ingestion lag.** At a 1-min lag the opportunity set is **682 bets** (vs 136) — a 5×.
-   Poll several providers concurrently and take the earliest; drop `FAST_LOCK_POLL_INTERVAL_SECONDS`.
-   AWC's own publication floor is 0.95–8 min, staggered per station, so provider choice is the lever.
+1. **Cut METAR ingestion lag — but NOT by adding providers.** Measured 2026-07-10 (10-s polling across
+   a METAR issue boundary, 8 stations): **AWC and NOAA are the same upstream feed** — identical
+   first-appearance *second* on 13 of 14 observations; NOAA won once, by 32 s. A multi-provider racer
+   buys ≈0. **Publication is the floor and it is per-station**: WSSS 1.09 min, OPKC 1.65, VILK 2.80,
+   RKSI 5.00, ZGGG 5.31, WMKK 8.70. (Note those are exactly the stations our winning bets come from —
+   the edge *is* the fast-publishing stations.) The "1-min lag ⇒ 682 bets, 5×" counterfactual in the
+   EV-vs-lag table is therefore **not attainable in general**; it is attainable only on the
+   fast-publishing subset. Our only controllable slack is `FAST_LOCK_POLL_INTERVAL_SECONDS`
+   (30 s → 10 s, done) plus decision→order time.
 2. Place the order within ~15 s of detection (EV +0.43 at 15 s, +0.28 at 30 s, dead at 60 s).
 3. Re-check the station-exclusion list monthly from `station_day_resolutions` (it is ex-ante and
    walk-forward computable; do not tune it on bet outcomes).

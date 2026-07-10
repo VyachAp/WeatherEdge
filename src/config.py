@@ -281,7 +281,22 @@ class Settings(BaseSettings):
     # margin) so latency from METAR publication to order placement is seconds
     # rather than up to 5 minutes.
     FAST_LOCK_POLL_ENABLED: bool = True
-    FAST_LOCK_POLL_INTERVAL_SECONDS: int = 30
+    # 10 s, not 30 s. The `bucket_overshoot` edge is a seconds-scale race: the
+    # market collapses a dead bucket a median 2.07 min after the METAR's
+    # observation time, and realized EV falls from +0.46/$1 at zero decision
+    # delay to +0.28 at 30 s and to noise (+0.10, CI spans 0) at 60 s. The poll
+    # interval is pure additive latency on top of publication.
+    #
+    # Measured 2026-07-10 (10 s polling across an issue boundary): AWC and NOAA
+    # are the SAME upstream feed — identical first-appearance second on 13 of 14
+    # observations — so racing providers buys nothing. Publication itself is the
+    # floor and it is per-station (WSSS 1.1 min, OPKC 1.7, VILK 2.8, RKSI 5.0,
+    # WMKK 8.7). Our only controllable slack is this interval.
+    #
+    # Cost: one bulk AWC call per tick over the active-bucket ICAOs (batched 20
+    # per request), i.e. ~6 calls/min. `_throttle()` in `ingestion.aviation`
+    # still bounds concurrency.
+    FAST_LOCK_POLL_INTERVAL_SECONDS: int = 10
 
     # Order reconciliation job — polls PENDING/OPEN trades whose
     # `fill_price` is still NULL (delayed orders that posted to the CLOB

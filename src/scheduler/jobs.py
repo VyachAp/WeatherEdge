@@ -1687,6 +1687,22 @@ async def job_fast_lock_poll() -> None:
                     continue
 
                 state = _minimal_state_for_easy_lock(icao, routine_points)
+
+                # Order matters: this is a seconds-scale race (see
+                # settings.BUCKET_OVERSHOOT_LOCK_ENABLED). When a METAR pushes the
+                # running max up, the bucket it *just* crossed is the valuable one
+                # — the market still prices it high. Buckets crossed hours ago are
+                # already at ~0 and will be rejected by BUCKET_OVERSHOOT_MAX_COST,
+                # but only *after* paying get_token_ids + get_best_bid_ask. Walk
+                # from the top of the ladder down so the freshest bucket's order
+                # goes out first.
+                city_markets = sorted(
+                    city_markets,
+                    key=lambda m: (
+                        m.parsed_threshold if m.parsed_threshold is not None else -1e9
+                    ),
+                    reverse=True,
+                )
                 latest_obs = max(new_routine, key=lambda m: m["observed_at"])
                 logger.info(
                     "[fast-poll %s] new routine METAR obs=%s temp=%.1f°F max=%.1f°F | %d market(s)",
