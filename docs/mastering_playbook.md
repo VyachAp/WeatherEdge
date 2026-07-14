@@ -1709,3 +1709,29 @@ Fixed (`ee4ae49`): a report with no DDHHMMZ group is NIL or malformed — drop i
 METAR-age kill criterion, and now a fabricated observation time). Every one of them produced a
 confident, plausible, wrong conclusion. The discipline that caught all four was the same:
 **look at the raw input before believing the derived number.**
+
+### §5 addendum 14 — the last throttle ($7.65 stake) is NOT a bug. Verified, leave it.
+
+The only thing still halving every `bucket_overshoot` bet is the **CAUTION drawdown multiplier
+(0.5×)**, giving `LOCK_POSITION_PCT 5% × $305.93 × 0.5 = $7.65`. Given this project's history of
+*stale-peak silencers* (§ `project_drawdown_peak_stuck_2026-05-16`, where a bogus $2074 peak
+perma-PAUSED the bot), the obvious suspicion was another one. **Checked. It isn't.**
+
+```
+2026-06-24/25/26   balance 360.66   peak 360.66   <- the bot ACTUALLY reached this
+2026-07-10..13     balance 305.93   peak 360.66   <- dd 15.2%, genuine
+```
+
+The peak was last reset 2026-06-22 (466.55 → 359.24), and every peak since is a real equity high
+the bot achieved. The all-time $2074 is the known-bogus pre-bankroll-fix artifact and is NOT in
+play. **The 15.2% drawdown is a true 15% loss off a true high, and CAUTION is doing its job.**
+
+**⇒ There is no defect left in the sizing path.** `$7.65` is a *risk decision*, not a bug:
+- To raise it, widen `DRAWDOWN_CAUTION_THRESHOLD` (0.10 → 0.20) — which **removes the brake while
+  genuinely 15% below peak**. That is the operator's call, not an engineering fix, and it was
+  offered and declined this session.
+- Note the depth cap no longer binds on ANY book after `BUCKET_OVERSHOOT_DEPTH_CAP_PCT=0.50`; the
+  bankroll arm is the only remaining constraint. So the stake scales with **equity**: the edge
+  compounds itself out of CAUTION if it works.
+
+**Do not "fix" this in a future session.** It was verified on 2026-07-14 and is correct behaviour.
