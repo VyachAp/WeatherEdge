@@ -1066,3 +1066,93 @@ problem, not an edge problem, fully consistent with "the edge is fine; the bot b
 **Action: none.** Logged as the expected tail of price-band concentration × `KELLY_PROB_CAP`.
 Re-confirm volume returns once `DEPTH_POSITION_CAP_PCT` is raised; revisit the dead-zone only
 after the σ-floor (Iter 2) makes the near-lock forecast-NO band trustworthy.
+
+---
+
+## §5 — Iteration 2026-07-14: the edge was never firing, and the "cheap" candidates were fiction
+
+**Headline:** `bucket_overshoot` — the project's only edge validated against real executable
+prices — had **never fired a single lock signal** since going live on 07-10. The bot had placed
+**zero trades since 07-09**. Neither was a filter problem. Two independent root causes, both in
+the fast path, plus one methodological trap that nearly produced a bad config change.
+
+### 1. We were losing the latency race to ourselves (FIXED, `1e766c0`)
+
+`bucket_overshoot` EV is **+0.46/$1 at 0s decision delay, +0.28 at 30s, dead by 60s** (§5 07-10).
+APScheduler runs `job_fast_lock_poll` with `max_instances=1`, so **a tick that overruns its
+interval is DROPPED, not queued** — the configured 10s is a floor, not a guarantee. Prod was
+dropping **63% of ticks** (83 skipped / 49 run in 22 min); effective poll period **~27s**.
+
+The tick's *fixed* cost was ~24s, all of it O(markets)/O(stations) round-trips that look
+harmless in review:
+
+| Phase | Before | After | Cause |
+|---|---|---|---|
+| `get_active_weather_markets` | ~8s | 0.24-0.46s | **seq scan of all 55,428 `markets` rows, every 10s** (no index). `EXPLAIN ANALYZE` 3,237ms → **0.97ms** |
+| `fetch_latest_metars` | ~16s | 2.2-2.9s | one `INSERT` **per observation** — 48 × ~231ms round-trips to the remote managed PG (~11s) |
+| `get_token_ids` | 519ms **per market per tick** | 0 | immutable IDs re-fetched from Gamma every tick, though `job_scan_markets` already persists them |
+| **total** | **~24s** | **~2.8s** | budget is 10s |
+
+Post-deploy: drop rate **63% → ~15%**, effective interval ~27s → ~11.8s.
+
+**Invariant added to CLAUDE.md: anything on the fast-poll path must be O(1) network
+round-trips, not O(markets) or O(stations).** The canary is
+`grep -c 'skipped: maximum number of running instances'` in prod logs — nonzero means you are
+silently losing the race.
+
+### 2. The lock path was pricing off STALE Gamma (FIXED, same commit)
+
+`job_unified_pipeline` gated the lock path on `price > 0` but **not** on `token_ids`. When
+`get_token_ids` returned None (Gamma rate-limit — frequent, per above), `price` fell back to
+`market.current_yes_price`: the Gamma snapshot, already documented as stale in exactly the
+post-METAR repricing window this path lives in. The executor then wrote `EvaluationLog` rows at
+NO costs **that never existed on the book**, with `buy_depth` hardcoded `0.0` — so the only
+thing preventing bets at fictional prices was an accidental `depth $0 < $10` veto.
+
+### 3. THE TRAP — and it nearly cost us
+
+Because Gamma's staleness is **directional** (a dying YES bucket still looks expensive ⇒ NO
+looks cheap), those contaminated rows form a *beautiful* fake edge. I found 38 "cheap"
+bucket_overshoot candidates blocked on depth; **26 of 26 resolved ones would have won, at an
+apparent +0.76/$1**. Every number was true. The conclusion was still wrong: the **rule** was
+right (the buckets really did die) but the **prices** were fiction — the live CLOB was at
+0.91+, and the real tradeable band is ≥0.96. Proof: an eval logged
+`market_prob = 0.7050000000000001` while the Gamma snapshot was `0.2950` (1−0.295 = 0.705000…1)
+and `shadow_ledger`'s live quote was 0.91.
+
+**Methodological rules banked:**
+- **When a backtest hands you a spectacular edge, verify the PRICE source before the OUTCOME
+  source.** Outcomes were impeccable here; prices were garbage.
+- **A filter that rejects for reason X may be masking a completely different failure Y.** The
+  `depth $0` reject reason described the *symptom* (no token to probe), not the disease (no
+  live quote at all). Cf. the 07-09 rule: *a reject-reason cohort names the first gate that
+  fired, not the only gate that would.* This is the same family, one level deeper.
+- Pre-07-14 lock rows in `evaluation_logs` are **contaminated**. Signature:
+  `signal_kind='lock' AND depth_usd IS NULL AND reject_reason LIKE 'depth%'`. **Filter them out
+  of any lock-EV analysis** — the nightly analyst would otherwise re-derive the phantom edge.
+
+### 4. Also found, deliberately NOT acted on (see `docs/improvements.md`)
+
+- **Open-Meteo is 429 rate-limited in prod** → mass `has_forecast=False` degenerate states.
+  Backlogged: `bucket_overshoot` needs no forecast, and the existing guards fail closed.
+- **The probability path is structurally self-blocked**: `PROBABILITY_MIN_ENTRY_PRICE=0.80`
+  admits exactly the band `KELLY_PROB_CAP=0.90` sizes to **$0 ("no edge")**. 100% of passing
+  probability evals in 9 days died as `stake_below_min`. Left alone on purpose — the model
+  beats the market in **0 of 5** calibration buckets, so unblocking it just buys more unproven
+  bets. (This supersedes the "dead-zone" note above with a confirmed mechanism.)
+- A runaway ad-hoc analysis query (3 backends, **3d16h** old) was pinning the DB buffer pool
+  *and* blocking `CREATE INDEX CONCURRENTLY` — leaving the index built but `indisvalid=false`,
+  i.e. present in `pg_indexes` and **ignored by the planner**. Terminated; index rebuilt valid.
+
+### Next iteration's gate (do NOT tune anything until this is in)
+
+1. `skipped: maximum number of running instances` count → drive to **0**.
+2. Live NO-cost distribution at first fire, **post-07-14 rows only**
+   (`signal_kind='lock' AND direction='BUY_NO' AND depth_usd IS NOT NULL`). Hypothesis: with a
+   ~2.8s tick we now arrive *before* the collapse and see the <0.93 band for the first time.
+3. Real fills + realised PnL on `lock_branch='bucket_overshoot'`.
+
+Only then consider `BUCKET_OVERSHOOT_MAX_COST`. Certainty math: EV/$1 = p/c − 1, so at the
+trusted-station violation rate (p≈0.9992) c=0.96 → +4.1%, c=0.98 → +2.0%, c=0.99 → +0.9% — all
+positive but thin, and thin margins are where resolver divergence and slippage bite.
+**Prefer winning the race over paying up.**
