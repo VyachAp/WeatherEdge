@@ -376,12 +376,27 @@ async def try_lock_rule_trade(
             )
             else None
         )
+        # `bucket_overshoot` gets its own depth cap. The flat 0.15 exists to
+        # limit damage when you might be WRONG about the price — adverse
+        # selection as the FAK walks the book. That risk does not apply to a
+        # *certainty* bet whose cost is already bounded by
+        # BUCKET_OVERSHOOT_MAX_COST: every level swept at or below that price is
+        # +EV by construction. Measured 2026-07-14, the 0.15 cap (× the 0.5
+        # CAUTION multiplier, against MIN_TRADE_USD=$5) silently sized 35 of the
+        # 61 opportunities with a live, fillable NO book down to $0 — it, not the
+        # book, was the binding throttle on the project's only validated edge.
+        # Default 0.15 = no-op; live env sets 0.50.
         pos = size_locked_position(
             bankroll=bankroll,
             price=effective_price,
             current_exposure=exposure,
             orderbook_depth=buy_depth or None,
             floor_to_usd=floor_to_usd,
+            depth_cap_pct=(
+                settings.BUCKET_OVERSHOOT_DEPTH_CAP_PCT
+                if decision.branch == "bucket_overshoot"
+                else 0.15
+            ),
         )
     dd_state = monitor.check(bankroll)
     stake = pos.stake_usd * dd_state.size_multiplier

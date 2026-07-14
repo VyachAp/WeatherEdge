@@ -479,6 +479,35 @@ async def test_no_side_uses_no_token_depth_lookup():
 
 
 @pytest.mark.asyncio
+async def test_bucket_overshoot_gets_its_own_depth_cap_other_locks_keep_015():
+    """`bucket_overshoot` sizes against BUCKET_OVERSHOOT_DEPTH_CAP_PCT; every
+    other lock branch keeps the flat 0.15.
+
+    The 0.15 cap limits damage when you might be WRONG about the price. That risk
+    doesn't apply to a certainty bet already price-bounded by
+    BUCKET_OVERSHOOT_MAX_COST — every level swept at or below it is +EV by
+    construction. Measured 2026-07-14: the 0.15 cap (× the 0.5 CAUTION multiplier,
+    against MIN_TRADE_USD=$5) required depth >= $67 and silently sized 35 of the
+    61 opportunities that HAD a live fillable NO book down to $0. The cap, not the
+    book, was throttling the project's only validated edge.
+    """
+    with patch.object(lre.settings, "BUCKET_OVERSHOOT_DEPTH_CAP_PCT", 0.50):
+        # bucket_overshoot → the branch-specific cap
+        _, c = await _invoke(
+            decision=_no_decision(branch="bucket_overshoot"),
+            yes_price=0.10, yes_bid=0.10,   # NO cost 0.90 ≤ MAX_COST
+        )
+        assert c["size_locked_position"].call_args.kwargs["depth_cap_pct"] == 0.50
+
+        # any other lock branch → unchanged 0.15
+        _, c2 = await _invoke(
+            decision=_no_decision(branch="easy_super"),
+            yes_price=0.10, yes_bid=0.10,
+        )
+        assert c2["size_locked_position"].call_args.kwargs["depth_cap_pct"] == 0.15
+
+
+@pytest.mark.asyncio
 async def test_no_live_quote_is_counted_not_silently_skipped():
     """An empty/one-sided book must be REPORTED, never priced off `yes_price`.
 

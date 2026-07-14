@@ -619,6 +619,23 @@ class Settings(BaseSettings):
     # These four produced 11 of the 16 rule violations observed.
     BUCKET_OVERSHOOT_EXCLUDED_STATIONS: str = "ZGSZ,MPTO,EGLL,UUEE"
 
+    # Orderbook-depth cap for the `bucket_overshoot` NO branch specifically.
+    # `size_locked_position` defaults to 0.15 (the flat-lock cap), which measured
+    # 2026-07-14 as the binding throttle on this edge: with the CAUTION multiplier
+    # (0.5x) and MIN_TRADE_USD=$5, a stake only survives when
+    #   0.15 x depth x 0.5 >= $5  =>  depth >= $67
+    # and 35 of the 61 opportunities that had a live, fillable NO book (>= $10 of
+    # resting size) were sized to $0 on that cap alone.
+    #
+    # A tight depth cap exists to limit damage when you might be WRONG about the
+    # price — adverse selection as you walk the book. That risk does not apply
+    # here: bucket_overshoot is a *certainty* bet (0.08% violation rate on trusted
+    # stations) and BUCKET_OVERSHOOT_MAX_COST already bounds what we pay, so every
+    # level swept at <= that cost is +EV by construction. Default 0.15 keeps the
+    # old behaviour; the live env sets 0.50 (matching LOCK_DEPTH_CAP_PCT_BIG).
+    # Applies ONLY to the bucket_overshoot branch — every other lock keeps 0.15.
+    BUCKET_OVERSHOOT_DEPTH_CAP_PCT: float = 0.15
+
     @property
     def bucket_overshoot_excluded(self) -> set[str]:
         return {
