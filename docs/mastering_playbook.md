@@ -1544,3 +1544,26 @@ ORDER BY created_at DESC;
 ```
 `no_cost <= 0.93` AND `depth_no_usd >= 10` on a fast station = a bet we should have taken.
 Cross-check against `evaluation_logs` (`signal_kind='lock'`, `depth_usd IS NOT NULL`) and `trades`.
+
+### §5 addendum 10 — END-TO-END validation against a live CLOB book (no order, no DB write)
+
+Drove the **real** `try_lock_rule_trade` against a **real** live orderbook, with only
+`place_order` / persistence / alerter mocked and a synthetic dead-bucket state:
+
+```
+market    : "…highest temperature in Jeddah be 36°C…"   station OEJN (winnable, 1.0min lag)
+live book : yes_bid=0.09  yes_ask=0.12   =>  NO cost 0.910
+eval      : passes=True   reject=None
+DEPTH     : $62.00        <- REAL CLOB probe, epsilon-fixed, measured up to the 0.93 cap
+ORDER     : stake $7.65   entry 0.910
+FAK limit : 0.910 + 2.0c = 0.9300      <- exactly at BUCKET_OVERSHOOT_MAX_COST, no breach
+```
+
+**All five fixes compose.** The stake is bound by the **bankroll arm**
+(`LOCK_POSITION_PCT 5% × $306 × 0.5 CAUTION = $7.65`), *not* by depth — exactly as the funnel
+predicted once the depth cap moved 0.15 → 0.50. The pipeline will place a bet the moment a fresh
+kill lands on a live book.
+
+This is a harness test (the bucket was forced dead on a market that is still live), so it proves
+the **code path**, not the edge. The edge itself is still gated on the natural event — see the
+durable kill-criterion queries in addendum 9.
