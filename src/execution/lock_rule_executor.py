@@ -553,8 +553,15 @@ async def try_lock_rule_trade(
         # the stake gets truncated at the top of the book. Price-time priority
         # means we still pay the cheapest levels first; the cap bounds the worst
         # we can pay, and every level under it is +EV by construction.
+        #
+        # NOTE the floor is 0.0, NOT the 2¢ used by the conviction path.
+        # `place_order` sets `limit = entry_price + max_slippage_cents/100`, so a
+        # 2¢ floor at an effective price of 0.92 would post a 0.94 limit — ABOVE
+        # the very cap the cost gate above refuses to trade past, i.e. we'd bid a
+        # price we had just rejected. Clamp to the cap exactly; at
+        # effective_price == cap the slippage is 0 and we simply lift the best ask.
         order_kwargs["max_slippage_cents"] = max(
-            2.0, (settings.BUCKET_OVERSHOOT_MAX_COST - effective_price) * 100.0
+            0.0, (settings.BUCKET_OVERSHOOT_MAX_COST - effective_price) * 100.0
         )
     order_ok = await place_order(trade, session, **order_kwargs)
     if not order_ok:

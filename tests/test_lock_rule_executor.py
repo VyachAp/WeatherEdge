@@ -506,6 +506,28 @@ async def test_bucket_overshoot_probes_depth_up_to_max_cost_and_walks_the_book()
         assert slip == pytest.approx((0.93 - 0.70) * 100.0, abs=0.5)
 
 
+@pytest.mark.parametrize("yes_bid,eff", [(0.30, 0.70), (0.08, 0.92), (0.07, 0.93)])
+@pytest.mark.asyncio
+async def test_bucket_overshoot_fak_limit_never_exceeds_max_cost(yes_bid, eff):
+    """The order's LIMIT must never breach BUCKET_OVERSHOOT_MAX_COST.
+
+    `place_order` posts `limit = entry_price + max_slippage_cents/100`. The
+    conviction path floors slippage at 2¢ — copying that here would post a 0.94
+    limit at an effective price of 0.92, i.e. bid a price the cost gate a few
+    lines earlier explicitly refuses. The cap is what bounds resolver-divergence
+    risk on a certainty bet, so it must hold on the ORDER, not just the check.
+    """
+    CAP = 0.93
+    with patch.object(lre.settings, "BUCKET_OVERSHOOT_MAX_COST", CAP):
+        _, c = await _invoke(
+            decision=_no_decision(branch="bucket_overshoot"),
+            yes_price=yes_bid, yes_bid=yes_bid,
+        )
+        slip = c["place_order"].await_args.kwargs["max_slippage_cents"]
+        limit = eff + slip / 100.0          # what place_order will post
+        assert limit <= CAP + 1e-9, f"FAK limit {limit:.4f} breaches cap {CAP}"
+
+
 @pytest.mark.asyncio
 async def test_non_bucket_overshoot_lock_still_probes_at_its_own_ask():
     """Only the certainty branch gets the widened probe/walk — nothing else."""
