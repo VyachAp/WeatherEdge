@@ -80,11 +80,30 @@ def parse_raw_metar(
     # Flight category
     flight_category = _compute_flight_category(vis_miles, ceiling_ft)
 
-    # Observation time
-    if obs.time:
-        observed_at = obs.time.replace(tzinfo=timezone.utc)
-    else:
-        observed_at = datetime.now(timezone.utc)
+    # Observation time. NEVER fabricate this.
+    #
+    # This used to fall back to `datetime.now()` when the report carried no
+    # DDHHMMZ group — which is exactly what a **NIL** report looks like
+    # ("METAR OEJN NIL", i.e. the station published nothing). The result was an
+    # Observation stamped with the current time and no temperature, and
+    # `_parse_ogimet_metar_html` sorts observations by `observed_at` DESC, so the
+    # phantom sorted to the FRONT and was served as "the latest METAR" (observed
+    # live on 2026-07-14: OGIMET returned OEJN NIL and the parser reported it as a
+    # 0.0-minute-old observation).
+    #
+    # `observed_at` is load-bearing for the whole bucket_overshoot edge —
+    # `seconds_since_obs`, kill freshness, and fast-poll's `_last_routine_seen`
+    # watermark all key off it. A now()-stamped phantom would push the watermark
+    # to the present and SUPPRESS the genuinely new METARs behind it. The
+    # DDHHMMZ group is mandatory in a real METAR, so its absence means the report
+    # is NIL or malformed: drop it and let the caller fail over.
+    if not obs.time:
+        logger.debug(
+            "METAR has no observation time (NIL/malformed), dropping: %s",
+            raw_text[:80],
+        )
+        return None
+    observed_at = obs.time.replace(tzinfo=timezone.utc)
 
     station_id = obs.station_id or station
 
