@@ -1404,3 +1404,46 @@ for, and it is now fully instrumented end-to-end:
 latency and we stop paying for it. If instead those fresh kills produce `evaluation_logs` rows
 with real depth, the edge is real and the only remaining lever is **ingestion lag** (METAR
 publication, ~2.7 min — see §5 07-10; a provider racer was already measured and rejected).
+
+### §5 addendum 7 — FIRST fresh-kill datum: the book is DEEP, the PRICE is gone. Station lag is the lever.
+
+The first `metar_reprice_snapshots` row with `depth_no_usd` populated (fast-poll T0 = a lock
+fired on a live book):
+
+```
+station        : WMKK (Kuala Lumpur)
+METAR observed : 05:00:00Z      we saw it 514s later  (8.6 min)
+market         : "…highest temperature in Kuala Lumpur…"  [exactly]
+live quote     : yes_bid 0.001 / yes_ask 0.002   =>  NO cost 0.999
+NO-side DEPTH  : $406.80
+```
+
+**Two conclusions, both important:**
+
+1. **The NO book is NOT empty just after a collapse — it holds $407 at 0.999.** The empty-book
+   state we kept hitting arrives *much* later (the 81 stale `lock_unexecutable` events had a
+   median age of **27 min**). So the binding constraint on a fresh kill is **PRICE, not
+   liquidity**: the size is there, we just arrive after the reprice. This refines addendum 3 —
+   depth was never the real problem on fresh kills.
+
+2. **8.6 min is exactly WMKK's known METAR publication floor** (§5 07-10: WSSS 1.1 min, OPKC 1.7,
+   VILK 2.8, **WMKK 8.7**). The market collapses dead buckets at a median **2.07 min**. On WMKK
+   we are ~6.5 min late *before our code runs at all* — **the race is structurally unwinnable
+   there at any tick speed.** Our 24s→2.8s tick fix cannot help a station whose data is 8.6 min
+   old on arrival.
+
+**⇒ NEXT LEVER: prioritise / gate stations by METAR PUBLICATION LAG, not by divergence alone.**
+Decision lag is solved (2.8s tick, 0% dropped ticks). The remaining ~2.7 min is publication, and
+it is **per-station**. The winnable set is the low-lag stations (WSSS 1.1, OPKC 1.7, VILK 2.8);
+WMKK at 8.7 min is a guaranteed loss that still costs us CLOB calls and log noise.
+
+**Concrete next step (measure first, as always):** we now record `seconds_since_obs` on every
+fast-poll T0 snapshot AND on every `lock_unexecutable` event. Build the per-station lag
+distribution from `metar_reprice_snapshots.seconds_since_obs`, then:
+- compute, per station, `P(NO cost ≤ 0.93 | fresh kill)` against that station's lag;
+- expect a sharp cliff around the market's ~2 min reprice time;
+- consider a `BUCKET_OVERSHOOT_MIN_LAG_STATIONS` allow-list (or simply exclude stations whose
+  median publication lag exceeds ~2-3 min) — the same shape as
+  `BUCKET_OVERSHOOT_EXCLUDED_STATIONS`, but gating on **speed** rather than **divergence**.
+
+Do NOT hand-pick from one datum. WMKK is one snapshot; build the distribution first.
