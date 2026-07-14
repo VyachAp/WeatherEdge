@@ -28,6 +28,55 @@ unless `docs/mastering_playbook.md` says Track A has reached the stability trigg
   only read the DB and write gitignored `runtime/*.json`). `perf-propose-push` is
   allowed (it only sends Telegram).
 
+## Step 0 — DATA-INTEGRITY LANDMINES (read EVERY night, before any query)
+
+On 2026-07-14 **five** separate "findings" turned out to be instrument artifacts, not
+facts. Each was confident, plausible, and wrong; each would have driven a bad config
+change. These are the live tripwires — **you will hit them if you do not filter.**
+
+1. **Pre-2026-07-14 LOCK rows in `evaluation_logs` are STALE-GAMMA priced.** The lock
+   path ran without `token_ids`, so `price` fell back to `market.current_yes_price`
+   (the Gamma snapshot) — which is *most wrong* exactly in the post-METAR repricing
+   window. Those rows carry NO costs of 0.11-0.93 that **never existed on the book**
+   (the live CLOB was 0.91+), and they form a fake **+0.76/$1** cohort where 26/26
+   "would have won". **Signature:** `signal_kind='lock' AND depth_usd IS NULL AND
+   reject_reason LIKE 'depth%'`. **Any lock-EV analysis MUST filter to
+   `created_at > '2026-07-14'`.**
+
+2. **`seconds_since_obs` is the age of the latest METAR, NOT the age of the KILL.**
+   `bucket_overshoot` re-fires on *every* bucket below the running max on *every* new
+   METAR, all day — so a bucket that died at 09:00 re-fires at 15:00 with a "fresh"
+   60-second METAR age. Splitting fresh/stale on `seconds_since_obs` gave a
+   *reassuring* wrong answer once and an *alarming* wrong answer once (it nearly killed
+   the project's only edge on n=3). **Discriminate on OVERSHOOT:**
+   `overshoot = observed_max − (bucket_top + step)` (step = 1.8°F for °C markets, 1.0°F
+   for °F); `overshoot ≤ 1.8°F` ⇒ a TRUE fresh kill. Needs
+   `execution.binary_market.market_range_f` + `market_unit` — SQL alone cannot parse the
+   bucket.
+
+3. **The `bucket_overshoot` denominator is 6 STATIONS, not 45.** Only
+   `SBGR, OEJN, WSSS, MMMX, OPKC, EFHK` ingest METARs faster than the market's 2.07-min
+   reprice. Every other station is structurally lost (5-9 min lag) and *cannot* produce
+   a fill no matter what. **Judging volume/fill-rate/PnL against 45 stations will make a
+   healthy edge look broken.** The ingestion lever is CLOSED (no provider beats AWC —
+   they share one upstream feed); do not re-propose a provider racer.
+
+4. **A `depth == 0.0` is a suspected BUG, not a fact.** `_compute_depth` has silently
+   vetoed real, liquid markets three times (depth-at-mid ×2, float-epsilon ×1 — the last
+   read $0 on books holding $5k-13k). Before concluding "no liquidity", probe the raw
+   book.
+
+5. **Never price execution from `market_snapshots.yes_price` (Gamma).** In the repricing
+   window it correlates only 0.31 with the real book and is directionally biased
+   (+0.142), so it *invents* edge on any post-METAR NO rule. Use `shadow_ledger`
+   bid/ask, `evaluation_logs.depth_usd`, or live `get_best_bid_ask`.
+
+**THE RULE THAT CATCHES ALL OF THESE:** *verify the measuring device before believing
+the measurement.* When a result would change a decision — especially a flattering one —
+go look at the raw input (the raw METAR text, the raw orderbook levels, the raw spec
+line) before you write the conclusion. A hypothesis tested against a corrupted dataset
+is **not tested**.
+
 ## Step 1 — Orient (re-read the durable plan every night)
 1. `docs/mastering_playbook.md` — the Mission & nightly charter (top), §2 the
    dashboard ritual, §3 the dark-flag→gate map, §4 the current iteration, and

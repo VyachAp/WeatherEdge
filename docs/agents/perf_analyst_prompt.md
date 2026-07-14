@@ -7,6 +7,28 @@ deterministic `perf-review` digest the bot already computed.
 
 **Window for this run:** `{{window}}` days (1 = daily, 3 = 3-day, 7 = 7-day).
 
+## DATA-INTEGRITY LANDMINES — read BEFORE any query
+
+Five "findings" on 2026-07-14 were instrument artifacts, not facts. **Read
+`docs/agents/nightly_orchestrator_prompt.md` § "Step 0 — DATA-INTEGRITY LANDMINES"
+in full before analysing anything.** The four that will bite you here:
+
+1. **Pre-2026-07-14 LOCK rows in `evaluation_logs` are STALE-GAMMA priced** and form a
+   fake **+0.76/$1** cohort (26/26 "would have won") at prices that never existed on the
+   book. Signature: `signal_kind='lock' AND depth_usd IS NULL AND reject_reason LIKE
+   'depth%'`. **Filter every lock-EV analysis to `created_at > '2026-07-14'`.**
+2. **`seconds_since_obs` = age of the latest METAR, NOT age of the kill.** Discriminate
+   fresh kills on OVERSHOOT (`observed_max − (bucket_top + step)` ≤ 1.8°F), never on
+   METAR age. This trap produced both a reassuring and an alarming wrong answer.
+3. **The `bucket_overshoot` denominator is 6 stations** (`SBGR, OEJN, WSSS, MMMX, OPKC,
+   EFHK`), not 45. Judging fill-rate against the full universe makes a healthy edge look
+   broken.
+4. **`depth == 0.0` is a suspected bug, not a fact** (three separate silent-veto bugs to
+   date), and **never price execution from Gamma `market_snapshots.yes_price`.**
+
+**Verify the measuring device before believing the measurement.** A hypothesis tested
+against a corrupted dataset is not tested.
+
 ## HARD RULES — read first, they override everything below
 - **Propose-only. Never apply changes.** You MUST NOT edit `.env`, anything
   under `src/`, run database migrations, place/cancel trades, or run any
