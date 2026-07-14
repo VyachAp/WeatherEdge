@@ -1567,3 +1567,66 @@ kill lands on a live book.
 This is a harness test (the bucket was forced dead on a market that is still live), so it proves
 the **code path**, not the edge. The edge itself is still gated on the natural event — see the
 durable kill-criterion queries in addendum 9.
+
+### §5 addendum 11 — ⚠️ CORRECTION: my kill criterion was BROKEN, and the corrected one is flashing red
+
+**The criterion in addendum 9 is INVALID. Do not use it. The "0 of 81 fresh → thesis intact"
+verdict in addendum 6 is therefore also unearned — it was measuring the wrong thing.**
+
+**The bug:** `seconds_since_obs` is the age of the **latest METAR**, not the age of the **KILL**.
+`bucket_overshoot` fires on *every* bucket below the running max, on *every* new METAR, for the
+rest of the day — a bucket that died at 09:00 still re-fires at 15:00 with a "fresh" 60-second
+METAR age. So a `lock_unexecutable` row with `seconds_since_obs = 55s` is almost always a
+**long-dead bucket re-firing**, whose empty book is entirely expected and says nothing.
+
+Confirmed: of 17 "fresh (<3min)" empty-book locks, **14 had an overshoot of 2.4-12.6°F past the
+dead threshold** — i.e. the max crossed those buckets hours ago.
+
+**CORRECTED CRITERION — discriminate on OVERSHOOT, not METAR age:**
+
+```sql
+-- overshoot = observed_max - (bucket_top + step)   [step = 1.8°F for °C markets, 1.0°F for °F]
+-- overshoot <= ~1.8°F (one METAR heating step) => the max JUST crossed => a TRUE fresh kill.
+-- Compute in Python with execution.binary_market.market_range_f + market_unit;
+-- SQL alone cannot parse the bucket. See scratchpad/isfresh.py.
+SELECT s.station_icao, s.seconds_since_obs, s.new_observed_max_f, m.question
+FROM metar_reprice_snapshots s JOIN markets m ON m.id = s.market_id
+WHERE s.yes_bid IS NULL              -- empty book
+  AND s.created_at > '2026-07-14'
+  AND s.seconds_since_obs < 180;     -- necessary, NOT sufficient — then filter on overshoot
+```
+
+**FIRST CORRECTED READ — and it is bad news:** 3 of the 17 were TRUE fresh kills
+(overshoot ≤ 1.8°F). **All three had an EMPTY book:**
+
+| station | METAR age | overshoot | book |
+|---|---|---|---|
+| **WSSS** (FAST, 1.4min median lag) | **1.3 min** | 0.6°F — just crossed | **EMPTY** |
+| RPLL | 0.9 min | 0.6°F | **EMPTY** |
+| VILK | 2.8 min | 1.8°F | **EMPTY** |
+
+**WSSS is the damning one.** We had the METAR **1.3 min** after observation — inside the 2.07-min
+reprice window, i.e. *we won the race* — the bucket had **just** died, and there was **nothing to
+buy.**
+
+**NEW LEADING HYPOTHESIS — the market FRONT-RUNS the kill.** Traders do not need the killing
+METAR. Once the temperature is visibly climbing toward a bucket, they withdraw their NO offers on
+it *before* it is mathematically dead. If that is what is happening, the offers are gone by the
+time our certainty condition triggers, and **no amount of speed helps — the edge does not exist**,
+and the §5 07-10 study's "~19% still priced NO < 0.99" was an artifact of pricing off **stale
+Gamma** (see the contamination gotcha), not a real executable opportunity.
+
+**n = 3. Do NOT act on this yet.** But it is now the leading hypothesis, it directly contradicts
+the thesis the whole `bucket_overshoot` programme rests on, and it is cheap to settle:
+
+1. Let `metar_reprice_snapshots` accumulate (writer is live and durable).
+2. Re-run the **overshoot-filtered** query in a few days.
+3. **Decision rule:** if TRUE fresh kills (overshoot ≤ 1.8°F) on FAST stations
+   (`SBGR/OEJN/WSSS/MMMX/OPKC/EFHK`) keep showing an empty book at n ≥ 15-20, **the edge is a
+   mirage — kill `BUCKET_OVERSHOOT_LOCK_ENABLED` and stop spending on latency.** If instead some
+   show a live book at NO ≤ 0.93, the edge is real and rare, and ingestion lag remains the lever.
+
+**Meta-lesson, third time this session:** *verify the instrument before believing the
+measurement.* I built the kill criterion, it returned a clean "thesis intact", and it was
+measuring the wrong variable. Same family as the `yaml.safe_load` key artifact and the epsilon
+hypothesis "refuted" against stale-Gamma rows.
