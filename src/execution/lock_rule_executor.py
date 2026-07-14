@@ -248,14 +248,21 @@ async def try_lock_rule_trade(
         )
         return 0.0
 
+    # Without token IDs there is no book to price or probe against, and
+    # `effective_price` would have been derived from the stale Gamma snapshot
+    # rather than the live CLOB quote. Reject explicitly: the old code fell
+    # through with `buy_depth = 0.0`, so this failure mode disguised itself as
+    # "depth $0 < $10" and quietly filled evaluation_logs with NO costs that
+    # never existed on the book.
+    if not token_ids:
+        await _log_lock_eval(False, "no token IDs (cannot price the live book)", None)
+        return 0.0
+
     # Depth against the side we're actually buying.
     if decision.side == "YES":
         buy_depth = yes_depth
     else:
-        buy_depth = (
-            get_orderbook_depth(token_ids[1], effective_price)
-            if token_ids else 0.0
-        )
+        buy_depth = get_orderbook_depth(token_ids[1], effective_price)
 
     # Reuse the existing filter helper for routine-count / close-buffer / depth.
     # Pass stub prob/edge/price values that will pass those specific checks; we're

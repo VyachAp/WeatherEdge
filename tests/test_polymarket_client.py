@@ -336,3 +336,49 @@ def test_fast_poll_yes_depth_probes_ask_not_mid():
     # Old (mid): vetoed. New (ask): real fillable depth.
     assert _compute_depth(book, yes_price) == 0.0
     assert _compute_depth(book, yes_buy_px) == 0.52 * 100.0
+
+
+# ---------------------------------------------------------------------------
+# Conditional-token ID caching (2026-07-14)
+# ---------------------------------------------------------------------------
+#
+# `get_token_ids` used to pay a Gamma round-trip *per market per tick*. On the
+# 10s fast-poll that was the dominant cost: the job overran its own interval
+# and APScheduler dropped 63% of ticks ("maximum number of running instances
+# reached"), so the effective poll period was ~27s. bucket_overshoot is a
+# seconds-scale race whose EV dies by ~60s of decision delay, so that lag was
+# pure EV decay. Worse, when Gamma rate-limited and the call returned None, the
+# caller silently fell back to the STALE `market.current_yes_price`.
+# Token IDs are immutable, and job_scan_markets already persists them.
+
+
+def test_token_ids_from_row_reads_the_market_row_without_network():
+    from types import SimpleNamespace
+    from src.execution.polymarket_client import _token_id_cache, token_ids_from_row
+
+    _token_id_cache.clear()
+    market = SimpleNamespace(id="123", clob_token_ids=["yes_tok", "no_tok"])
+
+    assert token_ids_from_row(market) == ("yes_tok", "no_tok")
+    # ...and it primes the memo, so a later get_token_ids needs no HTTP call.
+    assert _token_id_cache["123"] == ("yes_tok", "no_tok")
+
+
+def test_token_ids_from_row_returns_none_when_row_has_no_ids():
+    from types import SimpleNamespace
+    from src.execution.polymarket_client import token_ids_from_row
+
+    assert token_ids_from_row(SimpleNamespace(id="1", clob_token_ids=None)) is None
+    assert token_ids_from_row(SimpleNamespace(id="1", clob_token_ids=["only_one"])) is None
+
+
+@pytest.mark.asyncio
+async def test_get_token_ids_is_memoised_so_the_hot_path_pays_no_gamma_roundtrip():
+    from src.execution.polymarket_client import _token_id_cache, get_token_ids
+
+    _token_id_cache.clear()
+    _token_id_cache["777"] = ("yes_tok", "no_tok")
+
+    with patch("httpx.AsyncClient") as http:
+        assert await get_token_ids("777") == ("yes_tok", "no_tok")
+        http.assert_not_called()  # cache hit => zero network

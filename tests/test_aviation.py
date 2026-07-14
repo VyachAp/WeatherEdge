@@ -571,6 +571,38 @@ class TestFetchMetars:
 
     @patch("src.ingestion.aviation._awc_get_json")
     @patch("src.ingestion.aviation.async_session")
+    async def test_observations_persist_in_a_single_multi_row_insert(
+        self, mock_session_factory, mock_get
+    ):
+        """N observations → ONE INSERT, not N.
+
+        Regression for 2026-07-14. This ran one `await session.execute(INSERT)`
+        per observation against a *remote* managed Postgres (~50-150ms of
+        round-trip each), so a 48-station fast-poll tick spent seconds here. The
+        fast-poll interval is 10s and `bucket_overshoot` is a seconds-scale race
+        whose EV decays to zero by ~60s of decision delay, so this was straight
+        EV decay: the tick overran, APScheduler dropped 63% of ticks, and the
+        effective poll period became ~27s.
+        """
+        mock_session = AsyncMock()
+        mock_session_factory.return_value = mock_session
+
+        stations = [f"K{i:03d}" for i in range(12)]
+        mock_get.return_value = [
+            {**SAMPLE_METAR, "icaoId": s} for s in stations
+        ]
+
+        result = await fetch_latest_metars(stations)
+
+        assert len(result) == 12
+        assert mock_session.execute.await_count == 1, (
+            "expected a single multi-row INSERT, got "
+            f"{mock_session.execute.await_count} statements"
+        )
+        assert mock_session.commit.called
+
+    @patch("src.ingestion.aviation._awc_get_json")
+    @patch("src.ingestion.aviation.async_session")
     async def test_station_failure_doesnt_fail_batch(
         self, mock_session_factory, mock_get
     ):

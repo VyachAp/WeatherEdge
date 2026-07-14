@@ -37,6 +37,13 @@ class TradeStatus(str, enum.Enum):
 
 class Market(Base):
     __tablename__ = "markets"
+    __table_args__ = (
+        # `get_active_weather_markets` (parsed_variable = 'temperature' AND
+        # end_date > now() ORDER BY end_date) runs on every 10s fast-poll tick.
+        # Without this it seq-scans the whole table (55k rows to return ~880,
+        # ~3.2s on prod) and blows the fast-poll interval budget.
+        Index("ix_markets_active_weather", "parsed_variable", "end_date"),
+    )
 
     id = Column(String, primary_key=True)
     question = Column(Text, nullable=False)

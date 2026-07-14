@@ -241,13 +241,44 @@ def get_wallet_usdc_balance(force_refresh: bool = False) -> float | None:
 # ---------------------------------------------------------------------------
 
 
+# Conditional-token IDs are immutable for the life of a market, so this memo
+# never needs a TTL. It exists because the hot paths (fast-poll every 10s,
+# unified every 5min) used to pay a Gamma round-trip *per market per tick*:
+# the dominant fast-poll latency cost, and — when Gamma rate-limited and the
+# call returned None — the trigger for the stale-price path (see
+# ``token_ids_from_row``). Bounded by the number of markets we ever touch.
+_token_id_cache: dict[str, tuple[str, str]] = {}
+
+
+def token_ids_from_row(market) -> tuple[str, str] | None:
+    """Return (YES, NO) token IDs from an already-loaded ``Market`` row.
+
+    ``job_scan_markets`` persists Gamma's ``clobTokenIds`` into
+    ``markets.clob_token_ids`` on every scan, so for any market scanned at
+    least once while live the IDs are already in hand — no I/O at all. Falls
+    back to ``None`` so callers can defer to the network ``get_token_ids``.
+    """
+    raw = getattr(market, "clob_token_ids", None)
+    if not raw or len(raw) < 2:
+        return None
+    pair = (str(raw[0]), str(raw[1]))
+    _token_id_cache.setdefault(str(market.id), pair)
+    return pair
+
+
 async def get_token_ids(market_id: str) -> tuple[str, str] | None:
     """Fetch YES/NO conditional token IDs for a Polymarket market.
 
     Returns (yes_token_id, no_token_id) or None on failure.
-    Token IDs come from the Gamma API, keyed by clobTokenIds.
+    Token IDs come from the Gamma API, keyed by clobTokenIds, and are memoised
+    in ``_token_id_cache`` (they never change once the market exists).
     """
     import httpx
+
+    market_id = str(market_id)
+    cached = _token_id_cache.get(market_id)
+    if cached is not None:
+        return cached
 
     try:
         async with httpx.AsyncClient() as http:
@@ -279,7 +310,9 @@ async def get_token_ids(market_id: str) -> tuple[str, str] | None:
             logger.warning("Market %s has fewer than 2 token IDs: %s", market_id, token_ids)
             return None
 
-        return (token_ids[0], token_ids[1])  # (YES, NO)
+        pair = (str(token_ids[0]), str(token_ids[1]))  # (YES, NO)
+        _token_id_cache[market_id] = pair
+        return pair
 
     except Exception:
         logger.exception("Failed to fetch token IDs for market %s", market_id)

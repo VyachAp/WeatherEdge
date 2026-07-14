@@ -249,37 +249,51 @@ async def fetch_latest_metars(
 
     try:
         async with _make_client() as client:
-            for i in range(0, len(station_list), _BULK_BATCH_SIZE):
-                batch = station_list[i : i + _BULK_BATCH_SIZE]
-                ids_str = ",".join(batch)
+            # Fire the ICAO batches CONCURRENTLY. This is the fast-poll hot path
+            # and `bucket_overshoot` is a seconds-scale race, so serialising the
+            # batches just adds decision latency to an edge that decays to zero
+            # by ~60s. `return_exceptions=True` keeps one bad batch from voiding
+            # the others (same discipline as the aggregator's forecast gather).
+            batches = [
+                station_list[i : i + _BULK_BATCH_SIZE]
+                for i in range(0, len(station_list), _BULK_BATCH_SIZE)
+            ]
+            results = await asyncio.gather(
+                *(
+                    _awc_get_json(client, METAR_URL, {"ids": ",".join(b), "format": "json"})
+                    for b in batches
+                ),
+                return_exceptions=True,
+            )
+
+        for batch, data in zip(batches, results):
+            if isinstance(data, BaseException):
+                logger.warning(
+                    "METAR fetch failed for batch %s: %s", ",".join(batch), data,
+                )
+                continue
+            if not isinstance(data, list):
+                continue
+
+            for entry in data:
                 try:
-                    data = await _awc_get_json(
-                        client, METAR_URL, {"ids": ids_str, "format": "json"}
-                    )
+                    all_parsed.append(_parse_metar_json(entry))
                 except Exception:
                     logger.warning(
-                        "METAR fetch failed for batch %s", ids_str, exc_info=True
+                        "METAR parse failed for %s",
+                        entry.get("icaoId", "?"),
+                        exc_info=True,
                     )
-                    continue
 
-                if not isinstance(data, list):
-                    continue
-
-                for entry in data:
-                    try:
-                        parsed = _parse_metar_json(entry)
-                        all_parsed.append(parsed)
-                        await session.execute(
-                            pg_insert(MetarObservation)
-                            .values(**parsed)
-                            .on_conflict_do_nothing(constraint="uq_metar_station_obs")
-                        )
-                    except Exception:
-                        logger.warning(
-                            "METAR parse failed for %s",
-                            entry.get("icaoId", "?"),
-                            exc_info=True,
-                        )
+        # ONE multi-row INSERT instead of a round-trip per observation. The DB is
+        # a remote managed Postgres, so ~50-150ms of latency per statement × one
+        # row per station was several seconds of the fast-poll tick's budget.
+        if all_parsed:
+            await session.execute(
+                pg_insert(MetarObservation)
+                .values(all_parsed)
+                .on_conflict_do_nothing(constraint="uq_metar_station_obs")
+            )
 
         await session.commit()
         logger.info("Persisted %d METAR observations", len(all_parsed))

@@ -191,7 +191,12 @@ async def job_unified_pipeline() -> None:
         from src.signals.state_aggregator import WeatherState, aggregate_state
         from src.signals.probability_engine import compute_distribution
         from src.signals.mapper import icao_for_location, geocode
-        from src.execution.polymarket_client import get_best_bid_ask, get_orderbook_depth, get_token_ids
+        from src.execution.polymarket_client import (
+            get_best_bid_ask,
+            get_orderbook_depth,
+            get_token_ids,
+            token_ids_from_row as _token_ids_from_row,
+        )
 
         # Reset per-station dedup / cache for any station whose local day
         # has just rolled over. Cheap, runs every tick.
@@ -341,7 +346,10 @@ async def job_unified_pipeline() -> None:
                     yes_bid: float | None = None
                     yes_ask: float | None = None
                     live_price: float | None = None
-                    token_ids = await get_token_ids(market.id)
+                    # Prefer the token IDs job_scan_markets already persisted on
+                    # the row (zero I/O). They're immutable, so the Gamma call is
+                    # only a fallback for a market we've never scanned.
+                    token_ids = _token_ids_from_row(market) or await get_token_ids(market.id)
                     if token_ids:
                         quote = get_best_bid_ask(token_ids[0])
                         if quote:
@@ -406,9 +414,23 @@ async def job_unified_pipeline() -> None:
                     # Evaluate before the near-resolved skip so the 0.90-0.95
                     # "we read the max on METAR before Wunderground updates" zone
                     # is tradeable rather than filtered out as "too close to resolved".
+                    # A lock MUST be priced off the live CLOB book. Without
+                    # token_ids there is no live quote and `price` silently falls
+                    # back to `market.current_yes_price` — the Gamma snapshot,
+                    # which is STALE in exactly the post-METAR repricing window
+                    # this path lives in (it keeps quoting the pre-move price for
+                    # ~10 min). That made a dying YES bucket still look expensive,
+                    # so NO looked cheap: the executor logged EvaluationLog rows at
+                    # fictional NO costs of 0.11-0.93 when the real book was at
+                    # 0.91+, and `buy_depth` was hardcoded 0.0 (no token to probe)
+                    # so only the depth filter stopped us betting at prices that
+                    # did not exist. Require the live quote instead of relying on
+                    # that accident. See the "Gamma snapshot is STALE" gotcha.
                     if (
                         settings.LOCK_RULE_ENABLED
                         and _is_binary_market(market)
+                        and token_ids
+                        and live_price is not None
                         and price > 0
                     ):
                         lock_executed = await _try_lock_rule_trade(
@@ -1620,6 +1642,7 @@ async def job_fast_lock_poll() -> None:
             get_best_bid_ask,
             get_orderbook_depth,
             get_token_ids,
+            token_ids_from_row as _token_ids_from_row,
         )
 
         async with async_session() as session:
@@ -1768,7 +1791,12 @@ async def job_fast_lock_poll() -> None:
                     if decision.side is None or decision.direction is None:
                         continue
 
-                    token_ids = await get_token_ids(market.id)
+                    # Row-cached IDs first: a Gamma round-trip per market per 10s
+                    # tick was the dominant fast-poll latency cost, and the poll
+                    # was overrunning its interval (ticks dropped with "maximum
+                    # number of running instances reached"). bucket_overshoot is a
+                    # seconds-scale race, so that lag is pure EV decay.
+                    token_ids = _token_ids_from_row(market) or await get_token_ids(market.id)
                     if not token_ids:
                         logger.info(
                             "[fast-poll %s] lock %s on %s but no token IDs",

@@ -117,6 +117,7 @@ async def _invoke(
     yes_bid: float | None = None,
     yes_ask: float | None = None,
     alerter: MagicMock | None = None,
+    token_ids: tuple[str, str] | None = ("yes_token", "no_token"),
 ) -> tuple[float | None, dict]:
     """Drive ``try_lock_rule_trade`` with every collaborator stubbed.
 
@@ -167,7 +168,7 @@ async def _invoke(
             market=market,
             state=state,
             yes_price=yes_price,
-            token_ids=("yes_token", "no_token"),
+            token_ids=token_ids,
             yes_depth=yes_depth,
             end_time=market.end_date,
             bankroll=bankroll,
@@ -473,6 +474,38 @@ async def test_no_side_uses_no_token_depth_lookup():
     assert result is not None and result > 0
     # NO-side depth was fetched via the orderbook for the NO token.
     c["get_orderbook_depth"].assert_called_once_with("no_token", 0.9)
+
+
+@pytest.mark.asyncio
+async def test_missing_token_ids_rejects_explicitly_and_never_probes_depth():
+    """No token IDs → reject with a *named* reason, not a phantom depth failure.
+
+    Regression for 2026-07-14. The unified pipeline ran the lock path whenever
+    `price > 0` without requiring token_ids. With token_ids=None the executor
+    fell through to `buy_depth = 0.0`, so the trade died on "depth $0 < $10" —
+    while `effective_price` had been derived from `market.current_yes_price`,
+    the *stale* Gamma snapshot. Gamma keeps quoting the pre-move price through
+    the post-METAR repricing window, so a dying YES bucket still looked
+    expensive and NO looked cheap: evaluation_logs filled with NO costs of
+    0.11-0.93 that never existed on the book (the live CLOB was at 0.91+).
+    Only the accidental depth-0 veto kept us from betting fictional prices.
+    """
+    result, c = await _invoke(
+        decision=_no_decision(),
+        yes_price=0.295,          # the STALE Gamma price
+        yes_bid=None,             # no live quote — that's the whole point
+        token_ids=None,
+    )
+
+    assert result == 0.0
+    # Never probe a book we have no token for.
+    c["get_orderbook_depth"].assert_not_called()
+    # And never place an order off a stale price.
+    c["place_order"].assert_not_called()
+
+    reason = c["log_evaluation"].await_args.kwargs["reject_reason"]
+    assert "token" in reason.lower()
+    assert "depth" not in reason.lower()  # must not masquerade as a depth veto
 
 
 @pytest.mark.asyncio
