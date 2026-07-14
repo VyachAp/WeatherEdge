@@ -1496,3 +1496,51 @@ median-based exclusion. What this map *does* change:
    opportunity set at 1-min ingestion). A multi-provider racer was already measured and rejected
    (AWC and NOAA share an upstream feed), so the open question is whether a genuinely different
    source exists for the slow stations — regional met service, SYNOP, direct station feed.
+
+### §5 addendum 9 — the instrument is now DURABLE (a log line is not an instrument)
+
+`lock_unexecutable` was shipped as a **log event** — and prod log volume rotates the tail within
+minutes. Two consecutive `doctl apps logs --tail 3000` calls returned **disjoint** windows: one
+showed 81 events, the next showed zero. The single most important number in the project was being
+written to a buffer that throws it away, and the nightly analyst reading it days later would have
+found nothing.
+
+Fixed (`34a642a`): the fast-poll fresh-kill path now also writes a `metar_reprice_snapshots` row
+with **`yes_bid IS NULL`** — which reads exactly as *"a lock fired here and the book was empty"* —
+carrying station, market, `metar_observed_at` and `seconds_since_obs`. No migration (all those
+columns were already nullable).
+
+**THE KILL CRITERION — run this in a few days:**
+
+```sql
+-- Empty-book locks: were any of them FRESH kills on a FAST station?
+SELECT s.station_icao,
+       count(*)                                             AS empty_book_locks,
+       count(*) FILTER (WHERE s.seconds_since_obs < 180)    AS fresh_and_unbuyable,
+       round(min(s.seconds_since_obs)/60.0, 1)              AS min_age_min
+FROM metar_reprice_snapshots s
+WHERE s.yes_bid IS NULL                 -- the empty-book marker
+  AND s.created_at > '2026-07-14'
+GROUP BY 1
+ORDER BY 3 DESC;
+```
+
+- `fresh_and_unbuyable > 0` **on a fast station** (`SBGR, OEJN, WSSS, MMMX, OPKC, EFHK` — see
+  addendum 8) ⇒ the bucket is *already unbuyable within 3 minutes* even where we beat the reprice
+  ⇒ **the edge is a mirage at any latency. Stop paying for it.**
+- All-stale (as observed so far: **0 of 81 fresh, min age 458s**) ⇒ thesis intact; the empty book
+  is just the post-collapse state, and the lever remains **ingestion lag**.
+
+And the positive side of the same question:
+
+```sql
+-- Fresh kills that DID have a live book: the actual opportunity set.
+SELECT station_icao, round(seconds_since_obs) age_s,
+       round((1 - yes_bid)::numeric, 3) AS no_cost, depth_no_usd
+FROM metar_reprice_snapshots
+WHERE yes_bid IS NOT NULL AND depth_no_usd IS NOT NULL   -- fast-poll T0 rows
+  AND created_at > '2026-07-14'
+ORDER BY created_at DESC;
+```
+`no_cost <= 0.93` AND `depth_no_usd >= 10` on a fast station = a bet we should have taken.
+Cross-check against `evaluation_logs` (`signal_kind='lock'`, `depth_usd IS NOT NULL`) and `trades`.
