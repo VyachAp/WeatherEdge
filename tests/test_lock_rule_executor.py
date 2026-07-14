@@ -118,6 +118,7 @@ async def _invoke(
     yes_ask: float | None = None,
     alerter: MagicMock | None = None,
     token_ids: tuple[str, str] | None = ("yes_token", "no_token"),
+    live_quote: bool = True,
 ) -> tuple[float | None, dict]:
     """Drive ``try_lock_rule_trade`` with every collaborator stubbed.
 
@@ -178,6 +179,7 @@ async def _invoke(
             icao="KPHX",
             yes_bid=yes_bid,
             yes_ask=yes_ask,
+            live_quote=live_quote,
         )
     return result, captures
 
@@ -474,6 +476,35 @@ async def test_no_side_uses_no_token_depth_lookup():
     assert result is not None and result > 0
     # NO-side depth was fetched via the orderbook for the NO token.
     c["get_orderbook_depth"].assert_called_once_with("no_token", 0.9)
+
+
+@pytest.mark.asyncio
+async def test_no_live_quote_is_counted_not_silently_skipped():
+    """An empty/one-sided book must be REPORTED, never priced off `yes_price`.
+
+    A long-dead bucket has no YES bids left, and by the CLOB mirror invariant
+    (YES.bid + NO.ask = 1) that means no NO asks either — there is nothing to
+    buy at any price. `get_best_bid_ask` returns None on a one-sided book, and
+    the old code then fell back to `market.current_yes_price` (the STALE Gamma
+    snapshot) and invented a tradeable-looking price.
+
+    We must (a) never place an order, (b) never write a priced EvaluationLog row,
+    and (c) still emit telemetry — otherwise "no opportunity existed" and "an
+    opportunity existed but was unbuyable" are indistinguishable, and that is
+    the measurement that decides whether bucket_overshoot is executable at all.
+    """
+    result, c = await _invoke(
+        decision=_no_decision(),
+        yes_price=0.295,        # the stale Gamma price — must NOT be used
+        live_quote=False,
+    )
+
+    assert result == 0.0
+    c["place_order"].assert_not_called()
+    c["get_orderbook_depth"].assert_not_called()
+    # No priced row: market_prob/edge are NOT NULL, and inventing a price here
+    # is exactly the stale-Gamma bug. Telemetry goes to the log instead.
+    c["log_evaluation"].assert_not_awaited()
 
 
 @pytest.mark.asyncio

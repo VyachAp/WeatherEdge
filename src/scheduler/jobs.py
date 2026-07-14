@@ -426,13 +426,24 @@ async def job_unified_pipeline() -> None:
                     # so only the depth filter stopped us betting at prices that
                     # did not exist. Require the live quote instead of relying on
                     # that accident. See the "Gamma snapshot is STALE" gotcha.
+                    # NOTE: deliberately NOT gated on `live_price is not None`.
+                    # A missing quote means an empty/one-sided book, and we need
+                    # to COUNT those (the executor emits `lock_unexecutable`)
+                    # rather than skip them silently — otherwise "no opportunity
+                    # existed" and "an opportunity existed but was unbuyable"
+                    # look identical, and that distinction decides whether this
+                    # edge is executable at all. `live_quote=False` makes the
+                    # executor refuse to price off the stale `price` fallback.
                     if (
                         settings.LOCK_RULE_ENABLED
                         and _is_binary_market(market)
                         and token_ids
-                        and live_price is not None
-                        and price > 0
                     ):
+                        _obs_age = None
+                        if state.routine_history:
+                            _obs_age = (
+                                now_utc - state.routine_history[-1][0]
+                            ).total_seconds()
                         lock_executed = await _try_lock_rule_trade(
                             session=session, market=market, state=state,
                             yes_price=price, token_ids=token_ids,
@@ -440,6 +451,8 @@ async def job_unified_pipeline() -> None:
                             bankroll=bankroll, exposure=exposure,
                             monitor=monitor, alerter=alerter, icao=icao,
                             yes_bid=yes_bid, yes_ask=yes_ask,
+                            live_quote=live_price is not None and price > 0,
+                            seconds_since_obs=_obs_age,
                         )
                         if lock_executed is not None:
                             if lock_executed:
@@ -1804,11 +1817,31 @@ async def job_fast_lock_poll() -> None:
                         )
                         continue
 
+                    # This is the fresh-kill path — the ONLY moment the
+                    # bucket_overshoot edge is buyable. A None quote here means
+                    # the book is already empty/one-sided (no YES bids ⇒, by the
+                    # CLOB mirror invariant, no NO asks ⇒ nothing to buy). Count
+                    # it with `seconds_since_obs` instead of skipping silently:
+                    # if even fresh kills always show an empty book, the edge is
+                    # unexecutable at any latency. See `lock_unexecutable` in
+                    # lock_rule_executor.
                     quote = get_best_bid_ask(token_ids[0])
+                    obs_age = (now_utc - latest_obs["observed_at"]).total_seconds()
                     if quote is None:
                         logger.info(
-                            "[fast-poll %s] lock %s on %s but no price",
-                            icao, decision.side, market.id[:12],
+                            "[fast-poll %s] lock_unexecutable %s %s [%s]: "
+                            "empty/one-sided book %.0fs after obs",
+                            icao, decision.side, market.id[:12], decision.branch,
+                            obs_age,
+                            extra={
+                                "event": "lock_unexecutable",
+                                "icao": icao,
+                                "market_id": market.id,
+                                "lock_branch": decision.branch,
+                                "side": decision.side,
+                                "seconds_since_obs": obs_age,
+                                "source": "fast_poll",
+                            },
                         )
                         continue
                     yes_bid, yes_ask = quote
@@ -1859,6 +1892,7 @@ async def job_fast_lock_poll() -> None:
                         bankroll=bankroll, exposure=exposure,
                         monitor=monitor, alerter=alerter, icao=icao,
                         yes_bid=yes_bid, yes_ask=yes_ask,
+                        seconds_since_obs=obs_age,
                     )
                     if stake is None:
                         continue

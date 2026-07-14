@@ -95,6 +95,8 @@ async def try_lock_rule_trade(
     icao: str,
     yes_bid: float | None = None,
     yes_ask: float | None = None,
+    live_quote: bool = True,
+    seconds_since_obs: float | None = None,
 ) -> float | None:
     """Evaluate lock-rule conditions and place order if triggered.
 
@@ -104,6 +106,11 @@ async def try_lock_rule_trade(
     ``yes_price``. This prevents a wide post-move spread from making a
     locked market look mid-priced and slipping through the
     ``LOCK_RULE_MAX_PRICE`` guard.
+
+    ``live_quote``: False when ``get_best_bid_ask`` returned None — i.e. the
+    book is one-sided or empty, so there is no executable price. We refuse to
+    price off ``yes_price`` in that case (it would be the stale Gamma snapshot)
+    and emit the ``lock_unexecutable`` telemetry line instead.
     """
     # Local import: avoids circular ``edge_calculator`` → ``binary_market``
     # → polymarket-parser cycle at module load.
@@ -114,6 +121,35 @@ async def try_lock_rule_trade(
         # No lock fired — nothing to log; the probability path will emit
         # its own EvaluationLog row for this market on this tick.
         return None
+
+    # A lock fired but the book is empty/one-sided, so nothing is buyable.
+    # This is the NORMAL state of a long-dead bucket: once it is worthless the
+    # YES bids vanish, and by the CLOB mirror invariant (YES.bid + NO.ask = 1)
+    # no YES bids means no NO asks — nobody sells a certain $1 for less.
+    # We cannot write an EvaluationLog row (market_prob/edge are NOT NULL and
+    # inventing a price is precisely the stale-Gamma bug this replaced), so
+    # emit structured telemetry instead. THIS IS THE DECISIVE MEASUREMENT for
+    # whether bucket_overshoot is executable at all: grep `lock_unexecutable`
+    # and compare `seconds_since_obs` against the fills. If even *fresh* kills
+    # (low seconds_since_obs) always show an empty book, the edge does not
+    # exist at any latency and the 07-10 study — which priced candidates off
+    # CLOB prices-history (trades/mids), not resting offers — was measuring a
+    # price that was never executable.
+    if not live_quote:
+        logger.info(
+            "[%s] lock_unexecutable %s %s [%s]: empty/one-sided book, nothing to buy",
+            icao, decision.side, market.id[:12], decision.branch,
+            extra={
+                "event": "lock_unexecutable",
+                "icao": icao,
+                "market_id": market.id,
+                "lock_branch": decision.branch,
+                "side": decision.side,
+                "routine_count": decision.routine_count,
+                "seconds_since_obs": seconds_since_obs,
+            },
+        )
+        return 0.0
 
     # Effective price needs to land before has_active_trade so the
     # EvaluationLog row carries the actual market_prob even on early
