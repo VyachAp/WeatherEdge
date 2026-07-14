@@ -1156,3 +1156,42 @@ Only then consider `BUCKET_OVERSHOOT_MAX_COST`. Certainty math: EV/$1 = p/c − 
 trusted-station violation rate (p≈0.9992) c=0.96 → +4.1%, c=0.98 → +2.0%, c=0.99 → +0.9% — all
 positive but thin, and thin margins are where resolver divergence and slippage bite.
 **Prefer winning the race over paying up.**
+
+### §5 addendum (same day, post-deploy) — the constraint is BOOK EXISTENCE, not price
+
+Verified against live CLOB books for ZGGG's dead buckets (running max 89.6°F / 32°C):
+
+```
+"…Guangzhou be 25°C"   YES book: bids=0  asks=58    NO book: asks=0
+"…Guangzhou be 26°C"   YES book: bids=0  asks=59    NO book: asks=0
+"…Guangzhou be 27°C"   YES book: bids=0  asks=75    NO book: asks=0
+"…Guangzhou be 28°C"   YES book: bids=0  asks=86    NO book: asks=0
+```
+
+`evaluate_lock` fires `bucket_overshoot` on all of them (rc=28 — the rule is healthy). But the
+YES book has **zero bids** (only holders dumping worthless YES), and by the binary-CLOB mirror
+invariant *no YES bids ⇔ no NO asks*: **there is nothing to buy.** Nobody sells you a certain
+$1 for less. `get_best_bid_ask` correctly returns None on a one-sided book (`if not bids or not
+asks`), so the new live-quote gate skips them — that is not a regression, it is the truth.
+
+**Three consequences, and they redirect the whole strategy:**
+
+1. **This is the final proof the pre-07-14 "cheap" rows were fiction.** The old code computed a
+   NO cost of "0.705" from the stale Gamma price for markets whose NO book is *empty*. There
+   was never anything to buy at 0.705 — or at any price.
+2. **Raising `BUCKET_OVERSHOOT_MAX_COST` is a DEAD END. Do not propose it.** The binding
+   constraint is not the price being too high; it is that no offer exists at all. A higher cap
+   buys nothing when the book is empty. (Supersedes the "consider raising MAX_COST" line in the
+   §5 main entry above.)
+3. **Latency is the ONLY lever, and now the *only* remaining one.** The single tradeable moment
+   is the ~2-min window after the METAR, while the NO offers are still standing — exactly the
+   window the 07-10 study measured (market collapses at median 2.07 min; we saw the data at
+   2.70 min). Everything that shortens time-to-decision is +EV; nothing else moves this edge.
+
+**Therefore the next lever is INGESTION lag, not decision lag.** Decision lag is now ~2.8s/tick
+(was ~24s). The remaining ~2.7 min is dominated by **METAR publication** (AWC per-station floor:
+WSSS 1.1min, OPKC 1.7, VILK 2.8, WMKK 8.7 — §5 07-10). The 07-10 study also found that cutting
+ingestion lag to 1 min would **5× the opportunity set (136 → 682 bets)**. A provider racer was
+already measured and REJECTED (AWC and NOAA are the same upstream feed). So the open question
+is whether *any* faster source of the routine METAR exists (direct station feed / regional
+met-service / SYNOP), not whether we poll harder.
