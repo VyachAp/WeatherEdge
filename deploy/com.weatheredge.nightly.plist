@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Nightly orchestrator (LaunchAgent, runs as the logged-in user so it inherits
+  the keychain/network the interactive CLI uses).
+
+  Install:
+    cp deploy/com.weatheredge.nightly.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.weatheredge.nightly.plist
+  Trigger once to test:
+    launchctl start com.weatheredge.nightly
+  Remove:
+    launchctl unload ~/Library/LaunchAgents/com.weatheredge.nightly.plist
+
+  Time is LOCAL. 02:00 is a safe late-night slot; the agent self-regenerates its
+  own digests (perf-review --json --no-push), so it does NOT need to run right
+  after the 22:xx-UTC settlement jobs.
+
+  CAVEAT: launchd will NOT wake a sleeping Mac. Either keep the Mac awake at the
+  scheduled time, or allow scheduled wake:
+    sudo pmset repeat wakeorpoweron MTWRFSU 01:55:00
+  A missed run (asleep) fires at next wake because RunAtLoad-on-miss is handled
+  by launchd for calendar jobs on modern macOS; verify with `log show`.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.weatheredge.nightly</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/viacheslav.apasov/Business/WeatherEdge/scripts/nightly_agent.sh</string>
+  </array>
+
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key><integer>2</integer>
+    <key>Minute</key><integer>0</integer>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <false/>
+
+  <key>StandardOutPath</key>
+  <string>/Users/viacheslav.apasov/Business/WeatherEdge/runtime/nightly_launchd.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/viacheslav.apasov/Business/WeatherEdge/runtime/nightly_launchd.err.log</string>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/viacheslav.apasov/Business/WeatherEdge</string>
+</dict>
+</plist>

@@ -1,0 +1,64 @@
+{
+  "//": "Scoped settings for the UNATTENDED nightly orchestrator ONLY (scripts/nightly_agent.sh runs `claude --settings scripts/nightly_agent.settings.json`). NOT the repo's interactive settings, so these rules never affect normal development. Three layers of propose-only guardrail: (1) permissions.deny hard-blocks .env/src/alembic writes + mutating commands (deny outranks allow, and applies without a bypass flag); (2) permissions.allow is the read-only + docs/memory-write surface the agent needs (anything not allowed is denied in non-bypass headless mode); (3) a PreToolUse deny-hook as defense-in-depth for compound Bash commands the prefix matcher can miss. Run WITHOUT --dangerously-skip-permissions so deny rules are honored.",
+  "permissions": {
+    "deny": [
+      "Edit(./.env)",
+      "Write(./.env)",
+      "Edit(./.env.*)",
+      "Write(./.env.*)",
+      "Edit(./src/**)",
+      "Write(./src/**)",
+      "Edit(./alembic/**)",
+      "Write(./alembic/**)"
+    ],
+    "allow": [
+      "Read",
+      "Grep",
+      "Glob",
+      "Edit(./docs/**)",
+      "Write(./docs/**)",
+      "Edit(//Users/viacheslav.apasov/.claude/projects/-Users-viacheslav-apasov-Business-WeatherEdge/memory/**)",
+      "Write(//Users/viacheslav.apasov/.claude/projects/-Users-viacheslav-apasov-Business-WeatherEdge/memory/**)",
+      "Bash(python -m src.cli:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git status:*)",
+      "Bash(git show:*)",
+      "Bash(cat:*)",
+      "Bash(ls:*)",
+      "Bash(grep:*)",
+      "Bash(rg:*)",
+      "Bash(jq:*)",
+      "Bash(head:*)",
+      "Bash(tail:*)",
+      "Bash(wc:*)",
+      "Bash(echo:*)",
+      "Bash(sort:*)",
+      "Bash(uniq:*)",
+      "Bash(awk:*)",
+      "Bash(sed:*)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Write|Edit|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "jq -c 'if ((.tool_input.file_path // \"\") | test(\"(^|/)src/|(^|/)\\\\.env($|\\\\.)|(^|/)alembic/\")) then {hookSpecificOutput:{hookEventName:\"PreToolUse\",permissionDecision:\"deny\",permissionDecisionReason:\"Propose-only nightly agent: writing .env, src/, or alembic/ is forbidden. Draft the change in docs/ instead.\"}} else empty end' 2>/dev/null || true"
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "jq -c 'if ((.tool_input.command // \"\") | test(\"src\\\\.cli[[:space:]]+(bet|admin)|reconcile-stuck|redeem|--full-scan|AUTO_EXECUTE=true|(>|>>)[[:space:]]*\\\\.env|(>|>>)[[:space:]]*src/|(>|>>)[[:space:]]*alembic/|alembic[[:space:]]+upgrade|git[[:space:]]+(commit|push|add|reset|checkout)\")) then {hookSpecificOutput:{hookEventName:\"PreToolUse\",permissionDecision:\"deny\",permissionDecisionReason:\"Propose-only nightly agent: mutating trades/config/migrations/git is forbidden. Read-only reports + perf-propose-push + docs/memory writes only.\"}} else empty end' 2>/dev/null || true"
+          }
+        ]
+      }
+    ]
+  }
+}
