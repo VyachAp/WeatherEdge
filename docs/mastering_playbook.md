@@ -1235,3 +1235,49 @@ doctl apps logs <app> scheduler --type run --tail 5000 | grep lock_unexecutable
 
 **Do not tune anything until this resolves.** It is now the single highest-value unknown in the
 project — it decides whether the one surviving edge exists.
+
+### §5 addendum 3 — RESOLVED: the edge IS priced-tradeable at fresh kill (~13%). Depth is the last unknown.
+
+Addendum 2's "is this a mirage?" fear was based on n=8 and is **REFUTED**. Measured over 20 days
+using the bot's OWN live CLOB quotes from `metar_reprice_snapshots` (corr 0.974 with the book —
+NOT Gamma), 9,935 dead-bucket observations on trusted stations, dead-ness computed with the real
+`market_range_f` + °C/°F step:
+
+| age since METAR | n | mean live NO cost | min | **≤0.93 (tradeable)** |
+|---|---|---|---|---|
+| **<3 min (fresh kill)** | **184** | **0.9671** | 0.510 | **24 (13.0%)** |
+| 3-10 min | 658 | 0.9949 | 0.510 | 8 |
+| 10-30 min | 5,089 | 0.9973 | 0.520 | 25 |
+| 30-60 min | 3,311 | 0.9918 | 0.370 | 86 |
+| >60 min | 693 | 0.9705 | 0.520 | 77 |
+| **overall** | **9,935** | 0.9929 | — | 220 (2.2%) |
+
+**The fresh-kill band has the LOWEST mean cost** — the market genuinely has not repriced yet.
+So the thesis holds: **the edge is real, it is buyable ~13% of the time, and only inside the
+window the 07-14 latency fix made reachable.** The 66/66 empty books seen at 03:55 UTC were all
+*long-dead* buckets, correctly skipped — not evidence against the edge.
+
+**New, actionable:** every one of the 24 tradeable fresh kills was a **European** station —
+EDDM (Munich ×9), EFHK (Helsinki ×5), EHAM (Amsterdam ×3), LTFM (Istanbul ×2), LIMC (Milan) —
+none from the Asian stations that dominate our lock volume. European books are thinner and slower
+to reprice. **Before sizing up there, check divergence *variance* per §5 07-10** (mean is not the
+risk; EGLL is already excluded for exactly this reason, and EHAM is the σ-collapse station).
+
+**THE LAST UNKNOWN — depth.** A cheap NO *price* is worthless without a resting NO *size*, and
+**NO-side depth is recorded nowhere**: `metar_reprice_snapshots.depth_no_usd` is NULL in all
+859,455 rows (the writer only passes `depth_yes_usd`), and `shadow_ledger` has no such column at
+all (`jobs.py:580` computes `_no_depth_for_market()` for `record_shadow_decision`, which never
+persists it). So history cannot answer it.
+
+It resolves itself from here: the executor probes the NO book at the true NO ask for any candidate
+that clears the 0.93 cost gate and writes it to `evaluation_logs.depth_usd`. **Read it in a few
+days:**
+```sql
+SELECT round(market_prob::numeric,2) no_cost, depth_usd, passes, reject_reason
+FROM evaluation_logs
+WHERE signal_kind='lock' AND direction='BUY_NO'
+  AND depth_usd IS NOT NULL AND created_at > '2026-07-14'
+ORDER BY created_at DESC;
+```
+- depth ≥ `MIN_DEPTH_USD` on the cheap candidates ⇒ **the edge is real and fillable — scale it.**
+- depth ~0 ⇒ the cheap prices are dust quotes; the edge is unfillable and we stop paying for it.
