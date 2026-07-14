@@ -1630,3 +1630,40 @@ the thesis the whole `bucket_overshoot` programme rests on, and it is cheap to s
 measurement.* I built the kill criterion, it returned a clean "thesis intact", and it was
 measuring the wrong variable. Same family as the `yaml.safe_load` key artifact and the epsilon
 hypothesis "refuted" against stale-Gamma rows.
+
+### §5 addendum 12 — ✅ DEFINITIVE: the edge is REAL and speed is worth 5×. (Addendum 11's alarm was noise.)
+
+Addendum 11 raised the alarm on **n=3**. That was premature. Redone properly on 20 days, with the
+**corrected** fresh-kill discriminator (overshoot ≤ 1.8°F, *not* METAR age) **cross-tabbed against
+quote freshness** — because a "fresh kill" observed through a 5-min unified tick is priced with a
+5-min-old quote, which is exactly the confound that produced the wrong answer twice:
+
+| quote age at a **TRUE** fresh kill | n | empty book | mean NO cost | **buyable ≤ 0.93** |
+|---|---|---|---|---|
+| **< 3 min — what the latency fix now gives us** | 115 | 3 (2.6%) | **0.974** | **13 → 11.3%** |
+| 3-10 min | 379 | 4 | 0.992 | 8 → 2.1% |
+| > 10 min | 4,731 | 0 | 0.993 | 97 → 2.1% |
+
+**1. The market does NOT front-run the kill.** Only **2.6%** of true fresh kills have an empty
+book (and 0.13% across all 5,225 true fresh kills). The 3 empty books in addendum 11 were an
+unlucky micro-sample. **Hypothesis refuted.**
+
+**2. The edge is REAL.** With a fresh kill *and* a fresh quote, **11.3%** of dead buckets are
+buyable at ≤ 0.93, at a mean NO cost of **0.974**.
+
+**3. Speed is worth 5×.** 11.3% buyable inside 3 minutes vs **2.1%** after. This is the first
+uncontaminated measurement of the core thesis, and it says the entire 2026-07-14 latency programme
+(tick 24s → 2.8s, dropped ticks 63% → 0%) buys a **5× larger opportunity set** — and that the
+station speed map (addendum 8) is the right next lever, because only 6 stations can put us in the
+<3 min cell at all.
+
+**Superseded:** the earlier "13% buyable at fresh kill" (addendum 3) split on METAR age and was
+wrong-by-luck; the corrected figure for the same cell is **11.3%** — materially the same
+conclusion, now for the right reason. The "2.3% overall" figure is the *unconditional* rate across
+all fresh kills regardless of quote age, and it is the number to beat.
+
+**I was wrong twice today on this exact question** — once reassuring ("0/81 fresh, thesis intact",
+on a criterion that measured the wrong variable), once alarming ("mirage", on n=3). Both errors had
+the same root: **believing an instrument I had not verified.** The rule stands: *verify the
+measuring device before acting on the measurement* — and when a result is decision-changing, find
+the confound before you write the conclusion.
