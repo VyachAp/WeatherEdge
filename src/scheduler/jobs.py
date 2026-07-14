@@ -1864,10 +1864,24 @@ async def job_fast_lock_poll() -> None:
                     # free. obs_fraction is left None here (the minimal fast-poll
                     # state has no forecast); the unified-tick rows for the same
                     # metar_observed_at carry it. Best-effort, gated.
+                    #
+                    # `depth_no_usd` matters more than anything else here: a
+                    # bucket_overshoot bet is a BUY_NO, so the NO-side resting size
+                    # at the moment of the kill is what decides whether the edge is
+                    # fillable — and it was previously stored NOWHERE (NULL in all
+                    # 859k reprice rows; shadow_ledger has no such column). Probe at
+                    # the true NO ask (1-yes_bid), never the mid. Not an extra CLOB
+                    # call in practice: the executor probes the same NO book moments
+                    # later and hits the 30s orderbook cache.
                     if settings.REPRICE_SNAPSHOT_ENABLED:
                         try:
                             from src.signals.reprice_snapshot import record_reprice_snapshot
                             obs_at = latest_obs["observed_at"]
+                            no_depth = None
+                            if yes_bid is not None and yes_bid > 0:
+                                no_depth = get_orderbook_depth(
+                                    token_ids[1], max(0.001, 1.0 - yes_bid),
+                                )
                             await record_reprice_snapshot(
                                 session,
                                 market_id=market.id,
@@ -1879,6 +1893,7 @@ async def job_fast_lock_poll() -> None:
                                 yes_ask=yes_ask,
                                 yes_mid=yes_price,
                                 depth_yes_usd=yes_depth,
+                                depth_no_usd=no_depth,
                                 minutes_to_close=(end_time - now_utc).total_seconds() / 60.0,
                                 seconds_since_obs=(now_utc - obs_at).total_seconds(),
                             )
