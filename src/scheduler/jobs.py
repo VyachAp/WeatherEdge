@@ -1843,6 +1843,39 @@ async def job_fast_lock_poll() -> None:
                                 "source": "fast_poll",
                             },
                         )
+                        # ...and persist it. The log line alone is NOT an instrument:
+                        # prod log volume rotates the tail within minutes (two
+                        # consecutive `doctl apps logs` calls already returned
+                        # disjoint windows), so a reader looking days later — the
+                        # nightly analyst — finds nothing. This is the measurement
+                        # that decides whether the edge is executable at all, so it
+                        # has to be durable.
+                        #
+                        # A reprice row with `yes_bid IS NULL` means exactly "a lock
+                        # fired here and the book was empty", and it already carries
+                        # station + market + metar_observed_at + seconds_since_obs.
+                        # Query: empty-book locks bucketed by seconds_since_obs —
+                        # fresh kills (low age) that are ALREADY unbuyable would kill
+                        # the thesis; only stale ones (as seen so far) leave it intact.
+                        if settings.REPRICE_SNAPSHOT_ENABLED:
+                            try:
+                                from src.signals.reprice_snapshot import (
+                                    record_reprice_snapshot,
+                                )
+                                await record_reprice_snapshot(
+                                    session,
+                                    market_id=market.id,
+                                    station_icao=icao,
+                                    metar_observed_at=latest_obs["observed_at"],
+                                    new_obs_temp_f=latest_obs.get("temp_f"),
+                                    new_observed_max_f=state.current_max_f,
+                                    yes_bid=None,          # <- the empty-book marker
+                                    yes_ask=None,
+                                    yes_mid=None,
+                                    seconds_since_obs=obs_age,
+                                )
+                            except Exception:
+                                pass
                         continue
                     yes_bid, yes_ask = quote
                     yes_price = (yes_bid + yes_ask) / 2
