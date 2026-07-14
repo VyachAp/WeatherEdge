@@ -1195,3 +1195,43 @@ ingestion lag to 1 min would **5× the opportunity set (136 → 682 bets)**. A p
 already measured and REJECTED (AWC and NOAA are the same upstream feed). So the open question
 is whether *any* faster source of the routine METAR exists (direct station feed / regional
 met-service / SYNOP), not whether we poll harder.
+
+### §5 addendum 2 — OPEN RISK: is `bucket_overshoot` executable at all?
+
+The dead-bucket book finding above cuts deeper than "don't raise MAX_COST". It puts a crack in
+the study that valued this edge in the first place.
+
+**The 07-10 study priced 3,580 rule-triggered candidates off `clob.polymarket.com/prices-history`
+(1-min fidelity) and concluded EV +0.91/$1.** But prices-history reports **trades / mid-prices —
+not the existence of a resting NO offer we could actually hit.** A price series can keep printing
+0.90 for a bucket whose NO book has **zero asks**. We have now confirmed that dead buckets end up
+in exactly that state (ZGGG: YES bids=0, asks=58-86; NO asks=0), and a full scan of every station
+returned **66 lock fires / 66 empty books / 0 executable**.
+
+So the thesis has a load-bearing, still-unverified assumption:
+
+> **In the ~2-min window between the METAR and the market's repricing, does the NO book still
+> carry resting asks we can lift?**
+
+If YES → the edge is real, latency is the only lever, and the 07-14 fixes (24s → 2.8s tick) are
+exactly right. If NO → the edge is a **mirage**: the price we "would have paid" in the backtest
+was never buyable, and no amount of speed helps. This would also retro-explain why
+`bucket_overshoot` has fired **zero** trades since going live on 07-10 despite being enabled.
+
+**The instrument (shipped `0dead84`):** a structured `lock_unexecutable` event
+(`icao, market_id, lock_branch, side, seconds_since_obs, source`) fires whenever a lock fires but
+`get_best_bid_ask` returns None. It cannot be an `EvaluationLog` row — `market_prob`/`edge` are
+NOT NULL and inventing a price is the exact stale-Gamma bug we just removed.
+
+**How to read it (do this in a few days):**
+```bash
+doctl apps logs <app> scheduler --type run --tail 5000 | grep lock_unexecutable
+# bucket by seconds_since_obs; compare with the executed lock evals
+# (evaluation_logs: signal_kind='lock' AND depth_usd IS NOT NULL, created_at > 2026-07-14)
+```
+- Fresh kills (**low** `seconds_since_obs`) with **live** books ⇒ edge real, keep cutting latency.
+- Fresh kills with **empty** books ⇒ **edge is a mirage — stop paying for it** and re-open the
+  "is there any edge at all?" fork in the playbook header.
+
+**Do not tune anything until this resolves.** It is now the single highest-value unknown in the
+project — it decides whether the one surviving edge exists.
