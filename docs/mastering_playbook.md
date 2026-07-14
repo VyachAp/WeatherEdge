@@ -1667,3 +1667,45 @@ on a criterion that measured the wrong variable), once alarming ("mirage", on n=
 the same root: **believing an instrument I had not verified.** The rule stands: *verify the
 measuring device before acting on the measurement* — and when a result is decision-changing, find
 the confound before you write the conclusion.
+
+### §5 addendum 13 — INGESTION LEVER CLOSED: no provider beats AWC. The universe IS the 6 fast stations.
+
+Addendum 8 named ingestion lag as the next lever and asked whether a *genuinely different* METAR
+source exists for the slow stations. **Answer: no — not among the six providers in this codebase.**
+
+**Experiment (2026-07-14, live):** watched a real METAR cycle and recorded when each provider
+FIRST served the new 06:30Z observation.
+
+| station | AWC (current) | NOAA | OGIMET |
+|---|---|---|---|
+| RJTT | **12.7 min** | 13.1 min | not within window |
+| WMKK | **13.1 min** | 13.1 min | not within window |
+
+They arrive **essentially simultaneously** (AWC ahead by 0.4 min), and a snapshot probe showed
+AWC / NOAA / OGIMET returning **identical `observed_at`** for every station. This confirms
+empirically what §5 07-10 asserted: they share an upstream feed. IEM was 30-60 min *behind*
+throughout.
+
+**And the publication lag itself is 8-13 min for these stations** — against a **2.07 min** market
+reprice. The information does not exist anywhere in time. **No amount of engineering on our side
+fixes that.** Switching providers, adding a racer, or polling harder are all dead ends.
+
+**⇒ THE UNIVERSE IS THE 6 FAST STATIONS: `SBGR, OEJN, WSSS, MMMX, OPKC, EFHK`.** That is not a
+limitation to be engineered around — it is the shape of the opportunity. Judge all future
+`bucket_overshoot` volume, fill-rate and PnL against that denominator. The remaining upside is
+(a) making sure we win *every* race on those six (decision lag is now 2.8s, so we do), and
+(b) sizing those wins properly (done: `BUCKET_OVERSHOOT_DEPTH_CAP_PCT`).
+
+**Bonus catch — a data-integrity bug found by this experiment.** OGIMET served `METAR OEJN NIL`
+(station published nothing) and `parse_raw_metar` **fabricated** `observed_at = now()` for it,
+making it look like a 0.0-minute-old observation — briefly appearing to be a provider beating AWC
+by 25 minutes. `observed_at` is load-bearing for this entire edge (`seconds_since_obs`, kill
+freshness, and fast-poll's `_last_routine_seen` watermark), and the OGIMET parser sorts by
+`observed_at` DESC — so the phantom sorted to the FRONT as "the latest METAR" and would have
+pushed the dedup watermark to the present, **suppressing every genuinely new METAR behind it.**
+Fixed (`ee4ae49`): a report with no DDHHMMZ group is NIL or malformed — drop it, never stamp it.
+
+**That is the FOURTH instrument artifact this session** (yaml-hex key, stale-Gamma prices, the
+METAR-age kill criterion, and now a fabricated observation time). Every one of them produced a
+confident, plausible, wrong conclusion. The discipline that caught all four was the same:
+**look at the raw input before believing the derived number.**
