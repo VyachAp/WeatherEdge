@@ -1328,3 +1328,45 @@ the flat lock path uses the hardcoded **0.15** in `size_locked_position`, and
 **Do not flip these blind.** The week's data now has the instrument it needs: `depth_no_usd` is
 recorded at the kill (fast-poll T0, shipped this session) and `evaluation_logs.depth_usd` carries
 the executor's own probe for every candidate clearing the 0.93 gate.
+
+### §5 addendum 5 — two more silent vetoes on the same edge (shipped `ee951c3`)
+
+Chasing "why is the depth cap binding?" surfaced two further throttles, both starving the edge
+of *size* rather than blocking it outright.
+
+**1. FLOAT EPSILON — the third member of the depth-probe bug family.**
+Callers derive the NO buy price as `1.0 - yes_bid`. In IEEE-754 that lands a hair *below* the
+tick the book quotes for ~20% of the 1-cent grid (`1.0 - 0.32 == 0.6799999999999999 < 0.68`).
+`_compute_depth` tested `ask_price <= price`, and asks ascend — so excluding the best ask
+excludes **every** level and depth returns **exactly 0**. `depth >= MIN_DEPTH_USD` then vetoed
+markets with thousands of dollars resting on them.
+
+- Measured live: **36 of 269** tradeable-band markets returned **$0 depth at their own best
+  ask** — several holding **$5k-13k**. After the fix (`+ _PRICE_EPS`, 5e-5): **0 of 267**.
+- **I had already "refuted" this hypothesis earlier in the session** by testing it against
+  `evaluation_logs` — but those were the **stale-Gamma contaminated rows**, synthetic prices
+  that never went through a float subtraction. *A hypothesis tested against a corrupted dataset
+  is not tested.* Re-run it against live quotes.
+- This is the **third** time `_compute_depth` has silently vetoed real liquidity (06-14 mid,
+  06-18 mid, 07-14 epsilon). **RULE: treat any `depth == 0.0` as a suspected bug, not a fact.**
+
+**2. `bucket_overshoot` now probes to `BUCKET_OVERSHOOT_MAX_COST`, not the best ask** — and the
+FAK's `max_slippage_cents` is widened to the same ceiling so the size we measure is the size we
+can take. It is a certainty bet already cost-bounded by the cap, so **every resting level at or
+below it is +EV by construction**; sizing against the top of the book alone left **$664,695** of
+NO liquidity unreachable across 269 markets. Opportunities able to clear `MIN_TRADE_USD`:
+**179/269 → 265/269**.
+
+**Cumulative effect of this session on the edge's size funnel** (bankroll $306, CAUTION 0.5×):
+
+| throttle | before | after |
+|---|---|---|
+| fast-poll ticks reaching the fresh-kill window | 37% (63% dropped) | ~89% |
+| depth probe returns a true value | 87% (36/269 spuriously $0) | 100% |
+| liquidity visible to the sizer | best ask only | every level ≤ 0.93 (+$665k) |
+| opportunities clearing `MIN_TRADE_USD` | 179/269 | **265/269** |
+| lock depth cap | 0.15 (needed depth ≥ $67) | 0.50 |
+
+**Still unmoved:** the stake itself is capped at **$7.65** by `LOCK_POSITION_PCT (5%) × $306 ×
+0.5 (CAUTION)` — depth is no longer the binding arm on any book. Raising *that* is a risk
+decision (the 15.2% drawdown is real, not a stale peak), so it stays with the operator.
