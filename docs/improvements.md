@@ -28,6 +28,31 @@ gotchas, not here.
 
 ---
 
+## [NEXT LEVER] Cut METAR INGESTION lag — decision lag is solved, publication lag is not (2026-07-14)
+
+**Why this is now THE lever:** `bucket_overshoot` is a race. The market collapses a dead bucket at a median **2.07 min** after the observation. Decision lag is fixed (fast-poll tick 24s → 2.8s, dropped ticks 63% → 0%). What remains is **METAR publication/ingestion lag, and it is per-station**. Measured from `metar_observations` (`fetched_at - observed_at`, routine only, 7d, n≥50):
+
+**Only 8 stations have a median lag under the 2.07-min reprice — and 2 are already excluded for divergence:**
+
+| median lag (min) | stations |
+|---|---|
+| **0.5-1.8 ✅ WINNABLE** | **SBGR (0.5), OEJN (1.0), WSSS (1.4), MMMX (1.5), OPKC (1.8), EFHK (1.8)** — plus MPTO (1.1) and LLBG (1.8), both already excluded |
+| 2.7-3.8 marginal | EHAM, VHHH, LFPG, EPWA, RPLL, EDDM |
+| 4.6-8.8 ❌ structurally LOST | VILK, EGLL, **RKSI 4.9**, NZWN, LEMD, RKPK, LTFM, ZBAA, LIMC, ZSPD, **ZGGG 6.0**, ZGSZ, RCTP, **CYYZ 7.9**, **RJTT 8.0**, **WMKK 8.8** |
+
+Our lock volume is dominated by the *lost* set. First live fresh-kill datum: **WMKK, seen 8.6 min after observation, NO already at 0.999 — with $407 of depth.** The book was deep; the price was gone. **No tick speed fixes a 6-minute-old observation.**
+
+**Options, in order of expected value:**
+1. **Find a faster source for the slow stations.** A multi-provider racer was already measured and REJECTED (AWC and NOAA share an upstream feed — §5 07-10), so this means a *genuinely different* source: the national met service's own feed (e.g. CMA for the ZG*/ZS*/ZB* cluster, JMA for RJTT, MD for WMKK), SYNOP, or a direct station/ADDS push rather than polling.
+2. **Accept the 6-station universe** and optimise there (they are already the fastest; nothing to fix).
+3. Do NOT gate the slow stations out: `BUCKET_OVERSHOOT_MAX_COST` already refuses them on price (they cost a few CLOB calls, not EV), and several have a fast *tail* (p10 under 2 min: UUEE 1.2, RPLL 1.2, VHHH 1.8) that a median-based exclusion would discard.
+
+**Measure first:** `metar_observations` gives the lag distribution for free. Per candidate source, the only question that matters is *"does it deliver the routine METAR in under ~2 min?"* — everything else is secondary.
+
+**Caveat:** do NOT compute lag from `metar_reprice_snapshots.seconds_since_obs`; it is written by the 5-min unified tick and bakes in the pipeline cadence (it reported WSSS at 8.5 min vs the true 1.4). Use `metar_observations`.
+
+---
+
 ## [in-flight] Measure bucket_overshoot at REAL prices now that the latency fix has landed (2026-07-14)
 
 **Why:** `bucket_overshoot` — the project's only validated edge — had **never fired a single lock signal** despite being enabled since 07-10. Root cause was not the rule: `job_fast_lock_poll` was dropping **63% of its ticks** (24s of fixed work in a 10s interval, `max_instances=1` ⇒ overruns are dropped, not queued), so the effective poll period was ~27s on an edge whose EV is +0.46/$1 at 0s decision delay and **dead by 60s**. Fixed in `1e766c0` (tick now ~2.8s). Every live-priced candidate we ever saw was ≥0.96 — above `BUCKET_OVERSHOOT_MAX_COST=0.93` — because the market had already collapsed the bucket by the time we acted.
