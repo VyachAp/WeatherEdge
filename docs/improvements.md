@@ -28,6 +28,43 @@ gotchas, not here.
 
 ---
 
+## [in-flight] Measure bucket_overshoot at REAL prices now that the latency fix has landed (2026-07-14)
+
+**Why:** `bucket_overshoot` — the project's only validated edge — had **never fired a single lock signal** despite being enabled since 07-10. Root cause was not the rule: `job_fast_lock_poll` was dropping **63% of its ticks** (24s of fixed work in a 10s interval, `max_instances=1` ⇒ overruns are dropped, not queued), so the effective poll period was ~27s on an edge whose EV is +0.46/$1 at 0s decision delay and **dead by 60s**. Fixed in `1e766c0` (tick now ~2.8s). Every live-priced candidate we ever saw was ≥0.96 — above `BUCKET_OVERSHOOT_MAX_COST=0.93` — because the market had already collapsed the bucket by the time we acted.
+
+**Hypothesis:** with the tick at ~2.8s we should now arrive *before* the collapse and see candidates in the tradeable <0.93 band for the first time.
+
+**Gate / what to measure (do NOT tune anything until this is in):**
+1. `grep -c 'skipped: maximum number of running instances' ` in prod logs → must be **0**. If not, the tick still overruns and nothing below is meaningful.
+2. Distribution of live NO cost at first-fire, from `evaluation_logs` rows **written after 2026-07-14 only** (pre-fix lock rows are stale-Gamma contaminated — see the gotcha in CLAUDE.md; they fabricate a +0.76/$1 phantom edge). Filter: `signal_kind='lock' AND direction='BUY_NO' AND depth_usd IS NOT NULL`.
+3. Actual fills + realised PnL by `lock_branch='bucket_overshoot'`.
+
+**Then, and only then:** decide whether to raise `BUCKET_OVERSHOOT_MAX_COST`. The certainty math says EV/$1 = p/c − 1, so at the trusted-station violation rate (p ≈ 0.9992) c=0.96 is +4.1%, c=0.98 is +2.0%, c=0.99 is +0.9% — all positive but thin, and thin margins are where resolver divergence and slippage bite. Prefer winning the race over paying up.
+
+**Notes:** the 07-10 study (3,580 candidates priced off CLOB 1-min history) found +0.91/$1 *at the bot's true METAR arrival time* — i.e. the edge is real if we are fast. Latency is the lever, not the cap.
+
+---
+
+## [backlog] Open-Meteo is being 429 rate-limited in prod (degenerate forecast states)
+
+**Why:** prod logs (2026-07-13) show sustained `429 Too Many Requests` from `api.open-meteo.com` on BOTH the deterministic and ensemble endpoints, across many stations in the same tick. Each failure degrades `WeatherState` to `has_forecast=False` (`forecast_peak_f = current_max_f`, `σ=None`), which is exactly the degenerate state that has already produced two separate live bugs (the conviction-gate degenerate-state bug, memory `project_conviction_degenerate_state_bug_2026-06-21`, and the probability-path forecast-cool NO cohort that `PROBABILITY_THRESHOLD_NO_REQUIRE_FORECAST` now guards).
+
+**Why it's backlog, not urgent:** `bucket_overshoot` needs **no forecast at all** (it is pure observed-max monotonicity), so the one edge we're actively betting is unaffected. The guards already in place make the degenerate state fail *closed* rather than fire bad trades.
+
+**Fix sketch:** the unified pipeline fetches det + ensemble per station per 5-min tick with `Semaphore(8)` — ~45 stations × 2 endpoints. Add a per-(lat,lon,hour) response cache (the hourly forecast does not change within the hour), and/or back off on 429 instead of retrying. Measure the 429 rate before and after.
+
+---
+
+## [backlog] The probability path is structurally self-blocked (every passing eval sizes to $0)
+
+**Why:** `PROBABILITY_MIN_ENTRY_PRICE=0.80` (live) admits only the near-lock band, but `KELLY_PROB_CAP=0.90` clamps `model_prob` to 0.90 *before* Kelly — so any bet bought above 0.90 has `effective_prob/price − 1 ≤ 0` and sizes to **$0 with reason "no edge"**. Confirmed on live data: every passing probability eval in the last 9 days had `model_prob` 0.95–1.00 at a buy price of 0.85–0.94, and **100% of them ended in `decision_logs` as `stake_below_min`**. The two live settings directly contradict each other: the entry floor admits precisely the band the prob cap forbids.
+
+**Why NOT to "fix" it yet:** `calibration-report` shows the model beats the market in **0 of 5** obs-fraction buckets. Unblocking this would simply increase the volume of bets with no demonstrated edge. `NEAR_LOCK_CONVICTION_SIZING_ENABLED` (the built, rebuilt-safe bypass) exists and is **off** in prod — leaving it off is defensible. Recorded here so the contradiction isn't rediscovered as a "bug" and hastily patched.
+
+**Decide only after:** the shadow/calibration picture changes, or the price-band thesis (`project_price_band_concentration_2026-06-19`) is re-validated on post-07-14 fills.
+
+---
+
 ## [in-flight] Nightly orchestrator agent (stand up the Layer-2/mastering schedule)
 
 **Why:** The perf-review loop below shipped Layer 1 + the Layer-2 analyst prompt,
