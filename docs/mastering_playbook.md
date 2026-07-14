@@ -1447,3 +1447,52 @@ distribution from `metar_reprice_snapshots.seconds_since_obs`, then:
   `BUCKET_OVERSHOOT_EXCLUDED_STATIONS`, but gating on **speed** rather than **divergence**.
 
 Do NOT hand-pick from one datum. WMKK is one snapshot; build the distribution first.
+
+### §5 addendum 8 — THE STATION SPEED MAP: only 6 trusted stations can win the race at all
+
+Measured from `metar_observations` (`fetched_at - observed_at`, routine only, 7d, n=50+ per
+station). **This is the clean instrument** — an earlier attempt using
+`metar_reprice_snapshots.seconds_since_obs` was confounded by the 5-min unified-tick cadence and
+gave WSSS 8.5 min. The clean numbers reproduce the known publication floors (§5 07-10: WSSS 1.1,
+OPKC 1.7, WMKK 8.7 → measured 1.4 / 1.8 / 8.8), so it is trustworthy.
+
+Market collapses a dead bucket at a median **2.07 min** after the observation. Our ingestion lag
+must beat that or the bucket is already priced ~1.00 when we see it.
+
+| median lag | station | status |
+|---|---|---|
+| **0.5** | SBGR | ✅ winnable |
+| **1.0** | OEJN | ✅ winnable |
+| 1.1 | MPTO | ⛔ excluded (divergence 30.8%) |
+| **1.4** | WSSS | ✅ winnable |
+| **1.5** | MMMX | ✅ winnable |
+| **1.8** | OPKC | ✅ winnable |
+| **1.8** | EFHK | ✅ winnable |
+| 1.8 | LLBG | ⛔ excluded (`_EXCLUDED_ICAOS`) |
+| 2.7-3.8 | EHAM, VHHH, LFPG, EPWA, RPLL, EDDM | marginal (p10 sometimes beats it) |
+| 4.6-8.8 | VILK, EGLL, RKSI, NZWN, LEMD, RKPK, LTFM, ZBAA, LIMC, ZSPD, **ZGGG**, ZGSZ, RCTP, **CYYZ**, **RJTT**, **WMKK** | ❌ structurally LOST |
+
+**TRUSTED + WINNABLE SET (6): `SBGR, OEJN, WSSS, MMMX, OPKC, EFHK`.**
+
+**Why this reframes everything:** our lock volume is dominated by Asian stations — ZGGG (6.0),
+RKSI (4.9), RJTT (8.0), ZBAA (5.9), WMKK (8.8) — and **every one of them is structurally lost.**
+We arrive 3-7 minutes after the market repriced. The 24s→2.8s tick fix cannot help a station
+whose data is already 6 minutes old on arrival. This is why the first fresh-kill datum (WMKK,
+8.6 min, NO already at 0.999 with $407 of depth) looked the way it did: **the book was deep, the
+price was gone.**
+
+Note `LOCK_BIG_SIZE_STATIONS = CYYZ,SBGR,RKSI` — two of those three (CYYZ 7.9, RKSI 4.9) are in
+the structurally-lost set. That whitelist was curated on *divergence*, and for any speed-sensitive
+branch it is mostly inert.
+
+**Do NOT rush to gate.** `BUCKET_OVERSHOOT_MAX_COST` already refuses the repriced ones on price,
+so hopeless stations cost only a few CLOB calls, not EV — and several "lost" stations have a p10
+under 2 min (UUEE 1.2, RPLL 1.2, VHHH 1.8), i.e. a real fast tail we'd throw away with a
+median-based exclusion. What this map *does* change:
+1. **Calibrate expectations.** Realistic fill flow comes from **6 stations**, not 45. Judge the
+   coming week's data against that denominator, not the whole universe.
+2. **Where to look.** Any station-level analysis of the edge should start with those six.
+3. **The real lever is now unambiguous: cut INGESTION lag** (§5 07-10 estimated 5× the
+   opportunity set at 1-min ingestion). A multi-provider racer was already measured and rejected
+   (AWC and NOAA share an upstream feed), so the open question is whether a genuinely different
+   source exists for the slow stations — regional met service, SYNOP, direct station feed.
