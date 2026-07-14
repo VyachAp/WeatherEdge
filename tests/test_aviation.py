@@ -8,6 +8,42 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+
+def _local_noon_observations(
+    station: str,
+    offsets_and_temps: list[tuple[int, float]],
+    speci_at_offsets: set[int] | None = None,
+) -> list[dict]:
+    """Build routine observations anchored to LOCAL NOON of the station's
+    current local day.
+
+    `get_routine_daily_max()` (with no `reference_utc`) windows on the LOCAL day
+    containing `now`. Tests that placed observations at `now - Nh` therefore walked
+    into the PREVIOUS local day whenever the suite ran near the station's local
+    midnight — for KPHX (UTC-7) that is 07:00-10:00 UTC, so the suite went red for
+    ~3h every day, squarely across the hours the nightly agent runs.
+
+    Local noon is always inside the window (the filter is
+    `utc_start <= obs_at < utc_end`, with no future-observation guard), so this is
+    deterministic at any wall-clock hour while still exercising the default
+    "reference = now" path.
+    """
+    from src.signals.mapper import icao_timezone
+
+    speci_at_offsets = speci_at_offsets or set()
+    tz = icao_timezone(station)
+    local_noon = datetime.now(timezone.utc).astimezone(tz).replace(
+        hour=12, minute=0, second=0, microsecond=0,
+    )
+    return [
+        {
+            "observed_at": (local_noon + timedelta(hours=off)).astimezone(timezone.utc),
+            "temp_f": temp,
+            "is_speci": off in speci_at_offsets,
+        }
+        for off, temp in offsets_and_temps
+    ]
+
 from src.ingestion.aviation import (
     _c_to_f,
     _find_taf_period,
@@ -857,12 +893,16 @@ class TestGetRoutineDailyMax:
         preserving the pre-fix behavior for intra-day callers."""
         from src.ingestion.aviation import get_routine_daily_max
 
-        now = datetime.now(timezone.utc)
-        mock_history.return_value = [
-            {"observed_at": now - timedelta(hours=1), "temp_f": 75.0, "is_speci": False},
-            {"observed_at": now - timedelta(hours=2), "temp_f": 78.0, "is_speci": False},
-            {"observed_at": now - timedelta(hours=3), "temp_f": 72.0, "is_speci": False},
-        ]
+        # Anchor to LOCAL NOON of the local day containing `now`, not to
+        # `now - Nh`. Offsetting backwards from `now` walks into the PREVIOUS
+        # local day whenever the suite runs near the station's local midnight
+        # (KPHX is UTC-7, so any run between 07:00-10:00 UTC failed) — a flake
+        # that turned the suite red for ~3h every day, squarely across the hours
+        # the nightly agent runs. Local noon is always inside the window, and the
+        # window filter has no future-observation guard.
+        mock_history.return_value = _local_noon_observations(
+            "KPHX", [(0, 75.0), (-1, 78.0), (-2, 72.0)],
+        )
         max_f, count = await get_routine_daily_max("KPHX")
         assert max_f == 78.0
         assert count == 3
@@ -901,12 +941,12 @@ class TestGetRoutineDailyMax:
     async def test_speci_excluded(self, mock_history):
         from src.ingestion.aviation import get_routine_daily_max
 
-        now = datetime.now(timezone.utc)
-        mock_history.return_value = [
-            {"observed_at": now - timedelta(hours=1), "temp_f": 75.0, "is_speci": False},
-            {"observed_at": now - timedelta(hours=2), "temp_f": 99.0, "is_speci": True},
-            {"observed_at": now - timedelta(hours=3), "temp_f": 72.0, "is_speci": False},
-        ]
+        # Local-noon anchored — see test_default_reference_uses_now.
+        mock_history.return_value = _local_noon_observations(
+            "KPHX",
+            [(0, 75.0), (-1, 99.0), (-2, 72.0)],
+            speci_at_offsets={-1},
+        )
         max_f, count = await get_routine_daily_max("KPHX")
         assert max_f == 75.0
         assert count == 2  # SPECI skipped
