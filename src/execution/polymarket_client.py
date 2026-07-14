@@ -973,6 +973,11 @@ def _throttle_clob() -> None:
     _last_clob_request = _time.monotonic()
 
 
+# Half a Polymarket sub-cent tick. Big enough to absorb the float error in
+# `1.0 - yes_bid` (~1e-16), far too small to admit a genuinely higher tick.
+_PRICE_EPS = 5e-5
+
+
 def _compute_depth(book: object, price: float) -> float:
     """USD of liquidity available to a market BUY at limit *price*.
 
@@ -984,13 +989,23 @@ def _compute_depth(book: object, price: float) -> float:
     Verified against py_clob_client semantics 2026-04-28: bids are buy
     orders, asks are sell orders, and the binary CLOB invariant
     `YES.bid + NO.ask = 1.0` holds.
+
+    The comparison is `<= price + _PRICE_EPS`, not `<= price`. Callers derive the
+    NO buy price as ``1.0 - yes_bid``, and in IEEE-754 that lands a hair BELOW the
+    tick the book actually quotes for ~20% of the 1-cent grid
+    (``1.0 - 0.32 == 0.6799999999999999 < 0.68``). Asks ascend, so excluding the
+    best ask excludes EVERY level — depth comes back **exactly 0** and the
+    ``depth >= MIN_DEPTH_USD`` filter silently vetoes a market that has thousands
+    of dollars resting on it. Measured live 2026-07-14: real books quoting
+    $5k-13k of NO size returned depth 0 at their own best ask. Same silent-veto
+    family as the 2026-06-14 / 06-18 depth-at-mid bugs.
     """
     asks = book.asks if hasattr(book, "asks") else book.get("asks", [])  # type: ignore[union-attr]
     depth = 0.0
     for ask in asks or []:
         ask_price = float(ask.price if hasattr(ask, "price") else ask.get("price", 0))
         ask_size = float(ask.size if hasattr(ask, "size") else ask.get("size", 0))
-        if 0 < ask_price <= price:
+        if 0 < ask_price <= price + _PRICE_EPS:
             depth += ask_price * ask_size
     return depth
 

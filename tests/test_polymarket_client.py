@@ -382,3 +382,38 @@ async def test_get_token_ids_is_memoised_so_the_hot_path_pays_no_gamma_roundtrip
     with patch("httpx.AsyncClient") as http:
         assert await get_token_ids("777") == ("yes_tok", "no_tok")
         http.assert_not_called()  # cache hit => zero network
+
+
+# ---------------------------------------------------------------------------
+# Float-epsilon depth bug (2026-07-14)
+# ---------------------------------------------------------------------------
+#
+# Callers derive the NO buy price as `1.0 - yes_bid`. In IEEE-754 that lands a
+# hair BELOW the tick the book actually quotes for ~20% of the 1-cent grid.
+# Asks ascend, so excluding the best ask excludes EVERY level and depth comes
+# back exactly 0 — the `depth >= MIN_DEPTH_USD` filter then silently vetoes a
+# market with thousands of dollars resting on it. Measured live: real books
+# quoting $5k-13k of NO size returned depth 0 at their own best ask.
+
+
+def test_no_ask_from_float_subtraction_still_sees_the_best_ask():
+    from src.execution.polymarket_client import _compute_depth
+
+    yes_bid = 0.32
+    no_ask = 1.0 - yes_bid                 # 0.6799999999999999
+    assert no_ask < 0.68                   # the bug's precondition
+
+    book = _book([(0.68, 1000.0), (0.70, 500.0)])
+    depth = _compute_depth(book, no_ask)
+
+    # Must see the 0.68 level (the price the book actually quotes), not $0.
+    assert depth == pytest.approx(0.68 * 1000.0)
+
+
+def test_epsilon_does_not_admit_a_genuinely_higher_tick():
+    """The tolerance must not quietly buy a level we didn't ask for."""
+    from src.execution.polymarket_client import _compute_depth
+
+    book = _book([(0.69, 1000.0)])
+    # A real 1-cent step above our limit stays excluded.
+    assert _compute_depth(book, 0.68) == 0.0

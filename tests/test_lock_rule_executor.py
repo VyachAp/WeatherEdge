@@ -479,6 +479,47 @@ async def test_no_side_uses_no_token_depth_lookup():
 
 
 @pytest.mark.asyncio
+async def test_bucket_overshoot_probes_depth_up_to_max_cost_and_walks_the_book():
+    """A certainty bet must see — and be able to take — every +EV level.
+
+    `bucket_overshoot`'s cost is already bounded by BUCKET_OVERSHOOT_MAX_COST, so
+    every resting NO level at or below it is +EV by construction. Probing depth at
+    the *best ask* alone discards the rest: measured live 2026-07-14 across 269
+    tradeable-band markets, **$664,695** of NO liquidity was invisible, and the
+    count of opportunities able to clear MIN_TRADE_USD went 179/269 -> 265/269 once
+    the deeper levels were counted. The FAK limit must be widened to the same
+    ceiling, or the size we measured is unreachable and the stake is truncated at
+    the top of the book.
+    """
+    with patch.object(lre.settings, "BUCKET_OVERSHOOT_MAX_COST", 0.93):
+        _, c = await _invoke(
+            decision=_no_decision(branch="bucket_overshoot"),
+            yes_price=0.30, yes_bid=0.30,     # NO ask 0.70
+        )
+        # Depth probed at the CAP (0.93), not at the 0.70 best ask.
+        token, probe_price = c["get_orderbook_depth"].call_args.args
+        assert token == "no_token"
+        assert probe_price == pytest.approx(0.93)
+
+        # ...and the FAK is allowed to walk from 0.70 up to the same 0.93 ceiling.
+        slip = c["place_order"].await_args.kwargs["max_slippage_cents"]
+        assert slip == pytest.approx((0.93 - 0.70) * 100.0, abs=0.5)
+
+
+@pytest.mark.asyncio
+async def test_non_bucket_overshoot_lock_still_probes_at_its_own_ask():
+    """Only the certainty branch gets the widened probe/walk — nothing else."""
+    _, c = await _invoke(
+        decision=_no_decision(branch="easy_super"),
+        yes_price=0.30, yes_bid=0.30,         # NO ask 0.70
+    )
+    _, probe_price = c["get_orderbook_depth"].call_args.args
+    assert probe_price == pytest.approx(0.70)
+    # flat path omits the kwarg entirely -> place_order's 2c default stands
+    assert "max_slippage_cents" not in c["place_order"].await_args.kwargs
+
+
+@pytest.mark.asyncio
 async def test_bucket_overshoot_gets_its_own_depth_cap_other_locks_keep_015():
     """`bucket_overshoot` sizes against BUCKET_OVERSHOOT_DEPTH_CAP_PCT; every
     other lock branch keeps the flat 0.15.

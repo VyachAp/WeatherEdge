@@ -295,10 +295,23 @@ async def try_lock_rule_trade(
         return 0.0
 
     # Depth against the side we're actually buying.
+    #
+    # For `bucket_overshoot`, probe up to BUCKET_OVERSHOOT_MAX_COST rather than at
+    # the best ask. This is a *certainty* bet whose cost is already bounded by that
+    # cap, so EVERY resting level at or below it is +EV by construction — sizing
+    # against the top of the book alone throws the rest away. Measured live
+    # 2026-07-14 across 269 tradeable-band markets: **$664,695** of NO liquidity was
+    # invisible this way, and the count of opportunities that could clear
+    # MIN_TRADE_USD went 179/269 → 265/269 once the deeper levels were counted.
+    # The FAK limit is widened to match below (order_kwargs), so the depth we
+    # measure is the depth we can actually take.
     if decision.side == "YES":
         buy_depth = yes_depth
     else:
-        buy_depth = get_orderbook_depth(token_ids[1], effective_price)
+        probe_price = effective_price
+        if decision.branch == "bucket_overshoot":
+            probe_price = max(effective_price, settings.BUCKET_OVERSHOOT_MAX_COST)
+        buy_depth = get_orderbook_depth(token_ids[1], probe_price)
 
     # Reuse the existing filter helper for routine-count / close-buffer / depth.
     # Pass stub prob/edge/price values that will pass those specific checks; we're
@@ -531,6 +544,17 @@ async def try_lock_rule_trade(
     if conviction:
         order_kwargs["max_slippage_cents"] = max(
             2.0, (settings.LOCK_WALK_MAX_PRICE - effective_price) * 100.0
+        )
+    elif decision.branch == "bucket_overshoot":
+        # Let the FAK sweep every level up to BUCKET_OVERSHOOT_MAX_COST — the
+        # same ceiling `buy_depth` was probed at, and the price above which we
+        # already refuse to trade. Without this the order can only lift the best
+        # ask, so the deeper (still +EV) size we just measured is unreachable and
+        # the stake gets truncated at the top of the book. Price-time priority
+        # means we still pay the cheapest levels first; the cap bounds the worst
+        # we can pay, and every level under it is +EV by construction.
+        order_kwargs["max_slippage_cents"] = max(
+            2.0, (settings.BUCKET_OVERSHOOT_MAX_COST - effective_price) * 100.0
         )
     order_ok = await place_order(trade, session, **order_kwargs)
     if not order_ok:
