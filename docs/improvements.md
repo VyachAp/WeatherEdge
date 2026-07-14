@@ -42,9 +42,10 @@ gotchas, not here.
 
 Our lock volume is dominated by the *lost* set. First live fresh-kill datum: **WMKK, seen 8.6 min after observation, NO already at 0.999 — with $407 of depth.** The book was deep; the price was gone. **No tick speed fixes a 6-minute-old observation.**
 
-**Options, in order of expected value:**
-1. **Find a faster source for the slow stations.** A multi-provider racer was already measured and REJECTED (AWC and NOAA share an upstream feed — §5 07-10), so this means a *genuinely different* source: the national met service's own feed (e.g. CMA for the ZG*/ZS*/ZB* cluster, JMA for RJTT, MD for WMKK), SYNOP, or a direct station/ADDS push rather than polling.
-2. **Accept the 6-station universe** and optimise there (they are already the fastest; nothing to fix).
+**RESOLVED 2026-07-14 — option 1 is a DEAD END. Take option 2.** Live cycle watch (§5 addendum 13): for the 06:30Z observation, AWC first served it at **12.7 min**, NOAA at **13.1 min**, and a snapshot probe showed AWC / NOAA / OGIMET returning **identical `observed_at`** for every station — they share an upstream feed, confirmed empirically. IEM was 30-60 min behind. **No provider in the codebase beats AWC**, and the publication lag itself is 8-13 min against a 2.07-min reprice: *the information does not exist anywhere in time.* No engineering on our side fixes that.
+
+1. ~~Find a faster source~~ — **CLOSED.** (A national-met-service direct feed remains theoretically possible — CMA / JMA / MD Malaysia — but they feed the same synoptic pipeline, and this is now a low-prior, high-cost avenue. Do not spend on it without new evidence.)
+2. **✅ ACCEPT the 6-station universe** (`SBGR, OEJN, WSSS, MMMX, OPKC, EFHK`) and optimise there. This is not a limitation to engineer around — it is the shape of the opportunity. **Judge all bucket_overshoot volume, fill-rate and PnL against that denominator, not against 45 stations.** Remaining upside: win *every* race on those six (decision lag is now 2.8s, so we do) and size the wins properly (done — `BUCKET_OVERSHOOT_DEPTH_CAP_PCT=0.50`).
 3. Do NOT gate the slow stations out: `BUCKET_OVERSHOOT_MAX_COST` already refuses them on price (they cost a few CLOB calls, not EV), and several have a fast *tail* (p10 under 2 min: UUEE 1.2, RPLL 1.2, VHHH 1.8) that a median-based exclusion would discard.
 
 **Measure first:** `metar_observations` gives the lag distribution for free. Per candidate source, the only question that matters is *"does it deliver the routine METAR in under ~2 min?"* — everything else is secondary.
