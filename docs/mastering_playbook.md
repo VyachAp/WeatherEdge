@@ -1281,3 +1281,50 @@ ORDER BY created_at DESC;
 ```
 - depth ≥ `MIN_DEPTH_USD` on the cheap candidates ⇒ **the edge is real and fillable — scale it.**
 - depth ~0 ⇒ the cheap prices are dust quotes; the edge is unfillable and we stop paying for it.
+
+### §5 addendum 4 — the FULL funnel, measured. Depth is real; the DEPTH CAP is the next lever.
+
+The depth question is **answered** (no need to wait days). Live probe of 81 `exactly` markets
+sitting in the tradeable NO band (0.05-0.93), NO book probed at its **true ask** (1 - yes_bid):
+
+- **61/81 (75%) carry ≥ $10 of resting NO size.** Median NO depth: **EU $32, ASIA $58**; the top
+  of the book reaches $300-780 (ZGGG $784, OPKC $560, RJTT $422, WSSS $407, EPWA $332, EDDM $321).
+- **The books are real, not dust. The edge is FILLABLE.**
+
+**But our own sizing throws most of it away.** `size_locked_position` caps a flat lock at
+**15% of depth**, then the CAUTION drawdown multiplier halves it, against a `MIN_TRADE_USD=$5`
+floor:
+
+```
+stake = min(LOCK_POSITION_PCT×bankroll, MAX_POSITION_USD/2, 0.15×depth) × dd_mult
+      = min(0.05×$306,            $100,           0.15×depth) × 0.5
+⇒ 0.15 × depth × 0.5 ≥ $5   ⇒   depth must be ≥ $67
+```
+
+- **35 of the 61 fillable opportunities (57%) size to $0** purely on the depth cap.
+- Even on the **$784** book, the stake is **$7.65** — the 5%×$306×0.5 arm binds, not depth.
+
+**End-to-end funnel per dead bucket** (post-latency-fix):
+`13% priced ≤0.93` × `75% have depth` × `43% survive the depth cap` ≈ **4%** become a **$7.65** bet.
+
+This is the **same finding as §5 06-03** ("floor-up is inert; the true cause is the DEPTH CAP;
+the real lever is raising the cap, not the floor") — now confirmed for the **lock** path with
+hard numbers. Note `DEPTH_POSITION_CAP_PCT=0.30` (live) only governs the **probability** path;
+the flat lock path uses the hardcoded **0.15** in `size_locked_position`, and
+`LOCK_DEPTH_CAP_PCT_BIG=0.50` only applies to *conviction* (EASY-YES, whitelisted) locks —
+`bucket_overshoot` is a NO branch and gets neither.
+
+**Candidate levers (PROPOSE-ONLY — operator chose "leave sizing as-is, measure a week"):**
+1. **Give `bucket_overshoot` the 0.50 depth cap** (it already exists as `LOCK_DEPTH_CAP_PCT_BIG`).
+   Justification: this is a **certainty** bet (0.08% violation rate on trusted stations), so the
+   usual reason for a tight depth cap — adverse selection / being wrong about the price — does
+   not apply. Walking further into a book whose every level is ≤ `BUCKET_OVERSHOOT_MAX_COST=0.93`
+   stays +EV by construction.
+2. **Probe depth up to `BUCKET_OVERSHOOT_MAX_COST`, not just at the best ask.** We currently size
+   against depth at the *best* NO ask; levels at 0.91/0.92/0.93 are all still +EV and invisible.
+3. Clear the CAUTION multiplier (dd 15.2% of a stale $360.66 peak) — but that is a risk decision,
+   not a measurement one.
+
+**Do not flip these blind.** The week's data now has the instrument it needs: `depth_no_usd` is
+recorded at the kill (fast-poll T0, shipped this session) and `evaluation_logs.depth_usd` carries
+the executor's own probe for every candidate clearing the 0.93 gate.
