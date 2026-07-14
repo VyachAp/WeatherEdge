@@ -39,7 +39,9 @@ gotchas, not here.
 2. Distribution of live NO cost at first-fire, from `evaluation_logs` rows **written after 2026-07-14 only** (pre-fix lock rows are stale-Gamma contaminated — see the gotcha in CLAUDE.md; they fabricate a +0.76/$1 phantom edge). Filter: `signal_kind='lock' AND direction='BUY_NO' AND depth_usd IS NOT NULL`.
 3. Actual fills + realised PnL by `lock_branch='bucket_overshoot'`.
 
-**Then, and only then:** decide whether to raise `BUCKET_OVERSHOOT_MAX_COST`. The certainty math says EV/$1 = p/c − 1, so at the trusted-station violation rate (p ≈ 0.9992) c=0.96 is +4.1%, c=0.98 is +2.0%, c=0.99 is +0.9% — all positive but thin, and thin margins are where resolver divergence and slippage bite. Prefer winning the race over paying up.
+**RESOLVED same-day — do NOT raise `BUCKET_OVERSHOOT_MAX_COST`.** Live CLOB check: a fully-collapsed dead bucket has **0 YES bids** and therefore (mirror invariant) **0 NO asks** — the NO book is *empty*. There is nothing to buy at any price, so a higher cost cap buys nothing. The binding constraint is **book existence, not price**. The only tradeable moment is the ~2-min window after the METAR while the NO offers still stand ⇒ **latency is the only lever on this edge.**
+
+**So the next lever is INGESTION lag, not decision lag.** Decision lag is now ~2.8s/tick (was ~24s); the remaining ~2.7 min is dominated by **METAR publication** (AWC per-station floor: WSSS 1.1min, OPKC 1.7, VILK 2.8, WMKK 8.7). The 07-10 study found cutting ingestion to 1 min would **5× the opportunity set (136 → 682 bets)**, and a multi-provider racer was already measured and REJECTED (AWC and NOAA share an upstream feed). Open question: does *any* faster source of the routine METAR exist (direct station feed, regional met service, SYNOP)? That is the highest-value research item in the project.
 
 **Notes:** the 07-10 study (3,580 candidates priced off CLOB 1-min history) found +0.91/$1 *at the bot's true METAR arrival time* — i.e. the edge is real if we are fast. Latency is the lever, not the cap.
 
