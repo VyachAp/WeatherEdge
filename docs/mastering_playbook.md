@@ -1370,3 +1370,37 @@ NO liquidity unreachable across 269 markets. Opportunities able to clear `MIN_TR
 **Still unmoved:** the stake itself is capped at **$7.65** by `LOCK_POSITION_PCT (5%) × $306 ×
 0.5 (CAUTION)` — depth is no longer the binding arm on any book. Raising *that* is a risk
 decision (the 15.2% drawdown is real, not a stale peak), so it stays with the operator.
+
+### §5 addendum 6 — first read of the `lock_unexecutable` instrument: thesis INTACT
+
+First 81 events after the fixes (all `source: unified`, i.e. the 5-min tick):
+
+```
+branches : bucket_overshoot 60, easy_super 16, easy_standard 5
+seconds_since_obs on empty-book locks (n=81):
+   min = 458s (7.6 min)   median = 1637s (27 min)   max = 1677s
+   FRESH (<180s): 0 / 81
+```
+
+**Zero empty-book locks are fresh kills.** Every one is a bucket that died 7.6+ minutes ago
+(median 27 min). This is precisely the post-collapse state the thesis predicts — the NO offers
+are withdrawn *after* the market reprices — and it is **not** evidence against the edge. The
+"is bucket_overshoot a mirage?" question (addendum 2) is now answered from live production
+telemetry as well as from history: **no.**
+
+The fast-poll path (the one that reaches the <3-min window) has logged **no** `lock_unexecutable`
+yet, i.e. no new routine METAR has killed a bucket since the restart. That is the event to wait
+for, and it is now fully instrumented end-to-end:
+
+| stage | where it lands |
+|---|---|
+| lock fires, book already empty | `lock_unexecutable` log event + `seconds_since_obs` |
+| lock fires, live book | `evaluation_logs` row with a real `depth_usd` |
+| quote + NO depth at the instant of the kill | `metar_reprice_snapshots` (`depth_no_usd`, fast-poll T0) |
+| sized + placed | `decision_logs` + `Trade` |
+
+**The kill criterion is now explicit.** If fast-poll starts logging `lock_unexecutable` with
+**low** `seconds_since_obs` (fresh kills that are *already* unbuyable), the edge is dead at any
+latency and we stop paying for it. If instead those fresh kills produce `evaluation_logs` rows
+with real depth, the edge is real and the only remaining lever is **ingestion lag** (METAR
+publication, ~2.7 min — see §5 07-10; a provider racer was already measured and rejected).
